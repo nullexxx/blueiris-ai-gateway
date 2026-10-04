@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import math
 import os
 import threading
@@ -102,6 +103,9 @@ class TrackerConfig:
     max_pan_speed: int = 5
     max_tilt_speed: int = 4
     command_keepalive: float = 0.55
+    association_idle_distance: float = 0.22
+    association_moving_distance: float = 0.35
+    history_size: int = 300
 
     coast_time: float = 0.25
     reacquire_time: float = 1.50
@@ -150,6 +154,9 @@ class TrackerConfig:
             max_pan_speed=max(1, min(8, _env_int("TRACKER_MAX_PAN_SPEED", 5))),
             max_tilt_speed=max(1, min(8, _env_int("TRACKER_MAX_TILT_SPEED", 4))),
             command_keepalive=max(0.15, _env_float("TRACKER_COMMAND_KEEPALIVE", 0.55)),
+            association_idle_distance=max(0.05, min(0.80, _env_float("TRACKER_ASSOCIATION_IDLE_DISTANCE", 0.22))),
+            association_moving_distance=max(0.05, min(0.80, _env_float("TRACKER_ASSOCIATION_MOVING_DISTANCE", 0.35))),
+            history_size=max(50, min(2000, _env_int("TRACKER_HISTORY_SIZE", 300))),
             coast_time=max(0.0, _env_float("TRACKER_COAST_TIME", 0.25)),
             reacquire_time=max(0.1, _env_float("TRACKER_REACQUIRE_TIME", 1.50)),
             home_timeout=max(0.5, _env_float("TRACKER_HOME_TIMEOUT", 6.0)),
@@ -177,6 +184,7 @@ class TrackerConfig:
         cfg.fps = max(1.0, min(30.0, cfg.fps))
         cfg.acquire_conf = max(0.01, min(0.99, cfg.acquire_conf))
         cfg.hold_conf = max(0.01, min(cfg.acquire_conf, cfg.hold_conf))
+        cfg.association_moving_distance = max(cfg.association_idle_distance, cfg.association_moving_distance)
         cfg.reacquire_time = max(cfg.coast_time, cfg.reacquire_time)
         cfg.home_timeout = max(cfg.reacquire_time, cfg.home_timeout)
         return cfg
@@ -227,6 +235,9 @@ class TrackerConfig:
             "deadzone_y_out": self.deadzone_y_out,
             "max_pan_speed": self.max_pan_speed,
             "max_tilt_speed": self.max_tilt_speed,
+            "association_idle_distance": self.association_idle_distance,
+            "association_moving_distance": self.association_moving_distance,
+            "history_size": self.history_size,
             "coast_time": self.coast_time,
             "reacquire_time": self.reacquire_time,
             "home_timeout": self.home_timeout,
@@ -565,6 +576,9 @@ class DogTracker:
         self._last_frame_shape: Optional[Tuple[int, int]] = None
         self._debug_jpeg: Optional[bytes] = None
         self._inference_times: Deque[float] = deque(maxlen=128)
+        self._history: Deque[dict] = deque(maxlen=self.cfg.history_size)
+        self._session_started_wall: Optional[str] = None
+        self._session_started_mono: Optional[float] = None
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -573,6 +587,33 @@ class DogTracker:
         self.ptz_commands = 0
         self.targets_acquired = 0
         self.home_returns = 0
+
+    def _record_event(self, event: str, **fields) -> None:
+        item = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "event": event,
+            "state": self.state,
+        }
+        if self._session_started_mono is not None:
+            item["session_ms"] = int((time.monotonic() - self._session_started_mono) * 1000)
+        item.update(fields)
+        self._history.append(item)
+
+    def history(self, limit: int = 200) -> dict:
+        limit = max(1, min(int(limit), self.cfg.history_size))
+        events = list(self._history)[-limit:]
+        return {
+            "active": self.active,
+            "state": self.state,
+            "session_started": self._session_started_wall,
+            "event_count": len(self._history),
+            "returned": len(events),
+            "events": events,
+        }
+
+    def clear_history(self) -> dict:
+        self._history.clear()
+        return {"success": True, "event_count": 0}
 
     async def initialize(self) -> None:
         if not self.cfg.camera_ip:
@@ -588,6 +629,7 @@ class DogTracker:
             self.cfg.fps,
             self.cfg.autostart,
         )
+        self._record_event("initialized", camera=self.cfg.camera_ip, model=self.cfg.model_name, fps=self.cfg.fps)
         if self.cfg.autostart:
             await self.start()
 
@@ -609,6 +651,9 @@ class DogTracker:
         self.ptz.close()
 
     async def start(self) -> dict:
+        self._history.clear()
+        self._session_started_wall = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._session_started_mono = time.monotonic()
         self.active = True
         self.state = "SEARCHING"
         self.target = None
@@ -619,10 +664,12 @@ class DogTracker:
         self._last_tilt = 0
         if self.cfg.goto_home_on_start:
             await self.home()
+        self._record_event("tracker_started", goto_home_on_start=self.cfg.goto_home_on_start)
         self.logger.info("PTZ tracker STARTED")
         return self.status()
 
     async def stop(self) -> dict:
+        self._record_event("tracker_stopping")
         self.active = False
         self.state = "OFF"
         self.target = None
@@ -631,6 +678,7 @@ class DogTracker:
         self._last_pan = 0
         self._last_tilt = 0
         await asyncio.to_thread(self.ptz.stop, True)
+        self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
@@ -645,6 +693,7 @@ class DogTracker:
         ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
         if ok:
             self.home_returns += 1
+        self._record_event("home_command", preset=self.cfg.home_preset, success=bool(ok))
         return self.status()
 
     def debug_jpeg(self) -> Optional[bytes]:
@@ -677,6 +726,8 @@ class DogTracker:
         return {
             "enabled": self.cfg.enabled,
             "active": self.active,
+            "session_started": self._session_started_wall,
+            "history_events": len(self._history),
             "state": self.state,
             "camera_connected": self.capture.connected,
             "capture_reconnects": self.capture.reconnects,
@@ -822,6 +873,12 @@ class DogTracker:
                 acquire_hits=1,
             )
             self.state = "ACQUIRE"
+            self._record_event(
+                "acquire_candidate",
+                label=chosen.label,
+                confidence=round(chosen.confidence, 3),
+                bbox=[round(v, 1) for v in chosen.bbox],
+            )
             self._home_sent = False
             await self._stop_ptz_if_needed()
             return
@@ -839,6 +896,12 @@ class DogTracker:
 
             if was_acquiring and self.target.acquire_hits == self.cfg.acquire_frames:
                 self.targets_acquired += 1
+                self._record_event(
+                    "target_acquired",
+                    label=self.target.label,
+                    confidence=round(self.target.confidence, 3),
+                    bbox=[round(v, 1) for v in self.target.bbox],
+                )
                 self.logger.info(
                     "%s target acquired: conf=%.2f bbox=%s",
                     self.target.label,
@@ -854,6 +917,11 @@ class DogTracker:
         # drop it quickly instead of holding a one-frame false positive for the
         # full lost-target timeout.
         if self.target.acquire_hits < self.cfg.acquire_frames:
+            self._record_event(
+                "acquire_dropped",
+                label=self.target.label,
+                hits=self.target.acquire_hits,
+            )
             self.target = None
             self.state = "SEARCHING"
             self._x_active = False
@@ -864,17 +932,23 @@ class DogTracker:
         # Negative observation: nothing matched our sticky target.
         missing_for = now - self.target.last_seen
         if missing_for <= self.cfg.coast_time:
+            if self.state != "COAST":
+                self._record_event("target_missing", phase="coast", missing_ms=int(missing_for * 1000), label=self.target.label)
             self.state = "COAST"
             # Intentionally leave the last PTZ vector active for a very brief
             # period. The hardware timeout prevents runaway motion.
             return
 
         if missing_for <= self.cfg.reacquire_time:
+            if self.state != "REACQUIRE":
+                self._record_event("target_missing", phase="reacquire", missing_ms=int(missing_for * 1000), label=self.target.label)
             self.state = "REACQUIRE"
             await self._stop_ptz_if_needed()
             return
 
         if missing_for < self.cfg.home_timeout:
+            if self.state != "LOST":
+                self._record_event("target_missing", phase="lost", missing_ms=int(missing_for * 1000), label=self.target.label)
             self.state = "LOST"
             await self._stop_ptz_if_needed()
             return
@@ -891,6 +965,12 @@ class DogTracker:
                     self.cfg.home_preset,
                 )
             self._home_sent = True
+        self._record_event(
+            "target_released",
+            label=self.target.label if self.target is not None else None,
+            missing_ms=int(missing_for * 1000),
+            returned_home=bool(self.cfg.return_home_on_lost and self._home_sent),
+        )
         self.target = None
         self._x_active = False
         self._y_active = False
@@ -918,7 +998,9 @@ class DogTracker:
                 continue
             cx, cy = det.center
             dist_norm = math.hypot(cx - px, cy - py) / diag
-            proximity = max(0.0, 1.0 - (dist_norm / 0.45))
+            moving = self.ptz.current_vector != (0, 0, 0)
+            proximity_span = 0.60 if moving else 0.45
+            proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
             overlap = _iou(self.target.bbox, det.bbox)
             size_similarity = min(old_area, det.area) / max(old_area, det.area)
             score = 0.45 * overlap + 0.35 * proximity + 0.10 * size_similarity + 0.10 * det.confidence
@@ -927,9 +1009,12 @@ class DogTracker:
                 best = det
                 best_dist_norm = dist_norm
 
-        # IoU can be near zero while the PTZ itself is moving, so allow a
-        # proximity-based match as long as the candidate is not implausibly far away.
-        if best is not None and (best_score >= 0.22 or best_dist_norm <= 0.22):
+        # IoU can be near zero while the PTZ itself is moving because camera motion
+        # shifts every pixel in the frame. Use a wider configurable proximity gate
+        # while the PTZ is active, then tighten it again when the camera is still.
+        moving = self.ptz.current_vector != (0, 0, 0)
+        max_dist = self.cfg.association_moving_distance if moving else self.cfg.association_idle_distance
+        if best is not None and (best_score >= 0.22 or best_dist_norm <= max_dist):
             return best
         return None
 
@@ -969,6 +1054,14 @@ class DogTracker:
         ok = await asyncio.to_thread(self.ptz.continuous, pan, tilt, 0, False)
         if ok and changed:
             self.ptz_commands += 1
+            self._record_event(
+                "ptz_command",
+                label=self.target.label if self.target is not None else None,
+                vector=[pan, tilt, 0],
+                error_x=round(err_x, 3),
+                error_y=round(err_y, 3),
+                confidence=round(self.target.confidence, 3) if self.target is not None else None,
+            )
 
     @staticmethod
     def _axis_velocity(error: float, active: bool, inner: float, outer: float, max_speed: int) -> Tuple[int, bool]:
@@ -998,7 +1091,10 @@ class DogTracker:
 
     async def _stop_ptz_if_needed(self, force: bool = False) -> None:
         if force or self.ptz.current_vector != (0, 0, 0):
+            prior = list(self.ptz.current_vector)
             await asyncio.to_thread(self.ptz.stop, force)
+            if prior != [0, 0, 0]:
+                self._record_event("ptz_stop", prior_vector=prior, force=bool(force))
             self._last_pan = 0
             self._last_tilt = 0
 
