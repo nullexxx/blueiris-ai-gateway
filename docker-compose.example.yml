@@ -54,7 +54,16 @@ services:
       TRACKER_LEAD_MIN_SPAN: "0.08"
       TRACKER_LEAD_EDGE_MARGIN: "0.02"
 
-      # Wait for the physical camera to finish before another PTZ command
+      # Bounded destination updates while a native moveDirectly is still slewing.
+      # Predictive lead remains disabled during these moving-camera frames.
+      TRACKER_INFLIGHT_RETARGET_ENABLED: "true"
+      TRACKER_INFLIGHT_RETARGET_INTERVAL: "0.30"
+      TRACKER_INFLIGHT_RETARGET_MAX: "2"
+      TRACKER_INFLIGHT_REVERSAL_ERROR: "0.22"
+      TRACKER_ESCAPE_ERROR: "0.72"
+      TRACKER_ESCAPE_GAIN: "0.85"
+
+      # Camera status drives completion; no fixed movement sleep is used.
       TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.06"
       TRACKER_PTZ_OPERATION_TIMEOUT: "4.0"
       TRACKER_POST_MOVE_FRAMES: "1"
