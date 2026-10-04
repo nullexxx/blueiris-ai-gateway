@@ -87,7 +87,7 @@ active_inferences: int = 0
 is_healthy: bool = True
 health_failure_reason: Optional[str] = None
 
-# Optional dog PTZ tracker service (configured by TRACKER_* environment variables)
+# Optional multi-class PTZ tracker service (configured by TRACKER_* environment variables)
 tracker_service: Optional[DogTracker] = None
 
 
@@ -145,11 +145,11 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
     return model.predict(img, **kwargs)
 
 
-def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, target_class_id: int) -> List[dict]:
-    """Run a dog-only prediction and return plain Python data before releasing the GPU gate."""
+def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, target_class_ids: List[int]) -> List[dict]:
+    """Run tracker prediction for the configured classes and return plain Python data."""
     kwargs = {
         "conf": min_conf,
-        "classes": [target_class_id],
+        "classes": target_class_ids,
         "imgsz": 640,
         "device": 0,
         "verbose": False,
@@ -162,7 +162,10 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
     for r in results:
         for box in r.boxes:
             coords = box.xyxy[0].tolist()
+            class_id = int(box.cls[0])
             predictions.append({
+                "class_id": class_id,
+                "label": str(entry.model.names[class_id]),
                 "confidence": float(box.conf[0]),
                 "x_min": int(coords[0]),
                 "y_min": int(coords[1]),
@@ -476,7 +479,7 @@ async def get_model_entry(requested_name: str) -> Optional[ModelEntry]:
             return None
 
 
-async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: str, target_class_id: int):
+async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: str, target_class_ids: List[int]):
     """
     Opportunistic tracker inference. Blue Iris/FaceNet work gets priority: if the
     shared GPU gate is busy or a normal inference is queued, the tracker drops
@@ -511,7 +514,7 @@ async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: 
             return "unavailable", [], 0
 
         worker_future = loop.run_in_executor(
-            None, sync_tracker_predict, entry, frame, min_conf, target_class_id
+            None, sync_tracker_predict, entry, frame, min_conf, target_class_ids
         )
         try:
             predictions = await asyncio.wait_for(
@@ -769,14 +772,14 @@ async def custom_detection(
 
 
 # ============================================================================
-# DOG PTZ TRACKER ENDPOINTS
+# PTZ TRACKER ENDPOINTS
 # ============================================================================
 
 def _require_tracker() -> DogTracker:
     if tracker_service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Dog PTZ tracker is not enabled/initialized. Set TRACKER_ENABLED=true and check startup logs.",
+            detail="PTZ tracker is not enabled/initialized. Set TRACKER_ENABLED=true and check startup logs.",
         )
     return tracker_service
 
