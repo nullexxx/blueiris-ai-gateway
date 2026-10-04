@@ -1,0 +1,243 @@
+name: Apply measured edge rescue controller update
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/apply-edge-rescue.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply tracker update
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tracker.py")
+          s = path.read_text()
+
+          def replace_once(old, new):
+              global s
+              if old not in s:
+                  raise SystemExit(f"expected patch anchor not found:\n{old}")
+              s = s.replace(old, new, 1)
+
+          replace_once(
+          '''    velocity_consistency_cosine: float = 0.25
+    velocity_jump_ratio: float = 4.0
+
+    # Native PTZ operation tracking.''',
+          '''    velocity_consistency_cosine: float = 0.25
+    velocity_jump_ratio: float = 4.0
+
+    # Measured escape behavior: keep the known-good partial correction for normal
+    # tracking, but use a stronger one-shot moveDirectly correction when the bbox
+    # is already clipped or the target is close to escaping the frame. No command
+    # overlap or continuous steering is introduced.
+    edge_rescue_enabled: bool = True
+    edge_rescue_error: float = 0.75
+    edge_rescue_gain: float = 0.85
+
+    # Native PTZ operation tracking.''')
+
+          replace_once(
+          '''            velocity_consistency_cosine=_env_float("TRACKER_VELOCITY_CONSISTENCY_COSINE", 0.25),
+            velocity_jump_ratio=_env_float("TRACKER_VELOCITY_JUMP_RATIO", 4.0),
+            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''',
+          '''            velocity_consistency_cosine=_env_float("TRACKER_VELOCITY_CONSISTENCY_COSINE", 0.25),
+            velocity_jump_ratio=_env_float("TRACKER_VELOCITY_JUMP_RATIO", 4.0),
+            edge_rescue_enabled=_env_bool("TRACKER_EDGE_RESCUE_ENABLED", True),
+            edge_rescue_error=_env_float("TRACKER_EDGE_RESCUE_ERROR", 0.75),
+            edge_rescue_gain=_env_float("TRACKER_EDGE_RESCUE_GAIN", 0.85),
+            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''')
+
+          replace_once(
+          '''        cfg.velocity_consistency_cosine = max(-1.0, min(1.0, cfg.velocity_consistency_cosine))
+        cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))
+        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''',
+          '''        cfg.velocity_consistency_cosine = max(-1.0, min(1.0, cfg.velocity_consistency_cosine))
+        cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))
+        cfg.edge_rescue_error = max(0.40, min(0.98, cfg.edge_rescue_error))
+        cfg.edge_rescue_gain = max(cfg.move_gain, min(1.00, cfg.edge_rescue_gain))
+        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''')
+
+          replace_once(
+          '''            "velocity_consistency_cosine": self.velocity_consistency_cosine,
+            "velocity_jump_ratio": self.velocity_jump_ratio,
+            "ptz_status_poll_interval": self.ptz_status_poll_interval,''',
+          '''            "velocity_consistency_cosine": self.velocity_consistency_cosine,
+            "velocity_jump_ratio": self.velocity_jump_ratio,
+            "edge_rescue_enabled": self.edge_rescue_enabled,
+            "edge_rescue_error": self.edge_rescue_error,
+            "edge_rescue_gain": self.edge_rescue_gain,
+            "ptz_status_poll_interval": self.ptz_status_poll_interval,''')
+
+          replace_once(
+          '''        previous = self._trusted_velocity
+        self._trusted_velocity = (vx, vy)
+        if previous is None:
+            return True, None
+
+        prev_speed = math.hypot(previous[0], previous[1])
+        if speed < 20.0 or prev_speed < 20.0:
+            return True, None
+
+        cosine = (vx * previous[0] + vy * previous[1]) / max(1e-6, speed * prev_speed)
+        if cosine < self.cfg.velocity_consistency_cosine:
+            return False, "velocity_direction_change"
+
+        ratio = max(speed, prev_speed) / max(1.0, min(speed, prev_speed))
+        if ratio > self.cfg.velocity_jump_ratio:
+            return False, "velocity_jump"
+
+        return True, None''',
+          '''        previous = self._trusted_velocity
+        if previous is None:
+            self._trusted_velocity = (vx, vy)
+            return True, None
+
+        prev_speed = math.hypot(previous[0], previous[1])
+        if speed < 20.0 or prev_speed < 20.0:
+            self._trusted_velocity = (vx, vy)
+            return True, None
+
+        cosine = (vx * previous[0] + vy * previous[1]) / max(1e-6, speed * prev_speed)
+        if cosine < self.cfg.velocity_consistency_cosine:
+            return False, "velocity_direction_change"
+
+        ratio = max(speed, prev_speed) / max(1.0, min(speed, prev_speed))
+        if ratio > self.cfg.velocity_jump_ratio:
+            return False, "velocity_jump"
+
+        # Invalid samples must never become the reference used to validate the
+        # next sample. Promote the candidate only after every sanity check passes.
+        self._trusted_velocity = (vx, vy)
+        return True, None''')
+
+          replace_once(
+          '''            self.target = TargetTrack(
+                class_id=chosen.class_id,''',
+          '''            # Velocity sanity state belongs to one physical target; never
+            # compare a newly acquired subject against the previous subject's motion.
+            self._trusted_velocity = None
+            self.target = TargetTrack(
+                class_id=chosen.class_id,''')
+
+          replace_once(
+          '''            edge_clipped = (
+                x1 <= margin_x
+                or y1 <= margin_y
+                or x2 >= (w - margin_x)
+                or y2 >= (h - margin_y)
+            )
+
+            frame_cx = w / 2.0
+            frame_cy = h / 2.0
+''',
+          '''            edge_clipped = (
+                x1 <= margin_x
+                or y1 <= margin_y
+                or x2 >= (w - margin_x)
+                or y2 >= (h - margin_y)
+            )
+
+            # The failed run showed a very specific escape mode: once the subject
+            # reached the edge we correctly suppressed unreliable clipped-bbox
+            # velocity, but still applied only the normal 0.60 partial correction.
+            # That left an already escaping target near the edge for another full
+            # ~1.3-1.6 s camera move. Use a stronger *single* moveDirectly correction
+            # only for this rescue condition. Normal walking behavior is unchanged.
+            edge_rescue_active = self.cfg.edge_rescue_enabled and (
+                edge_clipped
+                or abs(err_x) >= self.cfg.edge_rescue_error
+                or abs(err_y) >= self.cfg.edge_rescue_error
+            )
+            edge_rescue_reason: Optional[str] = None
+            if edge_rescue_active:
+                edge_rescue_reason = "edge_clipped" if edge_clipped else "extreme_error"
+            active_move_gain = (
+                max(self.cfg.move_gain, self.cfg.edge_rescue_gain)
+                if edge_rescue_active
+                else self.cfg.move_gain
+            )
+
+            frame_cx = w / 2.0
+            frame_cy = h / 2.0
+''')
+
+          replace_once(
+          '''            base_command_center = (
+                frame_cx + (target_cx - frame_cx) * self.cfg.move_gain,
+                frame_cy + (target_cy - frame_cy) * self.cfg.move_gain,
+            )''',
+          '''            base_command_center = (
+                frame_cx + (target_cx - frame_cx) * active_move_gain,
+                frame_cy + (target_cy - frame_cy) * active_move_gain,
+            )''')
+
+          replace_once(
+          '''            command_center = (
+                frame_cx + (predicted_cx - frame_cx) * self.cfg.move_gain,
+                frame_cy + (predicted_cy - frame_cy) * self.cfg.move_gain,
+            )''',
+          '''            command_center = (
+                frame_cx + (predicted_cx - frame_cx) * active_move_gain,
+                frame_cy + (predicted_cy - frame_cy) * active_move_gain,
+            )''')
+
+          replace_once(
+          '''                    move_gain=round(self.cfg.move_gain, 3),
+                    lead_time=round(self.cfg.lead_time, 3),
+                    lead_horizon_s=round(lead_horizon_s, 3),''',
+          '''                    move_gain=round(active_move_gain, 3),
+                    base_move_gain=round(self.cfg.move_gain, 3),
+                    edge_rescue_active=edge_rescue_active,
+                    edge_rescue_reason=edge_rescue_reason,
+                    lead_time=round(self.cfg.lead_time, 3),
+                    lead_horizon_s=round(lead_horizon_s, 3),''')
+
+          path.write_text(s)
+          PY
+
+      - name: Validate tracker
+        shell: bash
+        run: |
+          python3 -m py_compile tracker.py
+          git diff --check
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('tracker.py').read_text()
+          checks = {
+              'adaptive ETA preserved': 'def _predict_move_eta' in s and 'move_eta_model_ready' in s,
+              'moveDirectly remains pursuit controller': 'self.ptz.move_directly_point' in s,
+              'edge rescue config': 'TRACKER_EDGE_RESCUE_GAIN' in s and 'TRACKER_EDGE_RESCUE_ERROR' in s,
+              'bounded rescue gain': 'active_move_gain' in s and 'edge_rescue_active' in s,
+              'invalid velocity not promoted': 'Invalid samples must never become the reference' in s,
+              'no continuous chase': 'TRACKER_CONTINUOUS_CHASE_ENABLED' not in s,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit('failed checks: ' + ', '.join(failed))
+          print('all controller safeguard checks passed')
+          PY
+
+      - name: Commit tracker and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-edge-rescue.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracker.py .github/workflows/apply-edge-rescue.yml
+          git commit -m "Strengthen moveDirectly edge recovery"
+          git push origin HEAD:main
