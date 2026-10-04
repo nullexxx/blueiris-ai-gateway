@@ -3,9 +3,18 @@ name: Build and Push to GHCR
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - "Dockerfile"
+      - "app.py"
+      - "tracker.py"
+      - ".github/workflows/build.yml"
   workflow_dispatch: # Allows manual one-click builds from the GitHub web UI
   schedule:
     - cron: '0 4 * * 0' # Rebuild every Sunday at 4:00 AM UTC
+
+concurrency:
+  group: blueiris-ai-ghcr-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -26,7 +35,7 @@ jobs:
         run: |
           echo "=== Free disk space before cleanup ==="
           df -h
-          
+
           echo "Removing heavy pre-installed tools..."
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /usr/share/dotnet
@@ -34,7 +43,7 @@ jobs:
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           docker image prune --all --force
-          
+
           echo "=== Free disk space after cleanup ==="
           df -h
 
