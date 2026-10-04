@@ -1,0 +1,180 @@
+name: Apply Frigate-inspired moveDirectly controller update
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/apply-frigate-inspired-movedirectly.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply tracker update
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tracker.py")
+          s = path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one anchor, found {count}")
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              '''    lead_min_span: float = 0.08\n    lead_edge_margin: float = 0.02\n\n    # Native PTZ operation tracking.''',
+              '''    lead_min_span: float = 0.08\n    lead_edge_margin: float = 0.02\n\n    # Frigate-inspired predictive control: learn this camera's actual moveDirectly\n    # duration from completed moves and predict where the subject will be when the\n    # camera arrives, rather than assuming one fixed movement duration forever.\n    adaptive_lead: bool = True\n    move_eta_min_samples: int = 3\n    move_eta_history: int = 24\n    move_eta_min: float = 0.50\n    move_eta_max: float = 2.00\n\n    # Reject abrupt/noisy velocity changes for one correction instead of turning\n    # a questionable sample into a large predictive lead.\n    velocity_consistency_cosine: float = 0.25\n    velocity_jump_ratio: float = 4.0\n\n    # Native PTZ operation tracking.''',
+              "config fields",
+          )
+
+          replace_once(
+              '''            lead_min_span=_env_float("TRACKER_LEAD_MIN_SPAN", 0.08),\n            lead_edge_margin=_env_float("TRACKER_LEAD_EDGE_MARGIN", 0.02),\n            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''',
+              '''            lead_min_span=_env_float("TRACKER_LEAD_MIN_SPAN", 0.08),\n            lead_edge_margin=_env_float("TRACKER_LEAD_EDGE_MARGIN", 0.02),\n            adaptive_lead=_env_bool("TRACKER_ADAPTIVE_LEAD", True),\n            move_eta_min_samples=_env_int("TRACKER_MOVE_ETA_MIN_SAMPLES", 3),\n            move_eta_history=_env_int("TRACKER_MOVE_ETA_HISTORY", 24),\n            move_eta_min=_env_float("TRACKER_MOVE_ETA_MIN", 0.50),\n            move_eta_max=_env_float("TRACKER_MOVE_ETA_MAX", 2.00),\n            velocity_consistency_cosine=_env_float("TRACKER_VELOCITY_CONSISTENCY_COSINE", 0.25),\n            velocity_jump_ratio=_env_float("TRACKER_VELOCITY_JUMP_RATIO", 4.0),\n            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''',
+              "config env",
+          )
+
+          replace_once(
+              '''        cfg.lead_min_span = max(0.02, min(0.50, cfg.lead_min_span))\n        cfg.lead_edge_margin = max(0.0, min(0.10, cfg.lead_edge_margin))\n        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''',
+              '''        cfg.lead_min_span = max(0.02, min(0.50, cfg.lead_min_span))\n        cfg.lead_edge_margin = max(0.0, min(0.10, cfg.lead_edge_margin))\n        cfg.move_eta_min_samples = max(2, min(12, cfg.move_eta_min_samples))\n        cfg.move_eta_history = max(cfg.move_eta_min_samples, min(100, cfg.move_eta_history))\n        cfg.move_eta_min = max(0.20, min(2.0, cfg.move_eta_min))\n        cfg.move_eta_max = max(cfg.move_eta_min, min(4.0, cfg.move_eta_max))\n        cfg.velocity_consistency_cosine = max(-1.0, min(1.0, cfg.velocity_consistency_cosine))\n        cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))\n        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''',
+              "config clamps",
+          )
+
+          replace_once(
+              '''            "lead_min_span": self.lead_min_span,\n            "lead_edge_margin": self.lead_edge_margin,\n            "ptz_status_poll_interval": self.ptz_status_poll_interval,''',
+              '''            "lead_min_span": self.lead_min_span,\n            "lead_edge_margin": self.lead_edge_margin,\n            "adaptive_lead": self.adaptive_lead,\n            "move_eta_min_samples": self.move_eta_min_samples,\n            "move_eta_history": self.move_eta_history,\n            "move_eta_min": self.move_eta_min,\n            "move_eta_max": self.move_eta_max,\n            "velocity_consistency_cosine": self.velocity_consistency_cosine,\n            "velocity_jump_ratio": self.velocity_jump_ratio,\n            "ptz_status_poll_interval": self.ptz_status_poll_interval,''',
+              "public config",
+          )
+
+          replace_once(
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n        self._velocity_rebase_required = False\n\n        self._last_detection_count = 0''',
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n        self._velocity_rebase_required = False\n\n        # Learned moveDirectly timing model. Samples persist across target sessions\n        # for the life of the process because they describe the camera, not a target.\n        self._move_timing_samples: Deque[Tuple[float, float]] = deque(maxlen=self.cfg.move_eta_history)\n        self._move_eta_intercept = max(self.cfg.move_eta_min, min(self.cfg.move_eta_max, self.cfg.lead_time))\n        self._move_eta_slope = 0.0\n        self._move_eta_model_ready = False\n        self._last_predicted_move_eta = self._move_eta_intercept\n        self._pending_move_distance: Optional[float] = None\n\n        # Lightweight camera-motion compensation for association. moveDirectly\n        # tells us the approximate image shift it intends to create, so detections\n        # during/just after a slew are matched against that motion corridor instead\n        # of only the stale pre-move bbox center.\n        self._association_motion_start_center: Optional[Tuple[float, float]] = None\n        self._association_motion_end_center: Optional[Tuple[float, float]] = None\n\n        # Last clean stationary-camera subject velocity. Used only as a sanity\n        # reference; a sudden reversal/jump suppresses predictive lead for one move.\n        self._trusted_velocity: Optional[Tuple[float, float]] = None\n\n        self._last_detection_count = 0''',
+              "runtime state",
+          )
+
+          replace_once(
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n        self._velocity_rebase_required = False\n\n    async def start(self) -> dict:''',
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n        self._velocity_rebase_required = False\n        self._pending_move_distance = None\n        self._association_motion_start_center = None\n        self._association_motion_end_center = None\n        self._trusted_velocity = None\n\n    async def start(self) -> dict:''',
+              "reset state",
+          )
+
+          replace_once(
+              '''            "control_mode": "moveDirectly",\n            "ptz_operation": self._ptz_operation,''',
+              '''            "control_mode": "moveDirectly",\n            "move_timing_model": {\n                "samples": len(self._move_timing_samples),\n                "ready": self._move_eta_model_ready,\n                "intercept_s": round(self._move_eta_intercept, 3),\n                "slope_s_per_norm": round(self._move_eta_slope, 3),\n                "last_predicted_eta_s": round(self._last_predicted_move_eta, 3),\n            },\n            "ptz_operation": self._ptz_operation,''',
+              "status timing model",
+          )
+
+          replace_once(
+              '''    async def camera_status(self) -> dict:\n        return await asyncio.to_thread(self.ptz.get_status)\n\n    def _begin_ptz_operation(self, kind: str, seq: int, now: float) -> None:''',
+              '''    async def camera_status(self) -> dict:\n        return await asyncio.to_thread(self.ptz.get_status)\n\n    @staticmethod\n    def _move_distance_from_center(point: Tuple[float, float], frame_shape: Tuple[int, ...]) -> float:\n        h, w = frame_shape[:2]\n        half_w = max(1.0, w / 2.0)\n        half_h = max(1.0, h / 2.0)\n        return min(2.0, abs(point[0] - half_w) / half_w + abs(point[1] - half_h) / half_h)\n\n    def _predict_move_eta(self, move_distance: float) -> float:\n        fallback = max(self.cfg.move_eta_min, min(self.cfg.move_eta_max, self.cfg.lead_time))\n        if not self.cfg.adaptive_lead or not self._move_eta_model_ready:\n            eta = fallback\n        else:\n            eta = self._move_eta_intercept + self._move_eta_slope * max(0.0, move_distance)\n            eta = max(self.cfg.move_eta_min, min(self.cfg.move_eta_max, eta))\n        self._last_predicted_move_eta = eta\n        return eta\n\n    def _update_move_timing_model(self, move_distance: float, elapsed_s: float) -> None:\n        if not (math.isfinite(move_distance) and math.isfinite(elapsed_s)):\n            return\n        if move_distance < 0.0 or elapsed_s < 0.10 or elapsed_s > self.cfg.ptz_operation_timeout:\n            return\n\n        self._move_timing_samples.append((float(move_distance), float(elapsed_s)))\n        if len(self._move_timing_samples) < self.cfg.move_eta_min_samples:\n            return\n\n        x = np.array([sample[0] for sample in self._move_timing_samples], dtype=float)\n        y = np.array([sample[1] for sample in self._move_timing_samples], dtype=float)\n\n        def fit(x_values: np.ndarray, y_values: np.ndarray) -> Tuple[float, float]:\n            if len(x_values) < 2 or float(np.ptp(x_values)) < 0.03:\n                return float(np.median(y_values)), 0.0\n            design = np.column_stack((np.ones(x_values.shape[0]), x_values))\n            intercept, slope = np.linalg.lstsq(design, y_values, rcond=None)[0]\n            if not (math.isfinite(float(intercept)) and math.isfinite(float(slope))):\n                return float(np.median(y_values)), 0.0\n            if slope < 0.0:\n                return float(np.median(y_values)), 0.0\n            return float(intercept), float(slope)\n\n        intercept, slope = fit(x, y)\n\n        # One robust refit keeps a delayed HTTP/status outlier from poisoning ETA.\n        if len(x) >= 5:\n            predicted = intercept + slope * x\n            residuals = y - predicted\n            median_residual = float(np.median(residuals))\n            mad = float(np.median(np.abs(residuals - median_residual)))\n            residual_limit = max(0.20, 3.0 * 1.4826 * mad)\n            mask = np.abs(residuals - median_residual) <= residual_limit\n            if int(np.count_nonzero(mask)) >= self.cfg.move_eta_min_samples:\n                intercept, slope = fit(x[mask], y[mask])\n\n        self._move_eta_intercept = max(0.10, min(self.cfg.move_eta_max, intercept))\n        self._move_eta_slope = max(0.0, min(2.0, slope))\n        self._move_eta_model_ready = True\n\n    @staticmethod\n    def _point_segment_distance(\n        point: Tuple[float, float],\n        start: Tuple[float, float],\n        end: Tuple[float, float],\n    ) -> float:\n        px, py = point\n        ax, ay = start\n        bx, by = end\n        dx = bx - ax\n        dy = by - ay\n        denom = dx * dx + dy * dy\n        if denom <= 1e-6:\n            return math.hypot(px - ax, py - ay)\n        t = ((px - ax) * dx + (py - ay) * dy) / denom\n        t = max(0.0, min(1.0, t))\n        cx = ax + t * dx\n        cy = ay + t * dy\n        return math.hypot(px - cx, py - cy)\n\n    def _validate_velocity_for_lead(self, frame_shape: Tuple[int, ...]) -> Tuple[bool, Optional[str]]:\n        if self.target is None or not self.target.velocity_valid:\n            return False, "velocity_sample"\n\n        h, w = frame_shape[:2]\n        vx = self.target.vx\n        vy = self.target.vy\n        speed = math.hypot(vx, vy)\n\n        # A center moving more than ~1.5 frame diagonals/second is much more likely\n        # to be association/bbox noise than a useful prediction sample.\n        if speed > max(100.0, math.hypot(w, h) * 1.5):\n            return False, "velocity_magnitude"\n\n        previous = self._trusted_velocity\n        self._trusted_velocity = (vx, vy)\n        if previous is None:\n            return True, None\n\n        prev_speed = math.hypot(previous[0], previous[1])\n        if speed < 20.0 or prev_speed < 20.0:\n            return True, None\n\n        cosine = (vx * previous[0] + vy * previous[1]) / max(1e-6, speed * prev_speed)\n        if cosine < self.cfg.velocity_consistency_cosine:\n            return False, "velocity_direction_change"\n\n        ratio = max(speed, prev_speed) / max(1.0, min(speed, prev_speed))\n        if ratio > self.cfg.velocity_jump_ratio:\n            return False, "velocity_jump"\n\n        return True, None\n\n    def _begin_ptz_operation(self, kind: str, seq: int, now: float) -> None:''',
+              "helpers",
+          )
+
+          replace_once(
+              '''        elapsed_ms = int(max(0.0, now - self._ptz_operation_started_at) * 1000)\n        self._record_event(\n            "ptz_operation_timeout" if timed_out else "ptz_operation_complete",\n            operation=kind,\n            elapsed_ms=elapsed_ms,\n            seen_motion=self._ptz_seen_motion,\n            idle_polls=self._ptz_idle_polls,\n            move_status=status.get("status.MoveStatus") if status else None,\n            pan_tilt_status=status.get("status.PanTiltStatus") if status else None,\n            zoom_status=status.get("status.ZoomStatus") if status else None,\n            position=None if position is None else [round(v, 3) for v in position],\n        )''',
+              '''        elapsed_ms = int(max(0.0, now - self._ptz_operation_started_at) * 1000)\n        move_distance = self._pending_move_distance if kind == "move" else None\n        if kind == "move" and not timed_out and move_distance is not None:\n            self._update_move_timing_model(move_distance, elapsed_ms / 1000.0)\n\n        event_fields = {\n            "operation": kind,\n            "elapsed_ms": elapsed_ms,\n            "seen_motion": self._ptz_seen_motion,\n            "idle_polls": self._ptz_idle_polls,\n            "move_status": status.get("status.MoveStatus") if status else None,\n            "pan_tilt_status": status.get("status.PanTiltStatus") if status else None,\n            "zoom_status": status.get("status.ZoomStatus") if status else None,\n            "position": None if position is None else [round(v, 3) for v in position],\n        }\n        if kind == "move":\n            event_fields.update(\n                move_distance=None if move_distance is None else round(move_distance, 3),\n                move_timing_samples=len(self._move_timing_samples),\n                move_eta_model_ready=self._move_eta_model_ready,\n                move_eta_intercept_s=round(self._move_eta_intercept, 3),\n                move_eta_slope_s_per_norm=round(self._move_eta_slope, 3),\n            )\n        self._record_event(\n            "ptz_operation_timeout" if timed_out else "ptz_operation_complete",\n            **event_fields,\n        )''',
+              "finish timing event",
+          )
+
+          replace_once(
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n\n    async def _poll_ptz_operation''',
+              '''        self._target_seen_during_ptz_operation = False\n        self._loss_pause_logged = False\n        self._pending_move_distance = None\n\n    async def _poll_ptz_operation''',
+              "finish clear pending",
+          )
+
+          replace_once(
+              '''            chosen = max(candidates, key=acquisition_key)\n            self.target = TargetTrack(''',
+              '''            chosen = max(candidates, key=acquisition_key)\n            self._trusted_velocity = None\n            self._association_motion_start_center = None\n            self._association_motion_end_center = None\n            self.target = TargetTrack(''',
+              "new target reset",
+          )
+
+          replace_once(
+              '''            if rebasing_velocity:\n                self.target.rebase_velocity(now)\n                self._velocity_rebase_required = False''',
+              '''            if rebasing_velocity:\n                self.target.rebase_velocity(now)\n                self._velocity_rebase_required = False\n                self._association_motion_start_center = None\n                self._association_motion_end_center = None''',
+              "rebase association clear",
+          )
+
+          replace_once(
+              '''        if camera_recently_moved:\n            # PTZ motion is global image motion, not subject velocity. Do not\n            # extrapolate the bbox across a camera movement.\n            px, py = self.target.center\n        else:\n            px, py = self.target.predicted_center(now)''',
+              '''        motion_start: Optional[Tuple[float, float]] = None\n        motion_end: Optional[Tuple[float, float]] = None\n        if camera_recently_moved:\n            # Approximate the camera-induced image shift from the moveDirectly\n            # command itself. This is a lightweight analogue of Frigate's camera\n            # motion compensation: associate against the whole expected image-motion\n            # corridor, not only the stale pre-move target center.\n            motion_start = self._association_motion_start_center or self.target.center\n            motion_end = self._association_motion_end_center or self.target.center\n            px, py = self.target.center\n        else:\n            px, py = self.target.predicted_center(now)''',
+              "association setup",
+          )
+
+          replace_once(
+              '''            cx, cy = det.center\n            dist_norm = math.hypot(cx - px, cy - py) / diag\n            proximity_span = 0.75 if camera_recently_moved else 0.45''',
+              '''            cx, cy = det.center\n            if camera_recently_moved and motion_start is not None and motion_end is not None:\n                dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag\n            else:\n                dist_norm = math.hypot(cx - px, cy - py) / diag\n            proximity_span = 0.75 if camera_recently_moved else 0.45''',
+              "association corridor distance",
+          )
+
+          replace_once(
+              '''            lead_suppressed_reason: Optional[str] = None\n            if not self.target.velocity_valid:\n                lead_suppressed_reason = "velocity_sample"\n            elif self.target.confidence < self.cfg.lead_min_conf:\n                lead_suppressed_reason = "low_confidence"\n            elif target_span < self.cfg.lead_min_span:\n                lead_suppressed_reason = "small_target"\n            elif edge_clipped:\n                lead_suppressed_reason = "edge_clipped"\n\n            lead_valid = lead_suppressed_reason is None\n            if lead_valid:\n                lead_dx = velocity_x * self.cfg.lead_time\n                lead_dy = velocity_y * self.cfg.lead_time\n                max_lead_x = w * 0.20\n                max_lead_y = h * 0.20\n                lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))\n                lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))\n            else:\n                lead_dx = 0.0\n                lead_dy = 0.0\n\n            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))\n            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))\n\n            frame_cx = w / 2.0\n            frame_cy = h / 2.0\n            command_center = (\n                frame_cx + (predicted_cx - frame_cx) * self.cfg.move_gain,\n                frame_cy + (predicted_cy - frame_cy) * self.cfg.move_gain,\n            )\n            scaled = self.ptz._scale_point(command_center, frame_shape)''',
+              '''            frame_cx = w / 2.0\n            frame_cy = h / 2.0\n\n            # Estimate the duration of the move we are about to ask for using the\n            # camera's own completed-move history. Before enough samples exist,\n            # TRACKER_LEAD_TIME remains the conservative known-good fallback.\n            base_command_center = (\n                frame_cx + (target_cx - frame_cx) * self.cfg.move_gain,\n                frame_cy + (target_cy - frame_cy) * self.cfg.move_gain,\n            )\n            base_move_distance = self._move_distance_from_center(base_command_center, frame_shape)\n            lead_horizon_s = self._predict_move_eta(base_move_distance)\n\n            lead_suppressed_reason: Optional[str] = None\n            if not self.target.velocity_valid:\n                lead_suppressed_reason = "velocity_sample"\n            elif self.target.confidence < self.cfg.lead_min_conf:\n                lead_suppressed_reason = "low_confidence"\n            elif target_span < self.cfg.lead_min_span:\n                lead_suppressed_reason = "small_target"\n            elif edge_clipped:\n                lead_suppressed_reason = "edge_clipped"\n            else:\n                velocity_ok, velocity_reason = self._validate_velocity_for_lead(frame_shape)\n                if not velocity_ok:\n                    lead_suppressed_reason = velocity_reason\n\n            lead_valid = lead_suppressed_reason is None\n            if lead_valid:\n                lead_dx = velocity_x * lead_horizon_s\n                lead_dy = velocity_y * lead_horizon_s\n                max_lead_x = w * 0.20\n                max_lead_y = h * 0.20\n                lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))\n                lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))\n            else:\n                lead_dx = 0.0\n                lead_dy = 0.0\n\n            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))\n            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))\n\n            command_center = (\n                frame_cx + (predicted_cx - frame_cx) * self.cfg.move_gain,\n                frame_cy + (predicted_cy - frame_cy) * self.cfg.move_gain,\n            )\n            move_distance = self._move_distance_from_center(command_center, frame_shape)\n\n            # Approximate where the predicted subject should land after the camera\n            # shift. Association uses the segment from the current center to this\n            # expected center while the PTZ is moving/settling.\n            expected_post_move_center = (\n                max(0.0, min(float(w), predicted_cx + frame_cx - command_center[0])),\n                max(0.0, min(float(h), predicted_cy + frame_cy - command_center[1])),\n            )\n            scaled = self.ptz._scale_point(command_center, frame_shape)''',
+              "adaptive lead",
+          )
+
+          replace_once(
+              '''                self.ptz_commands += 1\n                self.move_direct_commands += 1\n                self._last_move_point = scaled\n                self._begin_ptz_operation("move", seq, t1)''',
+              '''                self.ptz_commands += 1\n                self.move_direct_commands += 1\n                self._last_move_point = scaled\n                self._pending_move_distance = move_distance\n                self._association_motion_start_center = (target_cx, target_cy)\n                self._association_motion_end_center = expected_post_move_center\n                self._begin_ptz_operation("move", seq, t1)''',
+              "move runtime metadata",
+          )
+
+          replace_once(
+              '''                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],\n                    move_gain=round(self.cfg.move_gain, 3),\n                    lead_time=round(self.cfg.lead_time, 3),\n                    error_x=round(err_x, 3),''',
+              '''                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],\n                    move_gain=round(self.cfg.move_gain, 3),\n                    lead_time=round(self.cfg.lead_time, 3),\n                    lead_horizon_s=round(lead_horizon_s, 3),\n                    predicted_move_eta_ms=int(lead_horizon_s * 1000),\n                    move_distance=round(move_distance, 3),\n                    move_timing_samples=len(self._move_timing_samples),\n                    move_eta_model_ready=self._move_eta_model_ready,\n                    expected_post_move_center_px=[\n                        round(expected_post_move_center[0], 1),\n                        round(expected_post_move_center[1], 1),\n                    ],\n                    error_x=round(err_x, 3),''',
+              "move diagnostics",
+          )
+
+          path.write_text(s)
+          PY
+
+      - name: Validate tracker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile tracker.py
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          s = Path("tracker.py").read_text()
+          checks = [
+              'adaptive_lead: bool = True',
+              'def _update_move_timing_model',
+              'def _predict_move_eta',
+              'def _point_segment_distance',
+              'def _validate_velocity_for_lead',
+              'predicted_move_eta_ms=',
+              'expected_post_move_center_px=',
+              '"control_mode": "moveDirectly"',
+              'matched.confidence < self.cfg.acquire_conf',
+          ]
+          missing = [item for item in checks if item not in s]
+          if missing:
+              raise SystemExit(f"missing safeguards/features: {missing}")
+          if 'continuous_chase_enabled' in s:
+              raise SystemExit('continuous chase unexpectedly present')
+          print('Frigate-inspired moveDirectly validation passed')
+          PY
+
+      - name: Commit tracker and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm --ignore-unmatch .github/workflows/apply-frigate-inspired-movedirectly.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tracker.py
+          git commit -m 'Learn PTZ move timing for predictive tracking'
+          git push origin HEAD:main
