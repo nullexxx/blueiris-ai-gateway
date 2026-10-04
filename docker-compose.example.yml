@@ -22,12 +22,12 @@ services:
       ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
       NVIDIA_VISIBLE_DEVICES: "all"
 
-      # Optional PTZ tracker
-      TRACKER_ENABLED: "true"
-      TRACKER_AUTOSTART: "false"
-      TRACKER_CAMERA_IP: "${TRACKER_CAMERA_IP}"
+      # Optional PTZ tracker. Enable it in .env after setting camera credentials.
+      TRACKER_ENABLED: "${TRACKER_ENABLED:-false}"
+      TRACKER_AUTOSTART: "${TRACKER_AUTOSTART:-false}"
+      TRACKER_CAMERA_IP: "${TRACKER_CAMERA_IP:-}"
       TRACKER_CAMERA_USER: "${TRACKER_CAMERA_USER:-admin}"
-      TRACKER_CAMERA_PASSWORD: "${TRACKER_CAMERA_PASSWORD}"
+      TRACKER_CAMERA_PASSWORD: "${TRACKER_CAMERA_PASSWORD:-}"
       TRACKER_CAMERA_CHANNEL: "0"
       TRACKER_RTSP_CHANNEL: "1"
       TRACKER_RTSP_SUBTYPE: "1"
