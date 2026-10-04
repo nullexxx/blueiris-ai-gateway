@@ -1,0 +1,221 @@
+name: Tracker patch review
+
+on:
+  push:
+    branches: [ "tracker-velocity-quality-review" ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-check:
+    if: github.event.head_commit.message != 'Apply tracker velocity quality improvements'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout review branch
+        uses: actions/checkout@v4
+        with:
+          ref: tracker-velocity-quality-review
+          fetch-depth: 0
+
+      - name: Apply focused tracker patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tracker.py")
+          s = path.read_text()
+
+          def rep(old: str, new: str, count: int = 1) -> None:
+              global s
+              actual = s.count(old)
+              if actual != count:
+                  raise RuntimeError(f"Expected {count} match(es), found {actual}: {old[:160]!r}")
+              s = s.replace(old, new, count)
+
+          # Predictive-lead quality configuration. Defaults are intentionally
+          # conservative and do not require Compose changes.
+          rep(
+              '''    move_gain: float = 0.60\n    lead_time: float = 0.75\n\n    # Native PTZ operation tracking.''',
+              '''    move_gain: float = 0.60\n    lead_time: float = 0.75\n\n    # Predictive lead is only trusted after a real stationary-camera sample\n    # window and while the detection is large/clean enough to measure reliably.\n    velocity_min_sample_ms: int = 100\n    lead_min_conf: float = 0.50\n    lead_min_span: float = 0.08\n    lead_edge_margin: float = 0.02\n\n    # Native PTZ operation tracking.''',
+          )
+          rep(
+              '''            move_gain=_env_float("TRACKER_MOVE_GAIN", 0.60),\n            lead_time=_env_float("TRACKER_LEAD_TIME", 0.75),\n            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''',
+              '''            move_gain=_env_float("TRACKER_MOVE_GAIN", 0.60),\n            lead_time=_env_float("TRACKER_LEAD_TIME", 0.75),\n            velocity_min_sample_ms=_env_int("TRACKER_VELOCITY_MIN_SAMPLE_MS", 100),\n            lead_min_conf=_env_float("TRACKER_LEAD_MIN_CONF", 0.50),\n            lead_min_span=_env_float("TRACKER_LEAD_MIN_SPAN", 0.08),\n            lead_edge_margin=_env_float("TRACKER_LEAD_EDGE_MARGIN", 0.02),\n            ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),''',
+          )
+          rep(
+              '''        cfg.move_gain = max(0.20, min(1.00, cfg.move_gain))\n        cfg.lead_time = max(0.0, min(1.50, cfg.lead_time))\n        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''',
+              '''        cfg.move_gain = max(0.20, min(1.00, cfg.move_gain))\n        cfg.lead_time = max(0.0, min(1.50, cfg.lead_time))\n        cfg.velocity_min_sample_ms = max(50, min(500, cfg.velocity_min_sample_ms))\n        cfg.lead_min_conf = max(cfg.hold_conf, min(0.95, cfg.lead_min_conf))\n        cfg.lead_min_span = max(0.02, min(0.50, cfg.lead_min_span))\n        cfg.lead_edge_margin = max(0.0, min(0.10, cfg.lead_edge_margin))\n        cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))''',
+          )
+          rep(
+              '''            "move_gain": self.move_gain,\n            "lead_time": self.lead_time,\n            "ptz_status_poll_interval": self.ptz_status_poll_interval,''',
+              '''            "move_gain": self.move_gain,\n            "lead_time": self.lead_time,\n            "velocity_min_sample_ms": self.velocity_min_sample_ms,\n            "lead_min_conf": self.lead_min_conf,\n            "lead_min_span": self.lead_min_span,\n            "lead_edge_margin": self.lead_edge_margin,\n            "ptz_status_poll_interval": self.ptz_status_poll_interval,''',
+          )
+
+          # Keep velocity sampling on a dedicated stationary-camera reference
+          # instead of differentiating two YOLO boxes only tens of ms apart.
+          start = s.index("@dataclass\nclass TargetTrack:")
+          end = s.index("\n\ndef _iou(", start)
+          s = s[:start] + '''@dataclass
+          class TargetTrack:
+              class_id: int
+              label: str
+              bbox: Tuple[float, float, float, float]
+              confidence: float
+              center: Tuple[float, float]
+              last_update: float
+              last_seen: float
+              vx: float = 0.0
+              vy: float = 0.0
+              acquire_hits: int = 1
+              velocity_reference_center: Optional[Tuple[float, float]] = None
+              velocity_reference_time: Optional[float] = None
+              velocity_sample_ms: int = 0
+              velocity_valid: bool = False
+
+              def rebase_velocity(self, now: float) -> None:
+                  self.velocity_reference_center = self.center
+                  self.velocity_reference_time = now
+                  self.velocity_sample_ms = 0
+                  self.velocity_valid = False
+                  self.vx = 0.0
+                  self.vy = 0.0
+
+              def clear_velocity(self) -> None:
+                  self.velocity_reference_center = None
+                  self.velocity_reference_time = None
+                  self.velocity_sample_ms = 0
+                  self.velocity_valid = False
+                  self.vx = 0.0
+                  self.vy = 0.0
+
+              def update(
+                  self,
+                  det: Detection,
+                  now: float,
+                  *,
+                  update_velocity: bool = True,
+                  min_velocity_sample_s: float = 0.10,
+              ) -> None:
+                  if det.class_id != self.class_id:
+                      raise ValueError("TargetTrack.update received a different object class")
+
+                  new_center = det.center
+                  if update_velocity:
+                      if self.velocity_reference_center is None or self.velocity_reference_time is None:
+                          self.velocity_reference_center = self.center
+                          self.velocity_reference_time = self.last_update
+
+                      sample_s = max(0.0, now - self.velocity_reference_time)
+                      self.velocity_sample_ms = int(sample_s * 1000)
+                      if sample_s >= max(0.001, min_velocity_sample_s):
+                          ref_x, ref_y = self.velocity_reference_center
+                          inst_vx = (new_center[0] - ref_x) / sample_s
+                          inst_vy = (new_center[1] - ref_y) / sample_s
+                          alpha = 0.35
+                          if self.velocity_valid:
+                              self.vx = (1.0 - alpha) * self.vx + alpha * inst_vx
+                              self.vy = (1.0 - alpha) * self.vy + alpha * inst_vy
+                          else:
+                              self.vx = inst_vx
+                              self.vy = inst_vy
+                          self.velocity_valid = True
+                          self.velocity_reference_center = new_center
+                          self.velocity_reference_time = now
+                          self.velocity_sample_ms = int(sample_s * 1000)
+                  else:
+                      # Follow the bbox for association, but never learn global
+                      # image motion as target velocity while the PTZ is moving.
+                      self.clear_velocity()
+
+                  self.bbox = det.bbox
+                  self.confidence = det.confidence
+                  self.center = new_center
+                  self.last_update = now
+                  self.last_seen = now
+                  self.acquire_hits += 1
+
+              def predicted_center(self, now: float) -> Tuple[float, float]:
+                  dt = min(0.6, max(0.0, now - self.last_update))
+                  return (self.center[0] + self.vx * dt, self.center[1] + self.vy * dt)
+          '''.replace("          ", "") + s[end:]
+
+          rep(
+              '''                "velocity_px_s": [round(self.target.vx, 1), round(self.target.vy, 1)],\n                "acquire_hits": self.target.acquire_hits,''',
+              '''                "velocity_px_s": [round(self.target.vx, 1), round(self.target.vy, 1)],\n                "velocity_sample_ms": self.target.velocity_sample_ms,\n                "velocity_valid": self.target.velocity_valid,\n                "acquire_hits": self.target.acquire_hits,''',
+          )
+
+          rep(
+              '''        if self.target is not None:\n            self.target.vx = 0.0\n            self.target.vy = 0.0\n\n    @staticmethod\n    def _position_stable''',
+              '''        if self.target is not None:\n            self.target.clear_velocity()\n\n    @staticmethod\n    def _position_stable''',
+          )
+          rep(
+              '''            self.target.last_seen = now\n            self.target.last_update = now\n            self.target.vx = 0.0\n            self.target.vy = 0.0\n            self._velocity_rebase_required = True''',
+              '''            self.target.last_seen = now\n            self.target.last_update = now\n            self.target.clear_velocity()\n            self._velocity_rebase_required = True''',
+          )
+
+          rep(
+              '''            self.target.update(matched, now, update_velocity=velocity_learning_allowed)\n\n            # After a PTZ move completes, deliberately consume one matched target\n            # observation as the new image-space baseline. Do not issue a new PTZ\n            # command from that same frame: the following stationary frame is what\n            # produces the first trustworthy subject-velocity sample.\n            if rebasing_velocity:\n                self._velocity_rebase_required = False''',
+              '''            self.target.update(\n                matched,\n                now,\n                update_velocity=velocity_learning_allowed,\n                min_velocity_sample_s=self.cfg.velocity_min_sample_ms / 1000.0,\n            )\n\n            # Consume one post-move match as the stationary image-space reference.\n            # Later bbox updates do not move this reference until the sample window\n            # is mature, eliminating the noisy 30-60 ms velocity estimates.\n            if rebasing_velocity:\n                self.target.rebase_velocity(now)\n                self._velocity_rebase_required = False''',
+          )
+          rep(
+              '''            self._home_sent = False\n            self._loss_pause_logged = False\n            if self._ptz_operation is not None:\n                self._target_seen_during_ptz_operation = True''',
+              '''            self._home_sent = False\n            if self._ptz_operation is None and ptz_ready:\n                self._loss_pause_logged = False\n            if self._ptz_operation is not None:\n                self._target_seen_during_ptz_operation = True''',
+          )
+          rep(
+              '''            if rebasing_velocity:\n                self._record_event(\n                    "velocity_rebased",\n                    label=self.target.label,\n                    center_px=[round(self.target.center[0], 1), round(self.target.center[1], 1)],\n                )\n                return\n            await self._drive_to_target(frame.shape, seq, now)''',
+              '''            if rebasing_velocity:\n                self._record_event(\n                    "velocity_rebased",\n                    label=self.target.label,\n                    center_px=[round(self.target.center[0], 1), round(self.target.center[1], 1)],\n                )\n                return\n\n            # Wait only for one robust stationary-camera sample after a PTZ move.\n            # At 15 FPS the 100 ms default is about two frames, negligible beside\n            # the camera's ~1.5 s mechanical slew.\n            if (\n                self._ptz_operation is None\n                and ptz_ready\n                and self.target.velocity_reference_time is not None\n                and not self.target.velocity_valid\n                and (now - self.target.velocity_reference_time)\n                    < (self.cfg.velocity_min_sample_ms / 1000.0)\n            ):\n                self.state = "VELOCITY_SAMPLE"\n                return\n\n            await self._drive_to_target(frame.shape, seq, now)''',
+          )
+
+          # Suppress only predictive lead when the measurement is unreliable.
+          # Pan/tilt still follows the instantaneous target using move_gain.
+          rep(
+              '''            target_cx, target_cy = self.target.center\n            velocity_x = self.target.vx\n            velocity_y = self.target.vy\n            lead_dx = velocity_x * self.cfg.lead_time\n            lead_dy = velocity_y * self.cfg.lead_time\n            max_lead_x = w * 0.20\n            max_lead_y = h * 0.20\n            lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))\n            lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))\n\n            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))\n            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))''',
+              '''            target_cx, target_cy = self.target.center\n            velocity_x = self.target.vx\n            velocity_y = self.target.vy\n            velocity_sample_ms = self.target.velocity_sample_ms\n\n            margin_x = w * self.cfg.lead_edge_margin\n            margin_y = h * self.cfg.lead_edge_margin\n            edge_clipped = (\n                x1 <= margin_x\n                or y1 <= margin_y\n                or x2 >= (w - margin_x)\n                or y2 >= (h - margin_y)\n            )\n\n            lead_suppressed_reason: Optional[str] = None\n            if not self.target.velocity_valid:\n                lead_suppressed_reason = "velocity_sample"\n            elif self.target.confidence < self.cfg.lead_min_conf:\n                lead_suppressed_reason = "low_confidence"\n            elif target_span < self.cfg.lead_min_span:\n                lead_suppressed_reason = "small_target"\n            elif edge_clipped:\n                lead_suppressed_reason = "edge_clipped"\n\n            lead_valid = lead_suppressed_reason is None\n            if lead_valid:\n                lead_dx = velocity_x * self.cfg.lead_time\n                lead_dy = velocity_y * self.cfg.lead_time\n                max_lead_x = w * 0.20\n                max_lead_y = h * 0.20\n                lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))\n                lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))\n            else:\n                lead_dx = 0.0\n                lead_dy = 0.0\n\n            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))\n            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))''',
+          )
+          rep(
+              '''                    velocity_px_s=[round(velocity_x, 1), round(velocity_y, 1)],\n                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],\n                    move_gain=round(self.cfg.move_gain, 3),''',
+              '''                    velocity_px_s=[round(velocity_x, 1), round(velocity_y, 1)],\n                    velocity_sample_ms=velocity_sample_ms,\n                    lead_valid=lead_valid,\n                    lead_suppressed_reason=lead_suppressed_reason,\n                    edge_clipped=edge_clipped,\n                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],\n                    move_gain=round(self.cfg.move_gain, 3),''',
+          )
+
+          path.write_text(s)
+          PY
+
+      - name: Syntax and whitespace checks
+        run: |
+          python3 -m py_compile tracker.py
+          git diff --check
+          git diff -- tracker.py
+
+      - name: Verify expected safeguards exist
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('tracker.py').read_text()
+          required = [
+              'velocity_min_sample_ms: int = 100',
+              'lead_min_conf: float = 0.50',
+              'lead_min_span: float = 0.08',
+              'lead_edge_margin: float = 0.02',
+              'self.target.rebase_velocity(now)',
+              'self.state = "VELOCITY_SAMPLE"',
+              'lead_suppressed_reason = "low_confidence"',
+              'lead_suppressed_reason = "small_target"',
+              'lead_suppressed_reason = "edge_clipped"',
+              'velocity_sample_ms=velocity_sample_ms',
+              'lead_valid=lead_valid',
+          ]
+          missing = [item for item in required if item not in s]
+          if missing:
+              raise SystemExit(f'Missing expected safeguards: {missing}')
+          print('tracker safeguard checks: PASS')
+          PY
+
+      - name: Commit reviewed tracker change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracker.py
+          git commit -m "Apply tracker velocity quality improvements"
+          git push origin HEAD:tracker-velocity-quality-review
