@@ -116,7 +116,7 @@ class TrackerConfig:
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
     ptz_operation_timeout: float = 4.0
-    post_move_frames: int = 2
+    post_move_frames: int = 1
 
     # Bounded, deliberately conservative auto-zoom. Camera reports 5.12 at
     # full-wide and 128 at full-tele (25x). Default auto-tracking ceiling is 6x.
@@ -176,7 +176,7 @@ class TrackerConfig:
             lead_time=_env_float("TRACKER_LEAD_TIME", 0.75),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
-            post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 2),
+            post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
             autozoom=_env_bool("TRACKER_AUTOZOOM", True),
             zoom_wide_position=_env_float("TRACKER_ZOOM_WIDE_POSITION", 5.12),
             zoom_min_factor=_env_float("TRACKER_ZOOM_MIN_FACTOR", 1.0),
@@ -1052,7 +1052,9 @@ class DogTracker:
         self._ptz_last_poll_position = position
 
         # Avoid accepting an immediate stale Idle response directly after a command.
-        # Two consecutive idle/stable polls after 200 ms are required.
+        # If real movement has already been observed, one subsequent idle/stable
+        # poll is enough. If movement was never observed, retain the conservative
+        # two-poll confirmation to protect against a stale immediate Idle response.
         if (polled_at - self._ptz_operation_started_at) < 0.20:
             self._ptz_idle_polls = 0
             return
@@ -1064,7 +1066,8 @@ class DogTracker:
         else:
             self._ptz_idle_polls = 0
 
-        if self._ptz_idle_polls >= 2:
+        required_idle_polls = 1 if self._ptz_seen_motion else 2
+        if self._ptz_idle_polls >= required_idle_polls:
             self._finish_ptz_operation(seq, polled_at, timed_out=False, status=status)
 
     def _ptz_action_ready(self, seq: int) -> bool:
@@ -1214,6 +1217,11 @@ class DogTracker:
             was_acquiring = self.target.acquire_hits < self.cfg.acquire_frames
 
             ptz_ready = self._ptz_action_ready(seq)
+            rebasing_velocity = (
+                self._ptz_operation is None
+                and ptz_ready
+                and self._velocity_rebase_required
+            )
             velocity_learning_allowed = (
                 self._ptz_operation is None
                 and ptz_ready
@@ -1222,8 +1230,10 @@ class DogTracker:
             self.target.update(matched, now, update_velocity=velocity_learning_allowed)
 
             # After a PTZ move completes, deliberately consume one matched target
-            # observation as the new image-space baseline before learning velocity.
-            if self._ptz_operation is None and ptz_ready and self._velocity_rebase_required:
+            # observation as the new image-space baseline. Do not issue a new PTZ
+            # command from that same frame: the following stationary frame is what
+            # produces the first trustworthy subject-velocity sample.
+            if rebasing_velocity:
                 self._velocity_rebase_required = False
 
             self._home_sent = False
@@ -1253,6 +1263,13 @@ class DogTracker:
             self.state = "PTZ_MOVING" if self._ptz_operation is not None else (
                 "PTZ_SETTLING" if not self._ptz_action_ready(seq) else "TRACK"
             )
+            if rebasing_velocity:
+                self._record_event(
+                    "velocity_rebased",
+                    label=self.target.label,
+                    center_px=[round(self.target.center[0], 1), round(self.target.center[1], 1)],
+                )
+                return
             await self._drive_to_target(frame.shape, seq, now)
             return
 
