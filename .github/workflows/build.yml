@@ -8,7 +8,7 @@ on:
       - "app.py"
       - "tracker.py"
       - ".github/workflows/build.yml"
-  workflow_dispatch: # Manual GHCR build from the GitHub web UI
+  workflow_dispatch: # Manual GHCR build from the GitHub web UI (hybrid chase ready)
   schedule:
     - cron: '0 4 * * 0' # Rebuild every Sunday at 4:00 AM UTC
 
