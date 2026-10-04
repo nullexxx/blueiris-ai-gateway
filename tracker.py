@@ -112,6 +112,13 @@ class TrackerConfig:
     move_gain: float = 0.60
     lead_time: float = 0.75
 
+    # Predictive lead is only trusted after a real stationary-camera sample
+    # window and while the detection is large/clean enough to measure reliably.
+    velocity_min_sample_ms: int = 100
+    lead_min_conf: float = 0.50
+    lead_min_span: float = 0.08
+    lead_edge_margin: float = 0.02
+
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
@@ -174,6 +181,10 @@ class TrackerConfig:
             move_deadzone_y=_env_float("TRACKER_MOVE_DEADZONE_Y", 0.18),
             move_gain=_env_float("TRACKER_MOVE_GAIN", 0.60),
             lead_time=_env_float("TRACKER_LEAD_TIME", 0.75),
+            velocity_min_sample_ms=_env_int("TRACKER_VELOCITY_MIN_SAMPLE_MS", 100),
+            lead_min_conf=_env_float("TRACKER_LEAD_MIN_CONF", 0.50),
+            lead_min_span=_env_float("TRACKER_LEAD_MIN_SPAN", 0.08),
+            lead_edge_margin=_env_float("TRACKER_LEAD_EDGE_MARGIN", 0.02),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
@@ -215,6 +226,10 @@ class TrackerConfig:
         cfg.move_deadzone_y = max(0.02, min(0.80, cfg.move_deadzone_y))
         cfg.move_gain = max(0.20, min(1.00, cfg.move_gain))
         cfg.lead_time = max(0.0, min(1.50, cfg.lead_time))
+        cfg.velocity_min_sample_ms = max(50, min(500, cfg.velocity_min_sample_ms))
+        cfg.lead_min_conf = max(cfg.hold_conf, min(0.95, cfg.lead_min_conf))
+        cfg.lead_min_span = max(0.02, min(0.50, cfg.lead_min_span))
+        cfg.lead_edge_margin = max(0.0, min(0.10, cfg.lead_edge_margin))
         cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))
         cfg.ptz_operation_timeout = max(0.75, min(15.0, cfg.ptz_operation_timeout))
         cfg.post_move_frames = max(1, min(20, cfg.post_move_frames))
@@ -293,6 +308,10 @@ class TrackerConfig:
             "move_deadzone_y": self.move_deadzone_y,
             "move_gain": self.move_gain,
             "lead_time": self.lead_time,
+            "velocity_min_sample_ms": self.velocity_min_sample_ms,
+            "lead_min_conf": self.lead_min_conf,
+            "lead_min_span": self.lead_min_span,
+            "lead_edge_margin": self.lead_edge_margin,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -604,24 +623,66 @@ class TargetTrack:
     vx: float = 0.0
     vy: float = 0.0
     acquire_hits: int = 1
+    velocity_reference_center: Optional[Tuple[float, float]] = None
+    velocity_reference_time: Optional[float] = None
+    velocity_sample_ms: int = 0
+    velocity_valid: bool = False
 
-    def update(self, det: Detection, now: float, *, update_velocity: bool = True) -> None:
+    def rebase_velocity(self, now: float) -> None:
+        self.velocity_reference_center = self.center
+        self.velocity_reference_time = now
+        self.velocity_sample_ms = 0
+        self.velocity_valid = False
+        self.vx = 0.0
+        self.vy = 0.0
+
+    def clear_velocity(self) -> None:
+        self.velocity_reference_center = None
+        self.velocity_reference_time = None
+        self.velocity_sample_ms = 0
+        self.velocity_valid = False
+        self.vx = 0.0
+        self.vy = 0.0
+
+    def update(
+        self,
+        det: Detection,
+        now: float,
+        *,
+        update_velocity: bool = True,
+        min_velocity_sample_s: float = 0.10,
+    ) -> None:
         if det.class_id != self.class_id:
             raise ValueError("TargetTrack.update received a different object class")
+
         new_center = det.center
         if update_velocity:
-            dt = max(0.001, now - self.last_update)
-            inst_vx = (new_center[0] - self.center[0]) / dt
-            inst_vy = (new_center[1] - self.center[1]) / dt
-            alpha = 0.35
-            self.vx = (1.0 - alpha) * self.vx + alpha * inst_vx
-            self.vy = (1.0 - alpha) * self.vy + alpha * inst_vy
+            if self.velocity_reference_center is None or self.velocity_reference_time is None:
+                self.velocity_reference_center = self.center
+                self.velocity_reference_time = self.last_update
+
+            sample_s = max(0.0, now - self.velocity_reference_time)
+            self.velocity_sample_ms = int(sample_s * 1000)
+            if sample_s >= max(0.001, min_velocity_sample_s):
+                ref_x, ref_y = self.velocity_reference_center
+                inst_vx = (new_center[0] - ref_x) / sample_s
+                inst_vy = (new_center[1] - ref_y) / sample_s
+                alpha = 0.35
+                if self.velocity_valid:
+                    self.vx = (1.0 - alpha) * self.vx + alpha * inst_vx
+                    self.vy = (1.0 - alpha) * self.vy + alpha * inst_vy
+                else:
+                    self.vx = inst_vx
+                    self.vy = inst_vy
+                self.velocity_valid = True
+                self.velocity_reference_center = new_center
+                self.velocity_reference_time = now
+                self.velocity_sample_ms = int(sample_s * 1000)
         else:
-            # The bbox still needs to follow the target for association while the
-            # camera is slewing, but global image motion must never be learned as
-            # subject velocity. This also refreshes the velocity baseline.
-            self.vx = 0.0
-            self.vy = 0.0
+            # Follow the bbox for association, but never learn global
+            # image motion as target velocity while the PTZ is moving.
+            self.clear_velocity()
+
         self.bbox = det.bbox
         self.confidence = det.confidence
         self.center = new_center
@@ -857,6 +918,8 @@ class DogTracker:
                 "bbox": [round(v, 1) for v in self.target.bbox],
                 "center": [round(v, 1) for v in self.target.center],
                 "velocity_px_s": [round(self.target.vx, 1), round(self.target.vy, 1)],
+                "velocity_sample_ms": self.target.velocity_sample_ms,
+                "velocity_valid": self.target.velocity_valid,
                 "acquire_hits": self.target.acquire_hits,
                 "span": None if self._last_target_span is None else round(self._last_target_span, 3),
             }
@@ -945,8 +1008,7 @@ class DogTracker:
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
         if self.target is not None:
-            self.target.vx = 0.0
-            self.target.vy = 0.0
+            self.target.clear_velocity()
 
     @staticmethod
     def _position_stable(
@@ -998,8 +1060,7 @@ class DogTracker:
         if self.target is not None:
             self.target.last_seen = now
             self.target.last_update = now
-            self.target.vx = 0.0
-            self.target.vy = 0.0
+            self.target.clear_velocity()
             self._velocity_rebase_required = True
 
         self._ptz_operation = None
@@ -1227,17 +1288,23 @@ class DogTracker:
                 and ptz_ready
                 and not self._velocity_rebase_required
             )
-            self.target.update(matched, now, update_velocity=velocity_learning_allowed)
+            self.target.update(
+                matched,
+                now,
+                update_velocity=velocity_learning_allowed,
+                min_velocity_sample_s=self.cfg.velocity_min_sample_ms / 1000.0,
+            )
 
-            # After a PTZ move completes, deliberately consume one matched target
-            # observation as the new image-space baseline. Do not issue a new PTZ
-            # command from that same frame: the following stationary frame is what
-            # produces the first trustworthy subject-velocity sample.
+            # Consume one post-move match as the stationary image-space reference.
+            # Later bbox updates do not move this reference until the sample window
+            # is mature, eliminating the noisy 30-60 ms velocity estimates.
             if rebasing_velocity:
+                self.target.rebase_velocity(now)
                 self._velocity_rebase_required = False
 
             self._home_sent = False
-            self._loss_pause_logged = False
+            if self._ptz_operation is None and ptz_ready:
+                self._loss_pause_logged = False
             if self._ptz_operation is not None:
                 self._target_seen_during_ptz_operation = True
 
@@ -1270,6 +1337,21 @@ class DogTracker:
                     center_px=[round(self.target.center[0], 1), round(self.target.center[1], 1)],
                 )
                 return
+
+            # Wait only for one robust stationary-camera sample after a PTZ move.
+            # At 15 FPS the 100 ms default is about two frames, negligible beside
+            # the camera's ~1.5 s mechanical slew.
+            if (
+                self._ptz_operation is None
+                and ptz_ready
+                and self.target.velocity_reference_time is not None
+                and not self.target.velocity_valid
+                and (now - self.target.velocity_reference_time)
+                    < (self.cfg.velocity_min_sample_ms / 1000.0)
+            ):
+                self.state = "VELOCITY_SAMPLE"
+                return
+
             await self._drive_to_target(frame.shape, seq, now)
             return
 
@@ -1442,12 +1524,38 @@ class DogTracker:
             target_cx, target_cy = self.target.center
             velocity_x = self.target.vx
             velocity_y = self.target.vy
-            lead_dx = velocity_x * self.cfg.lead_time
-            lead_dy = velocity_y * self.cfg.lead_time
-            max_lead_x = w * 0.20
-            max_lead_y = h * 0.20
-            lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
-            lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))
+            velocity_sample_ms = self.target.velocity_sample_ms
+
+            margin_x = w * self.cfg.lead_edge_margin
+            margin_y = h * self.cfg.lead_edge_margin
+            edge_clipped = (
+                x1 <= margin_x
+                or y1 <= margin_y
+                or x2 >= (w - margin_x)
+                or y2 >= (h - margin_y)
+            )
+
+            lead_suppressed_reason: Optional[str] = None
+            if not self.target.velocity_valid:
+                lead_suppressed_reason = "velocity_sample"
+            elif self.target.confidence < self.cfg.lead_min_conf:
+                lead_suppressed_reason = "low_confidence"
+            elif target_span < self.cfg.lead_min_span:
+                lead_suppressed_reason = "small_target"
+            elif edge_clipped:
+                lead_suppressed_reason = "edge_clipped"
+
+            lead_valid = lead_suppressed_reason is None
+            if lead_valid:
+                lead_dx = velocity_x * self.cfg.lead_time
+                lead_dy = velocity_y * self.cfg.lead_time
+                max_lead_x = w * 0.20
+                max_lead_y = h * 0.20
+                lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
+                lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))
+            else:
+                lead_dx = 0.0
+                lead_dy = 0.0
 
             predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))
             predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))
@@ -1477,6 +1585,10 @@ class DogTracker:
                     predicted_center_px=[round(predicted_cx, 1), round(predicted_cy, 1)],
                     command_center_px=[round(command_center[0], 1), round(command_center[1], 1)],
                     velocity_px_s=[round(velocity_x, 1), round(velocity_y, 1)],
+                    velocity_sample_ms=velocity_sample_ms,
+                    lead_valid=lead_valid,
+                    lead_suppressed_reason=lead_suppressed_reason,
+                    edge_clipped=edge_clipped,
                     lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
                     move_gain=round(self.cfg.move_gain, 3),
                     lead_time=round(self.cfg.lead_time, 3),
