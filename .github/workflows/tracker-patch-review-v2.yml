@@ -1,0 +1,143 @@
+name: Tracker patch review v2
+
+on:
+  push:
+    branches: [ "tracker-velocity-quality-review" ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-check-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout review branch
+        uses: actions/checkout@v4
+        with:
+          ref: tracker-velocity-quality-review
+          fetch-depth: 0
+
+      - name: Apply corrected focused patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          workflow = Path('.github/workflows/tracker-patch-review.yml').read_text()
+          match = re.search(
+              r"python3 - <<'PY'\n(?P<body>.*?)\n          PY",
+              workflow,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit('Could not extract patch script from review workflow')
+
+          script = textwrap.dedent(match.group('body'))
+          bad = "'''.replace(\"          \", \"\") + s[end:]"
+          good = "''' + s[end:]"
+          if script.count(bad) != 1:
+              raise SystemExit('Expected exactly one broken indentation replacement')
+          script = script.replace(bad, good, 1)
+          exec(compile(script, '<tracker-patch>', 'exec'), {})
+          PY
+
+      - name: Syntax and whitespace checks
+        run: |
+          python3 -m py_compile tracker.py
+          git diff --check
+
+      - name: Static safeguard checks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('tracker.py').read_text()
+          required = [
+              'velocity_min_sample_ms: int = 100',
+              'lead_min_conf: float = 0.50',
+              'lead_min_span: float = 0.08',
+              'lead_edge_margin: float = 0.02',
+              'self.target.rebase_velocity(now)',
+              'self.state = "VELOCITY_SAMPLE"',
+              'lead_suppressed_reason = "low_confidence"',
+              'lead_suppressed_reason = "small_target"',
+              'lead_suppressed_reason = "edge_clipped"',
+              'velocity_sample_ms=velocity_sample_ms',
+              'lead_valid=lead_valid',
+              'edge_clipped=edge_clipped',
+          ]
+          missing = [item for item in required if item not in s]
+          if missing:
+              raise SystemExit(f'Missing expected safeguards: {missing}')
+          print('static tracker safeguard checks: PASS')
+          PY
+
+      - name: TargetTrack velocity-window behavior test
+        run: |
+          python3 - <<'PY'
+          import ast
+          from dataclasses import dataclass
+          from pathlib import Path
+          from typing import Optional, Tuple
+
+          source = Path('tracker.py').read_text()
+          tree = ast.parse(source)
+          wanted = {'Detection', 'TargetTrack'}
+          nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in wanted]
+          if {n.name for n in nodes} != wanted:
+              raise SystemExit('Could not locate Detection and TargetTrack')
+
+          ns = {
+              'dataclass': dataclass,
+              'Optional': Optional,
+              'Tuple': Tuple,
+          }
+          exec(compile(ast.Module(body=nodes, type_ignores=[]), '<target-track-test>', 'exec'), ns)
+          Detection = ns['Detection']
+          TargetTrack = ns['TargetTrack']
+
+          track = TargetTrack(
+              class_id=0,
+              label='person',
+              bbox=(90.0, 90.0, 110.0, 110.0),
+              confidence=0.9,
+              center=(100.0, 100.0),
+              last_update=1.0,
+              last_seen=1.0,
+          )
+          track.rebase_velocity(1.0)
+
+          d1 = Detection(0, 'person', 0.9, (94.0, 90.0, 114.0, 110.0))
+          track.update(d1, 1.05, min_velocity_sample_s=0.10)
+          assert not track.velocity_valid, track
+          assert 45 <= track.velocity_sample_ms <= 55, track.velocity_sample_ms
+          assert track.velocity_reference_center == (100.0, 100.0)
+
+          d2 = Detection(0, 'person', 0.9, (102.0, 90.0, 122.0, 110.0))
+          track.update(d2, 1.12, min_velocity_sample_s=0.10)
+          assert track.velocity_valid, track
+          assert 115 <= track.velocity_sample_ms <= 125, track.velocity_sample_ms
+          assert 95.0 <= track.vx <= 105.0, track.vx
+          assert abs(track.vy) < 1e-6, track.vy
+
+          track.clear_velocity()
+          assert not track.velocity_valid
+          assert track.velocity_reference_time is None
+          assert track.vx == 0.0 and track.vy == 0.0
+          print('TargetTrack velocity-window behavior: PASS')
+          PY
+
+      - name: Review diff scope
+        run: |
+          git diff --stat
+          git diff -- tracker.py
+          test "$(git diff --name-only | tr '\n' ' ')" = "tracker.py "
+
+      - name: Remove temporary review workflows and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/tracker-patch-review.yml .github/workflows/tracker-patch-review-v2.yml
+          git add tracker.py
+          git commit -m "Improve PTZ predictive lead quality gating"
+          git push origin HEAD:tracker-velocity-quality-review
