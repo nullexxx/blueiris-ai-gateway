@@ -1,0 +1,84 @@
+name: Fix hybrid pan direction
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/fix-hybrid-pan-direction.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply tracker fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tracker.py')
+          s = p.read_text()
+
+          def r(old, new, count=1):
+              global s
+              n = s.count(old)
+              if n != count:
+                  raise SystemExit(f'expected {count} matches, found {n}: {old[:120]!r}')
+              s = s.replace(old, new, count)
+
+          # Empirical camera calibration: the Dahua Continuously horizontal sign
+          # is opposite our image-error sign on this camera. The previous code
+          # drove farther away from right-edge targets, then escalated speed.
+          r('    hybrid_chase_enabled: bool = True\n', '    hybrid_chase_enabled: bool = True\n    hybrid_chase_pan_sign: int = -1\n')
+          r('            hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),\n', '            hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),\n            hybrid_chase_pan_sign=_env_int("TRACKER_HYBRID_CHASE_PAN_SIGN", -1),\n')
+          r('        cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))\n', '        cfg.hybrid_chase_pan_sign = 1 if cfg.hybrid_chase_pan_sign >= 0 else -1\n        cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))\n')
+          r('            "hybrid_chase_enabled": self.hybrid_chase_enabled,\n', '            "hybrid_chase_enabled": self.hybrid_chase_enabled,\n            "hybrid_chase_pan_sign": self.hybrid_chase_pan_sign,\n')
+
+          # Back off the aggressive tuning that amplified the wrong-direction bug.
+          r('    hybrid_chase_exit_error: float = 0.42\n', '    hybrid_chase_exit_error: float = 0.50\n')
+          r('    hybrid_chase_motion_error: float = 0.45\n', '    hybrid_chase_motion_error: float = 0.55\n')
+          r('    hybrid_chase_miss_grace: float = 0.60\n', '    hybrid_chase_miss_grace: float = 0.15\n')
+          r('    hybrid_chase_max_speed: int = 8\n', '    hybrid_chase_max_speed: int = 6\n')
+          r('    hybrid_chase_full_speed_error: float = 0.82\n', '    hybrid_chase_full_speed_error: float = 0.90\n')
+          r('_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42)', '_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.50)')
+          r('_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.45)', '_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.55)')
+          r('_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.60)', '_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.15)')
+          r('_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 8)', '_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 6)')
+          r('_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.82)', '_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.90)')
+
+          # Apply the camera-specific horizontal polarity in both chase entry and
+          # subsequent closed-loop updates. Vertical polarity remains unchanged.
+          r('pan_speed = self._hybrid_axis_speed(err_x)', 'pan_speed = self.cfg.hybrid_chase_pan_sign * self._hybrid_axis_speed(err_x)', count=2)
+
+          # Do not keep driving continuously on a barely-valid detection.
+          old = '''        if max(abs(err_x), abs(err_y)) <= self.cfg.hybrid_chase_exit_error:\n            await self._stop_hybrid_chase("safe_inner_region", seq=seq)\n            return\n'''
+          new = '''        if max(abs(err_x), abs(err_y)) <= self.cfg.hybrid_chase_exit_error:\n            await self._stop_hybrid_chase("safe_inner_region", seq=seq)\n            return\n        if self.target is not None and self.target.confidence < self.cfg.reacquire_conf:\n            await self._stop_hybrid_chase("low_confidence", seq=seq)\n            return\n'''
+          r(old, new)
+
+          p.write_text(s)
+          PY
+
+      - name: Validate tracker
+        run: |
+          python3 -m py_compile tracker.py
+          git diff --check
+          grep -q 'hybrid_chase_pan_sign: int = -1' tracker.py
+          test "$(grep -c 'hybrid_chase_pan_sign \* self._hybrid_axis_speed(err_x)' tracker.py)" -eq 2
+          grep -q 'hybrid_chase_miss_grace: float = 0.15' tracker.py
+          grep -q 'hybrid_chase_max_speed: int = 6' tracker.py
+          grep -q 'low_confidence' tracker.py
+
+      - name: Commit fix and remove one-shot workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tracker.py
+          git rm .github/workflows/fix-hybrid-pan-direction.yml
+          git commit -m 'Fix hybrid continuous pan direction and braking'
+          git push
