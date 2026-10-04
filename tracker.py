@@ -16,7 +16,41 @@ import requests
 from requests.auth import HTTPDigestAuth
 
 
-InferenceCallback = Callable[[np.ndarray, float, str, int], Awaitable[Tuple[str, List[dict], int]]]
+InferenceCallback = Callable[[np.ndarray, float, str, List[int]], Awaitable[Tuple[str, List[dict], int]]]
+
+
+# Standard Ultralytics YOLO11 COCO class IDs used by the tracker.
+COCO_TRACKER_CLASSES: Dict[str, int] = {
+    "person": 0,
+    "bird": 14,
+    "cat": 15,
+    "dog": 16,
+    "horse": 17,
+    "sheep": 18,
+    "cow": 19,
+    "elephant": 20,
+    "bear": 21,
+    "zebra": 22,
+    "giraffe": 23,
+}
+
+def _parse_class_list(value: str, default: List[str]) -> List[str]:
+    raw = [item.strip().lower() for item in value.split(",") if item.strip()]
+    result: List[str] = []
+    for token in (raw or default):
+        if token.isdigit():
+            cid = int(token)
+            name = next((n for n, i in COCO_TRACKER_CLASSES.items() if i == cid), str(cid))
+        else:
+            if token not in COCO_TRACKER_CLASSES:
+                raise ValueError(
+                    f"Unsupported TRACKER target class '{token}'. "
+                    f"Supported names: {', '.join(COCO_TRACKER_CLASSES)}"
+                )
+            name = token
+        if name not in result:
+            result.append(name)
+    return result
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -54,7 +88,8 @@ class TrackerConfig:
     rtsp_url: str = ""
 
     model_name: str = "yolo11l"
-    target_class_id: int = 16
+    target_classes: List[str] = field(default_factory=lambda: ["person", "dog", "cat", "bird", "bear"])
+    target_priority: List[str] = field(default_factory=lambda: ["dog", "person", "bear", "cat", "bird"])
     fps: float = 8.0
     acquire_conf: float = 0.40
     hold_conf: float = 0.22
@@ -96,7 +131,14 @@ class TrackerConfig:
             rtsp_subtype=_env_int("TRACKER_RTSP_SUBTYPE", 1),
             rtsp_url=os.getenv("TRACKER_RTSP_URL", "").strip(),
             model_name=os.getenv("TRACKER_MODEL", os.getenv("DEFAULT_MODEL", "yolo11l")).strip(),
-            target_class_id=_env_int("TRACKER_TARGET_CLASS_ID", 16),
+            target_classes=_parse_class_list(
+                os.getenv("TRACKER_TARGET_CLASSES", "person,dog,cat,bird,bear"),
+                ["person", "dog", "cat", "bird", "bear"],
+            ),
+            target_priority=_parse_class_list(
+                os.getenv("TRACKER_TARGET_PRIORITY", "dog,person,bear,cat,bird"),
+                ["dog", "person", "bear", "cat", "bird"],
+            ),
             fps=_env_float("TRACKER_FPS", 8.0),
             acquire_conf=_env_float("TRACKER_ACQUIRE_CONF", 0.40),
             hold_conf=_env_float("TRACKER_HOLD_CONF", 0.22),
@@ -120,6 +162,13 @@ class TrackerConfig:
             move_directly_enabled=_env_bool("TRACKER_MOVE_DIRECTLY_ENABLED", False),
         )
 
+        # Keep priority limited to enabled classes, then append any enabled
+        # classes omitted from the priority list so every target remains selectable.
+        cfg.target_priority = [name for name in cfg.target_priority if name in cfg.target_classes]
+        for name in cfg.target_classes:
+            if name not in cfg.target_priority:
+                cfg.target_priority.append(name)
+
         # Sanity constraints for hysteresis.
         cfg.deadzone_x_in = max(0.0, min(0.8, cfg.deadzone_x_in))
         cfg.deadzone_x_out = max(cfg.deadzone_x_in, min(0.9, cfg.deadzone_x_out))
@@ -131,6 +180,22 @@ class TrackerConfig:
         cfg.reacquire_time = max(cfg.coast_time, cfg.reacquire_time)
         cfg.home_timeout = max(cfg.reacquire_time, cfg.home_timeout)
         return cfg
+
+    @property
+    def target_class_ids(self) -> List[int]:
+        ids: List[int] = []
+        for name in self.target_classes:
+            if name.isdigit():
+                ids.append(int(name))
+            else:
+                ids.append(COCO_TRACKER_CLASSES[name])
+        return ids
+
+    def class_priority_rank(self, label: str) -> int:
+        try:
+            return self.target_priority.index(label)
+        except ValueError:
+            return len(self.target_priority) + 100
 
     def resolved_rtsp_url(self) -> str:
         if self.rtsp_url:
@@ -150,7 +215,9 @@ class TrackerConfig:
             "rtsp_channel": self.rtsp_channel,
             "rtsp_subtype": self.rtsp_subtype,
             "model": self.model_name,
-            "target_class_id": self.target_class_id,
+            "target_classes": list(self.target_classes),
+            "target_class_ids": list(self.target_class_ids),
+            "target_priority": list(self.target_priority),
             "fps": self.fps,
             "acquire_conf": self.acquire_conf,
             "hold_conf": self.hold_conf,
@@ -407,6 +474,8 @@ class AmcrestPTZ:
 
 @dataclass
 class Detection:
+    class_id: int
+    label: str
     confidence: float
     bbox: Tuple[float, float, float, float]
 
@@ -423,6 +492,8 @@ class Detection:
 
 @dataclass
 class TargetTrack:
+    class_id: int
+    label: str
     bbox: Tuple[float, float, float, float]
     confidence: float
     center: Tuple[float, float]
@@ -433,6 +504,8 @@ class TargetTrack:
     acquire_hits: int = 1
 
     def update(self, det: Detection, now: float) -> None:
+        if det.class_id != self.class_id:
+            raise ValueError("TargetTrack.update received a different object class")
         new_center = det.center
         dt = max(0.001, now - self.last_update)
         inst_vx = (new_center[0] - self.center[0]) / dt
@@ -505,11 +578,11 @@ class DogTracker:
         if not self.cfg.camera_ip:
             raise RuntimeError("TRACKER_CAMERA_IP is required when TRACKER_ENABLED=true")
         if not self.cfg.camera_password:
-            self.logger.warning("Dog tracker camera password is empty.")
+            self.logger.warning("PTZ tracker camera password is empty.")
         self.capture.start()
-        self._task = asyncio.create_task(self._run(), name="dog-ptz-tracker")
+        self._task = asyncio.create_task(self._run(), name="multi-ptz-tracker")
         self.logger.info(
-            "Dog tracker initialized: camera=%s model=%s fps=%.1f autostart=%s",
+            "PTZ tracker initialized: camera=%s model=%s fps=%.1f autostart=%s",
             self.cfg.camera_ip,
             self.cfg.model_name,
             self.cfg.fps,
@@ -546,7 +619,7 @@ class DogTracker:
         self._last_tilt = 0
         if self.cfg.goto_home_on_start:
             await self.home()
-        self.logger.info("Dog PTZ tracker STARTED")
+        self.logger.info("PTZ tracker STARTED")
         return self.status()
 
     async def stop(self) -> dict:
@@ -558,7 +631,7 @@ class DogTracker:
         self._last_pan = 0
         self._last_tilt = 0
         await asyncio.to_thread(self.ptz.stop, True)
-        self.logger.info("Dog PTZ tracker STOPPED")
+        self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
     async def home(self) -> dict:
@@ -586,6 +659,8 @@ class DogTracker:
         if self.target is not None:
             last_seen_ms = int(max(0.0, now - self.target.last_seen) * 1000)
             target_info = {
+                "class_id": self.target.class_id,
+                "label": self.target.label,
                 "confidence": round(self.target.confidence, 3),
                 "bbox": [round(v, 1) for v in self.target.bbox],
                 "center": [round(v, 1) for v in self.target.center],
@@ -610,7 +685,9 @@ class DogTracker:
             "frame_age_ms": frame_age_ms,
             "frame_shape": list(self._last_frame_shape) if self._last_frame_shape else None,
             "model": self.cfg.model_name,
-            "target_class_id": self.cfg.target_class_id,
+            "target_classes": list(self.cfg.target_classes),
+            "target_class_ids": list(self.cfg.target_class_ids),
+            "target_priority": list(self.cfg.target_priority),
             "target": target_info,
             "last_seen_ms": last_seen_ms,
             "last_error_x": None if self._last_error_x is None else round(self._last_error_x, 3),
@@ -671,7 +748,7 @@ class DogTracker:
                     frame,
                     self.cfg.hold_conf,
                     self.cfg.model_name,
-                    self.cfg.target_class_id,
+                    self.cfg.target_class_ids,
                 )
                 self._last_inference_outcome = outcome
                 self._last_inference_ms = infer_ms
@@ -690,6 +767,8 @@ class DogTracker:
                 self._inference_times.append(time.monotonic())
                 detections = [
                     Detection(
+                        class_id=int(d["class_id"]),
+                        label=str(d["label"]),
                         confidence=float(d["confidence"]),
                         bbox=(float(d["x_min"]), float(d["y_min"]), float(d["x_max"]), float(d["y_max"])),
                     )
@@ -703,7 +782,7 @@ class DogTracker:
             raise
         except Exception as exc:
             self.state = "TRACKER_ERROR"
-            self.logger.exception("Dog tracker loop crashed: %s", exc)
+            self.logger.exception("PTZ tracker loop crashed: %s", exc)
             try:
                 await self._stop_ptz_if_needed(force=True)
             except Exception:
@@ -719,12 +798,22 @@ class DogTracker:
                 await self._stop_ptz_if_needed()
                 return
 
-            # One-dog use case: favor confidence, with a mild preference for a
-            # larger/closer detection so a tiny distant false positive is less attractive.
+            # Priority is applied only while acquiring a new target. Once a target
+            # is locked, another class cannot steal the lock until the current target
+            # is genuinely lost. Within the same priority class, favor confidence
+            # with a mild preference for a larger/closer detection.
             h, w = frame.shape[:2]
             frame_area = max(1.0, float(h * w))
-            chosen = max(candidates, key=lambda d: d.confidence + 0.10 * math.sqrt(d.area / frame_area))
+
+            def acquisition_key(det: Detection) -> Tuple[int, float]:
+                rank = self.cfg.class_priority_rank(det.label)
+                quality = det.confidence + 0.10 * math.sqrt(det.area / frame_area)
+                return (-rank, quality)
+
+            chosen = max(candidates, key=acquisition_key)
             self.target = TargetTrack(
+                class_id=chosen.class_id,
+                label=chosen.label,
                 bbox=chosen.bbox,
                 confidence=chosen.confidence,
                 center=chosen.center,
@@ -751,7 +840,8 @@ class DogTracker:
             if was_acquiring and self.target.acquire_hits == self.cfg.acquire_frames:
                 self.targets_acquired += 1
                 self.logger.info(
-                    "Dog target acquired: conf=%.2f bbox=%s",
+                    "%s target acquired: conf=%.2f bbox=%s",
+                    self.target.label,
                     self.target.confidence,
                     tuple(round(v, 1) for v in self.target.bbox),
                 )
@@ -794,7 +884,12 @@ class DogTracker:
             ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
             if ok:
                 self.home_returns += 1
-                self.logger.info("Dog lost for %.1fs; returned to preset %d", missing_for, self.cfg.home_preset)
+                self.logger.info(
+                    "%s lost for %.1fs; returned to preset %d",
+                    self.target.label if self.target is not None else "target",
+                    missing_for,
+                    self.cfg.home_preset,
+                )
             self._home_sent = True
         self.target = None
         self._x_active = False
@@ -817,6 +912,10 @@ class DogTracker:
         best_score = -1.0
         best_dist_norm = 999.0
         for det in detections:
+            # Sticky multi-class lock: while tracking a dog, person, cat, etc.,
+            # detections from other classes are ignored until that target is lost.
+            if det.class_id != self.target.class_id:
+                continue
             cx, cy = det.center
             dist_norm = math.hypot(cx - px, cy - py) / diag
             proximity = max(0.0, 1.0 - (dist_norm / 0.45))
@@ -922,7 +1021,7 @@ class DogTracker:
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 190, 255), 1)
                 cv2.putText(
                     debug,
-                    f"dog {det.confidence:.2f}",
+                    f"{det.label} {det.confidence:.2f}",
                     (x1, max(15, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
@@ -938,8 +1037,11 @@ class DogTracker:
                 cv2.line(debug, (cx, cy), (tx, ty), (0, 255, 0), 1)
                 cv2.circle(debug, (tx, ty), 4, (0, 255, 0), -1)
 
+            target_text = ""
+            if self.target is not None:
+                target_text = f" {self.target.label} {self.target.confidence:.2f}"
             text = (
-                f"{self.state} PTZ={self.ptz.current_vector[0]},{self.ptz.current_vector[1]} "
+                f"{self.state}{target_text} PTZ={self.ptz.current_vector[0]},{self.ptz.current_vector[1]} "
                 f"err={self._last_error_x if self._last_error_x is not None else 0:+.2f},"
                 f"{self._last_error_y if self._last_error_y is not None else 0:+.2f} "
                 f"infer={self._last_inference_ms}ms"
