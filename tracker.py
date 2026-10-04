@@ -130,6 +130,18 @@ class TrackerConfig:
     escape_error: float = 0.72
     escape_gain: float = 0.85
 
+    # High-speed continuous chase controller. Continuously exposes signed motor
+    # speeds (-8..8), unlike moveDirectly where firmware chooses the positional
+    # slew. Start at speed 5 because this Dahua API family documents movement
+    # outside the +/-4 soft region, then scale to speed 8 as frame error grows.
+    continuous_chase_enabled: bool = True
+    continuous_min_speed: int = 5
+    continuous_max_speed: int = 8
+    continuous_full_speed_error: float = 0.60
+    continuous_command_interval: float = 0.15
+    continuous_keepalive: float = 0.45
+    continuous_camera_timeout: int = 1
+
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
@@ -202,6 +214,13 @@ class TrackerConfig:
             inflight_reversal_error=_env_float("TRACKER_INFLIGHT_REVERSAL_ERROR", 0.22),
             escape_error=_env_float("TRACKER_ESCAPE_ERROR", 0.72),
             escape_gain=_env_float("TRACKER_ESCAPE_GAIN", 0.85),
+            continuous_chase_enabled=_env_bool("TRACKER_CONTINUOUS_CHASE_ENABLED", True),
+            continuous_min_speed=_env_int("TRACKER_CONTINUOUS_MIN_SPEED", 5),
+            continuous_max_speed=_env_int("TRACKER_CONTINUOUS_MAX_SPEED", 8),
+            continuous_full_speed_error=_env_float("TRACKER_CONTINUOUS_FULL_SPEED_ERROR", 0.60),
+            continuous_command_interval=_env_float("TRACKER_CONTINUOUS_COMMAND_INTERVAL", 0.15),
+            continuous_keepalive=_env_float("TRACKER_CONTINUOUS_KEEPALIVE", 0.45),
+            continuous_camera_timeout=_env_int("TRACKER_CONTINUOUS_CAMERA_TIMEOUT", 1),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
@@ -252,6 +271,18 @@ class TrackerConfig:
         cfg.inflight_reversal_error = max(0.10, min(0.80, cfg.inflight_reversal_error))
         cfg.escape_error = max(0.50, min(0.95, cfg.escape_error))
         cfg.escape_gain = max(cfg.move_gain, min(1.0, cfg.escape_gain))
+        cfg.continuous_min_speed = max(1, min(8, cfg.continuous_min_speed))
+        cfg.continuous_max_speed = max(cfg.continuous_min_speed, min(8, cfg.continuous_max_speed))
+        cfg.continuous_full_speed_error = max(
+            max(cfg.move_deadzone_x, cfg.move_deadzone_y) + 0.05,
+            min(0.95, cfg.continuous_full_speed_error),
+        )
+        cfg.continuous_command_interval = max(0.05, min(0.50, cfg.continuous_command_interval))
+        cfg.continuous_camera_timeout = max(1, min(5, cfg.continuous_camera_timeout))
+        cfg.continuous_keepalive = max(
+            cfg.continuous_command_interval,
+            min(cfg.continuous_camera_timeout * 0.75, cfg.continuous_keepalive),
+        )
         cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))
         cfg.ptz_operation_timeout = max(0.75, min(15.0, cfg.ptz_operation_timeout))
         cfg.post_move_frames = max(1, min(20, cfg.post_move_frames))
@@ -340,6 +371,13 @@ class TrackerConfig:
             "inflight_reversal_error": self.inflight_reversal_error,
             "escape_error": self.escape_error,
             "escape_gain": self.escape_gain,
+            "continuous_chase_enabled": self.continuous_chase_enabled,
+            "continuous_min_speed": self.continuous_min_speed,
+            "continuous_max_speed": self.continuous_max_speed,
+            "continuous_full_speed_error": self.continuous_full_speed_error,
+            "continuous_command_interval": self.continuous_command_interval,
+            "continuous_keepalive": self.continuous_keepalive,
+            "continuous_camera_timeout": self.continuous_camera_timeout,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -577,6 +615,50 @@ class AmcrestPTZ:
         except Exception:
             return False
 
+    def continuous_move(self, pan_speed: int, tilt_speed: int, timeout_s: int = 1) -> bool:
+        """Drive pan/tilt continuously with signed Dahua speeds (-8..8)."""
+        pan_speed = max(-8, min(8, int(pan_speed)))
+        tilt_speed = max(-8, min(8, int(tilt_speed)))
+        timeout_s = max(1, min(5, int(timeout_s)))
+        if pan_speed == 0 and tilt_speed == 0:
+            return self.continuous_stop()
+        try:
+            self._get(
+                "/cgi-bin/ptz.cgi",
+                {
+                    "action": "start",
+                    "channel": self.cfg.camera_channel,
+                    "code": "Continuously",
+                    "arg1": pan_speed,
+                    "arg2": tilt_speed,
+                    "arg3": 0,
+                    "arg4": timeout_s,
+                },
+            )
+            self.last_move_point = None
+            return True
+        except Exception:
+            return False
+
+    def continuous_stop(self) -> bool:
+        """Immediately stop continuous pan/tilt movement."""
+        try:
+            self._get(
+                "/cgi-bin/ptz.cgi",
+                {
+                    "action": "stop",
+                    "channel": self.cfg.camera_channel,
+                    "code": "Continuously",
+                    "arg1": 0,
+                    "arg2": 0,
+                    "arg3": 0,
+                    "arg4": 0,
+                },
+            )
+            return True
+        except Exception:
+            return False
+
     def zoom_step(self, direction: str, duration_ms: int) -> bool:
         """Perform one bounded optical-zoom step using ZoomTele/ZoomWide."""
         if direction not in ("in", "out"):
@@ -737,7 +819,7 @@ def _iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, flo
 
 
 class DogTracker:
-    """Multi-class YOLO tracker using Dahua 3D moveDirectly + bounded autozoom."""
+    """Multi-class YOLO tracker using Dahua continuous chase + bounded autozoom."""
 
     def __init__(self, cfg: TrackerConfig, inference_cb: InferenceCallback, logger):
         self.cfg = cfg
@@ -789,6 +871,11 @@ class DogTracker:
         self._last_inflight_retarget_at = 0.0
         self._last_move_command_error: Optional[Tuple[float, float]] = None
 
+        self._continuous_active = False
+        self._continuous_pan_speed = 0
+        self._continuous_tilt_speed = 0
+        self._continuous_last_command_at = 0.0
+
         self._last_detection_count = 0
         self._last_inference_ms = 0
         self._last_inference_outcome = "never"
@@ -805,6 +892,8 @@ class DogTracker:
         self.move_direct_commands = 0
         self.zoom_commands = 0
         self.inflight_retargets = 0
+        self.continuous_commands = 0
+        self.continuous_stops = 0
         self.targets_acquired = 0
         self.home_returns = 0
 
@@ -841,9 +930,9 @@ class DogTracker:
         if not self.cfg.camera_password:
             self.logger.warning("PTZ tracker camera password is empty.")
         self.capture.start()
-        self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
+        self._task = asyncio.create_task(self._run(), name="continuous-ptz-tracker")
         self.logger.info(
-            "PTZ tracker initialized: camera=%s model=%s fps=%.1f mode=moveDirectly autozoom=%s autostart=%s",
+            "PTZ tracker initialized: camera=%s model=%s fps=%.1f mode=continuous autozoom=%s autostart=%s",
             self.cfg.camera_ip,
             self.cfg.model_name,
             self.cfg.fps,
@@ -855,7 +944,7 @@ class DogTracker:
             camera=self.cfg.camera_ip,
             model=self.cfg.model_name,
             fps=self.cfg.fps,
-            move_directly=self.cfg.move_directly_enabled,
+            continuous_chase=self.cfg.continuous_chase_enabled,
             autozoom=self.cfg.autozoom,
         )
         if self.cfg.autostart:
@@ -865,6 +954,7 @@ class DogTracker:
         self._shutdown = True
         self.active = False
         self.state = "SHUTDOWN"
+        await self._stop_continuous("shutdown", force=True)
         if self._task:
             self._task.cancel()
             try:
@@ -897,6 +987,10 @@ class DogTracker:
         self._inflight_retarget_count = 0
         self._last_inflight_retarget_at = 0.0
         self._last_move_command_error = None
+        self._continuous_active = False
+        self._continuous_pan_speed = 0
+        self._continuous_tilt_speed = 0
+        self._continuous_last_command_at = 0.0
 
     async def start(self) -> dict:
         self._history.clear()
@@ -911,22 +1005,24 @@ class DogTracker:
         self._record_event(
             "tracker_started",
             goto_home_on_start=self.cfg.goto_home_on_start,
-            move_directly=self.cfg.move_directly_enabled,
+            continuous_chase=self.cfg.continuous_chase_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (3D moveDirectly + status-driven settle)")
+        self.logger.info("PTZ tracker STARTED (continuous chase + status-driven home/zoom)")
         return self.status()
 
     async def stop(self) -> dict:
         self._record_event("tracker_stopping")
         self.active = False
         self.state = "OFF"
+        await self._stop_continuous("tracker_stop", force=True)
         self._reset_tracking_state()
         self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
     async def home(self) -> dict:
+        await self._stop_continuous("home", force=True)
         self._reset_tracking_state()
         self._home_sent = True
         self.state = "HOME" if self.active else "OFF"
@@ -990,12 +1086,18 @@ class DogTracker:
             "session_started": self._session_started_wall,
             "history_events": len(self._history),
             "state": self.state,
-            "control_mode": "moveDirectly",
+            "control_mode": "continuous",
             "ptz_operation": self._ptz_operation,
             "ptz_operation_elapsed_ms": op_elapsed_ms,
             "ptz_operation_chain_elapsed_ms": op_chain_elapsed_ms,
             "ptz_operation_timeout_remaining_ms": op_timeout_remaining_ms,
-            "inflight_retargets_this_move": self._inflight_retarget_count,
+            "continuous_active": self._continuous_active,
+            "continuous_speed": [self._continuous_pan_speed, self._continuous_tilt_speed],
+            "continuous_command_age_ms": (
+                None
+                if self._continuous_last_command_at <= 0
+                else int(max(0.0, now - self._continuous_last_command_at) * 1000)
+            ),
             "post_move_frames_remaining": post_frames_remaining,
             "camera_motion_status": {
                 "move": self._last_camera_status.get("status.MoveStatus"),
@@ -1034,6 +1136,8 @@ class DogTracker:
                 "move_direct_commands": self.move_direct_commands,
                 "zoom_commands": self.zoom_commands,
                 "inflight_retargets": self.inflight_retargets,
+                "continuous_commands": self.continuous_commands,
+                "continuous_stops": self.continuous_stops,
                 "targets_acquired": self.targets_acquired,
                 "home_returns": self.home_returns,
             },
@@ -1370,6 +1474,125 @@ class DogTracker:
         )
         return True
 
+    def _continuous_axis_speed(self, error: float, deadzone: float) -> int:
+        magnitude = abs(error)
+        if magnitude <= deadzone:
+            return 0
+        full_error = max(deadzone + 0.01, self.cfg.continuous_full_speed_error)
+        ratio = max(0.0, min(1.0, (magnitude - deadzone) / (full_error - deadzone)))
+        speed = int(round(
+            self.cfg.continuous_min_speed
+            + ratio * (self.cfg.continuous_max_speed - self.cfg.continuous_min_speed)
+        ))
+        speed = max(self.cfg.continuous_min_speed, min(self.cfg.continuous_max_speed, speed))
+        return speed if error > 0 else -speed
+
+    async def _stop_continuous(
+        self,
+        reason: str,
+        *,
+        seq: Optional[int] = None,
+        force: bool = False,
+    ) -> bool:
+        was_active = (
+            self._continuous_active
+            or self._continuous_pan_speed != 0
+            or self._continuous_tilt_speed != 0
+        )
+        if not was_active and not force:
+            return True
+        t0 = time.monotonic()
+        ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        t1 = time.monotonic()
+        self._continuous_active = False
+        self._continuous_pan_speed = 0
+        self._continuous_tilt_speed = 0
+        self._continuous_last_command_at = t1
+        if ok and was_active:
+            self.ptz_commands += 1
+            self.continuous_stops += 1
+            self._record_event("continuous_stop", reason=reason, http_ms=int((t1 - t0) * 1000))
+        elif not ok and was_active:
+            self._record_event("continuous_stop_failed", reason=reason, error=self.ptz.last_error)
+        if was_active:
+            if self.target is not None:
+                self.target.clear_velocity()
+                self._velocity_rebase_required = True
+            if seq is not None:
+                self._post_motion_release_seq = max(
+                    self._post_motion_release_seq, seq + self.cfg.post_move_frames
+                )
+        return ok
+
+    async def _set_continuous_speed(
+        self,
+        pan_speed: int,
+        tilt_speed: int,
+        *,
+        seq: int,
+        now: float,
+        reason: str,
+        error_x: float,
+        error_y: float,
+        target_span: float,
+    ) -> bool:
+        pan_speed = max(-self.cfg.continuous_max_speed, min(self.cfg.continuous_max_speed, int(pan_speed)))
+        tilt_speed = max(-self.cfg.continuous_max_speed, min(self.cfg.continuous_max_speed, int(tilt_speed)))
+        if pan_speed == 0 and tilt_speed == 0:
+            return await self._stop_continuous("deadzone", seq=seq)
+        desired = (pan_speed, tilt_speed)
+        current = (self._continuous_pan_speed, self._continuous_tilt_speed)
+        same_speed = self._continuous_active and desired == current
+        elapsed = max(0.0, now - self._continuous_last_command_at)
+        if same_speed and elapsed < self.cfg.continuous_keepalive:
+            return True
+        def sign_changed(old: int, new: int) -> bool:
+            return old != 0 and new != 0 and ((old > 0) != (new > 0))
+        urgent = (
+            not self._continuous_active
+            or sign_changed(current[0], desired[0])
+            or sign_changed(current[1], desired[1])
+            or (current[0] != 0 and desired[0] == 0)
+            or (current[1] != 0 and desired[1] == 0)
+        )
+        if not same_speed and not urgent and elapsed < self.cfg.continuous_command_interval:
+            return True
+        t0 = time.monotonic()
+        ok = await asyncio.to_thread(
+            self.ptz.continuous_move, pan_speed, tilt_speed, self.cfg.continuous_camera_timeout
+        )
+        t1 = time.monotonic()
+        if not ok:
+            self._record_event(
+                "continuous_move_failed", reason=reason, pan_speed=pan_speed,
+                tilt_speed=tilt_speed, error=self.ptz.last_error
+            )
+            if self._continuous_active:
+                await self._stop_continuous("continuous_command_failed", seq=seq, force=True)
+            return False
+        changed = not same_speed
+        self._continuous_active = True
+        self._continuous_pan_speed = pan_speed
+        self._continuous_tilt_speed = tilt_speed
+        self._continuous_last_command_at = t1
+        self.ptz_commands += 1
+        self.continuous_commands += 1
+        self.state = "CHASE"
+        if self.target is not None:
+            self.target.clear_velocity()
+            self._velocity_rebase_required = True
+        if changed:
+            self._record_event(
+                "continuous_move", label=None if self.target is None else self.target.label,
+                reason=reason, pan_speed=pan_speed, tilt_speed=tilt_speed,
+                error_x=round(error_x, 3), error_y=round(error_y, 3),
+                target_span=round(target_span, 3),
+                confidence=None if self.target is None else round(self.target.confidence, 3),
+                http_ms=int((t1 - t0) * 1000),
+                camera_timeout_s=self.cfg.continuous_camera_timeout,
+            )
+        return True
+
     async def _run(self) -> None:
         period = 1.0 / self.cfg.fps
         next_tick = time.monotonic()
@@ -1394,9 +1617,13 @@ class DogTracker:
                 now = time.monotonic()
 
                 if frame is None or frame_time <= 0:
+                    if self._continuous_active:
+                        await self._stop_continuous("frame_unavailable", seq=seq, force=True)
                     self.state = "WAITING_FRAME"
                     continue
                 if (now - frame_time) > self.cfg.frame_stale_timeout:
+                    if self._continuous_active:
+                        await self._stop_continuous("stale_frame", seq=seq, force=True)
                     self.frames_stale += 1
                     self.state = "STALE_FRAME"
                     continue
@@ -1419,6 +1646,8 @@ class DogTracker:
                     self.frames_skipped_gpu_busy += 1
                     continue
                 if outcome != "ok":
+                    if self._continuous_active:
+                        await self._stop_continuous("inference_error", seq=seq, force=True)
                     self.state = "INFERENCE_ERROR"
                     continue
 
@@ -1441,6 +1670,10 @@ class DogTracker:
             raise
         except Exception as exc:
             self.state = "TRACKER_ERROR"
+            try:
+                await self._stop_continuous("tracker_error", force=True)
+            except Exception:
+                pass
             self.logger.exception("PTZ tracker loop crashed: %s", exc)
 
     async def _process_observation(
@@ -1512,17 +1745,26 @@ class DogTracker:
         ):
             matched = None
 
+        if (
+            matched is not None
+            and self.target.acquire_hits < self.cfg.acquire_frames
+            and matched.confidence < self.cfg.acquire_conf
+        ):
+            matched = None
+
         if matched is not None:
             was_acquiring = self.target.acquire_hits < self.cfg.acquire_frames
 
             ptz_ready = self._ptz_action_ready(seq)
             rebasing_velocity = (
                 self._ptz_operation is None
+                and not self._continuous_active
                 and ptz_ready
                 and self._velocity_rebase_required
             )
             velocity_learning_allowed = (
                 self._ptz_operation is None
+                and not self._continuous_active
                 and ptz_ready
                 and not self._velocity_rebase_required
             )
@@ -1565,8 +1807,10 @@ class DogTracker:
                     tuple(round(v, 1) for v in self.target.bbox),
                 )
 
-            self.state = "PTZ_MOVING" if self._ptz_operation is not None else (
-                "PTZ_SETTLING" if not self._ptz_action_ready(seq) else "TRACK"
+            self.state = "CHASE" if self._continuous_active else (
+                "PTZ_MOVING" if self._ptz_operation is not None else (
+                    "PTZ_SETTLING" if not self._ptz_action_ready(seq) else "TRACK"
+                )
             )
             if rebasing_velocity:
                 self._record_event(
@@ -1580,7 +1824,8 @@ class DogTracker:
             # At 15 FPS the 100 ms default is about two frames, negligible beside
             # the camera's ~1.5 s mechanical slew.
             if (
-                self._ptz_operation is None
+                not self.cfg.continuous_chase_enabled
+                and self._ptz_operation is None
                 and ptz_ready
                 and self.target.velocity_reference_time is not None
                 and not self.target.velocity_valid
@@ -1599,8 +1844,11 @@ class DogTracker:
             self.state = "SEARCHING"
             return
 
-        # A temporary detector miss while the camera is moving is not evidence that
-        # the subject is gone. Pause the loss state machine until PTZ idle + fresh
+        if self._continuous_active:
+            await self._stop_continuous("target_missing", seq=seq)
+
+        # A temporary detector miss while a discrete home/zoom operation is moving is
+        # not evidence that the subject is gone. Pause the loss state machine until PTZ idle + fresh
         # post-move frames, with ptz_operation_timeout as the hard safety bound.
         if self._ptz_operation in ("move", "zoom") or not self._ptz_action_ready(seq):
             self.state = "PTZ_MOVING" if self._ptz_operation is not None else "PTZ_SETTLING"
@@ -1686,7 +1934,8 @@ class DogTracker:
         h, w = frame_shape[:2]
         diag = max(1.0, math.hypot(w, h))
         camera_recently_moved = (
-            self._ptz_operation is not None
+            self._continuous_active
+            or self._ptz_operation is not None
             or self._last_processed_seq < self._post_motion_release_seq
         )
         if camera_recently_moved:
@@ -1737,127 +1986,31 @@ class DogTracker:
         target_span = max(width_ratio, height_ratio)
         self._last_target_span = target_span
 
-        if self._ptz_operation == "move":
-            await self._maybe_inflight_retarget(
-                frame_shape, seq, now, err_x, err_y, target_span
-            )
-            return
-        if not self._ptz_action_ready(seq):
+        if self._ptz_operation is not None or seq < self._post_motion_release_seq:
             return
 
-        outside_deadzone = (
-            abs(err_x) > self.cfg.move_deadzone_x
-            or abs(err_y) > self.cfg.move_deadzone_y
-        )
-
-        if outside_deadzone:
-            if not self.cfg.move_directly_enabled:
-                return
-
-            # moveDirectly centers the point we give the camera, but a native 3D
-            # move takes long enough that the instantaneous YOLO point is stale by
-            # arrival. Use a deliberately simple correction:
-            #
-            #   1. Project the target a short distance using velocity learned only
-            #      from stationary-camera observations.
-            #   2. Bound that lead to 20% of the frame per axis so bbox jitter or a
-            #      bad sample can never fling the camera toward an edge.
-            #   3. Move only move_gain of the way from frame center to that projected
-            #      point. This avoids the full-error overshoot seen in V6.
-            target_cx, target_cy = self.target.center
-            velocity_x = self.target.vx
-            velocity_y = self.target.vy
-            velocity_sample_ms = self.target.velocity_sample_ms
-
-            margin_x = w * self.cfg.lead_edge_margin
-            margin_y = h * self.cfg.lead_edge_margin
-            edge_clipped = (
-                x1 <= margin_x
-                or y1 <= margin_y
-                or x2 >= (w - margin_x)
-                or y2 >= (h - margin_y)
-            )
-
-            lead_suppressed_reason: Optional[str] = None
-            if not self.target.velocity_valid:
-                lead_suppressed_reason = "velocity_sample"
-            elif self.target.confidence < self.cfg.lead_min_conf:
-                lead_suppressed_reason = "low_confidence"
-            elif target_span < self.cfg.lead_min_span:
-                lead_suppressed_reason = "small_target"
-            elif edge_clipped:
-                lead_suppressed_reason = "edge_clipped"
-
-            lead_valid = lead_suppressed_reason is None
-            if lead_valid:
-                lead_dx = velocity_x * self.cfg.lead_time
-                lead_dy = velocity_y * self.cfg.lead_time
-                max_lead_x = w * 0.20
-                max_lead_y = h * 0.20
-                lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
-                lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))
-            else:
-                lead_dx = 0.0
-                lead_dy = 0.0
-
-            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))
-            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))
-
-            frame_cx = w / 2.0
-            frame_cy = h / 2.0
-            escape_zone = self._escape_zone(err_x, err_y, self.target.bbox, frame_shape)
-            effective_gain = self.cfg.escape_gain if escape_zone else self.cfg.move_gain
-            command_center = (
-                frame_cx + (predicted_cx - frame_cx) * effective_gain,
-                frame_cy + (predicted_cy - frame_cy) * effective_gain,
-            )
-            scaled = self.ptz._scale_point(command_center, frame_shape)
-
-            t0 = time.monotonic()
-            ok = await asyncio.to_thread(self.ptz.move_directly_point, command_center, frame_shape)
-            t1 = time.monotonic()
-            if ok:
-                self.ptz_commands += 1
-                self.move_direct_commands += 1
-                self._last_move_point = scaled
-                self._begin_ptz_operation("move", seq, t1)
-                self._last_move_command_error = (err_x, err_y)
-                self.state = "PTZ_MOVING"
-                self._record_event(
-                    "move_directly",
-                    label=self.target.label,
-                    point_8192=[scaled[0], scaled[1]],
-                    center_px=[round(target_cx, 1), round(target_cy, 1)],
-                    predicted_center_px=[round(predicted_cx, 1), round(predicted_cy, 1)],
-                    command_center_px=[round(command_center[0], 1), round(command_center[1], 1)],
-                    velocity_px_s=[round(velocity_x, 1), round(velocity_y, 1)],
-                    velocity_sample_ms=velocity_sample_ms,
-                    lead_valid=lead_valid,
-                    lead_suppressed_reason=lead_suppressed_reason,
-                    edge_clipped=edge_clipped,
-                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
-                    move_gain=round(effective_gain, 3),
-                    base_move_gain=round(self.cfg.move_gain, 3),
-                    escape_zone=escape_zone,
-                    lead_time=round(self.cfg.lead_time, 3),
-                    error_x=round(err_x, 3),
-                    error_y=round(err_y, 3),
-                    target_span=round(target_span, 3),
-                    confidence=round(self.target.confidence, 3),
-                    http_ms=int((t1 - t0) * 1000),
-                    operation_timeout_ms=int(self.cfg.ptz_operation_timeout * 1000),
+        if self.cfg.continuous_chase_enabled:
+            pan_speed = self._continuous_axis_speed(err_x, self.cfg.move_deadzone_x)
+            tilt_speed = -self._continuous_axis_speed(err_y, self.cfg.move_deadzone_y)
+            if pan_speed != 0 or tilt_speed != 0:
+                magnitude = max(abs(err_x), abs(err_y))
+                reason = "escape" if magnitude >= self.cfg.continuous_full_speed_error else "track"
+                await self._set_continuous_speed(
+                    pan_speed, tilt_speed, seq=seq, now=now, reason=reason,
+                    error_x=err_x, error_y=err_y, target_span=target_span,
                 )
-            else:
-                self._record_event("move_directly_failed", error=self.ptz.last_error)
+                return
+            if self._continuous_active:
+                await self._stop_continuous("deadzone", seq=seq)
+                return
+        elif self._continuous_active:
+            await self._stop_continuous("continuous_disabled", seq=seq)
             return
 
-        # Zoom is intentionally secondary to pan/tilt and happens only while the
-        # subject is already centered and no camera operation is in flight.
         if not self.cfg.autozoom:
             return
         if (now - self._last_zoom_command_at) < self.cfg.zoom_cooldown:
             return
-
         if self._last_zoom_position is None:
             status = await asyncio.to_thread(self.ptz.get_status)
             checked_at = time.monotonic()
@@ -1871,38 +2024,25 @@ class DogTracker:
                 self._last_zoom_position = position[2]
             if self.ptz.pan_tilt_reported_idle(status) is False:
                 return
-
         if self._last_zoom_position is None:
             return
-
         direction: Optional[str] = None
         duration_ms = 0
         zoom_in_guard = max(0.50, self.cfg.zoom_max_position * 0.05)
-
-        # If a timed zoom step ever lands beyond a configured bound, correct it
-        # before making any target-size-based decision.
         if self._last_zoom_position > (self.cfg.zoom_max_position + 0.05):
             direction = "out"
             duration_ms = self.cfg.zoom_out_step_ms
         elif self._last_zoom_position < (self.cfg.zoom_min_position - 0.05):
             direction = "in"
             duration_ms = self.cfg.zoom_in_step_ms
-        elif (
-            target_span < self.cfg.zoom_target_min
-            and self._last_zoom_position < (self.cfg.zoom_max_position - zoom_in_guard)
-        ):
+        elif target_span < self.cfg.zoom_target_min and self._last_zoom_position < (self.cfg.zoom_max_position - zoom_in_guard):
             direction = "in"
             duration_ms = self.cfg.zoom_in_step_ms
-        elif (
-            target_span > self.cfg.zoom_target_max
-            and self._last_zoom_position > (self.cfg.zoom_min_position + 0.25)
-        ):
+        elif target_span > self.cfg.zoom_target_max and self._last_zoom_position > (self.cfg.zoom_min_position + 0.25):
             direction = "out"
             duration_ms = self.cfg.zoom_out_step_ms
-
         if direction is None:
             return
-
         before = self._last_zoom_position
         t0 = time.monotonic()
         ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
@@ -1915,13 +2055,9 @@ class DogTracker:
             self._begin_ptz_operation("zoom", seq, t1)
             self.state = "PTZ_MOVING"
             self._record_event(
-                "zoom_step",
-                label=self.target.label,
-                direction=direction,
-                duration_ms=duration_ms,
-                target_span=round(target_span, 3),
-                zoom_before=round(before, 3),
-                min_position=round(self.cfg.zoom_min_position, 3),
+                "zoom_step", label=self.target.label, direction=direction,
+                duration_ms=duration_ms, target_span=round(target_span, 3),
+                zoom_before=round(before, 3), min_position=round(self.cfg.zoom_min_position, 3),
                 max_position=round(self.cfg.zoom_max_position, 3),
                 http_ms=int((t1 - t0) * 1000),
             )
@@ -1970,7 +2106,7 @@ class DogTracker:
                 zoom_text = f"{self._last_zoom_position / self.cfg.zoom_wide_position:.1f}x"
             op_text = self._ptz_operation or "idle"
             text = (
-                f"{self.state}{target_text} mode=3D op={op_text} "
+                f"{self.state}{target_text} mode=CONT op={op_text} "
                 f"err={self._last_error_x if self._last_error_x is not None else 0:+.2f},"
                 f"{self._last_error_y if self._last_error_y is not None else 0:+.2f} "
                 f"zoom={zoom_text} infer={self._last_inference_ms}ms"
