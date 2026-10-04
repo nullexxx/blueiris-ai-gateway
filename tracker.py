@@ -148,6 +148,11 @@ class TrackerConfig:
     hybrid_chase_enabled: bool = True
     hybrid_chase_entry_error: float = 0.82
     hybrid_chase_exit_error: float = 0.42
+    # Fast-moving targets may enter chase before the hard edge threshold.
+    hybrid_chase_motion_error: float = 0.50
+    hybrid_chase_motion_speed_norm: float = 0.04
+    # Coast through very short detector dropouts caused by PTZ motion blur.
+    hybrid_chase_miss_grace: float = 0.25
     hybrid_chase_min_speed: int = 1
     hybrid_chase_max_speed: int = 6
     hybrid_chase_full_speed_error: float = 0.95
@@ -237,6 +242,9 @@ class TrackerConfig:
             hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),
             hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
             hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
+            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.50),
+            hybrid_chase_motion_speed_norm=_env_float("TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM", 0.04),
+            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.25),
             hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
             hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 6),
             hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.95),
@@ -301,6 +309,9 @@ class TrackerConfig:
         cfg.edge_rescue_gain = max(cfg.move_gain, min(1.00, cfg.edge_rescue_gain))
         cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))
         cfg.hybrid_chase_entry_error = max(cfg.hybrid_chase_exit_error + 0.10, min(0.98, cfg.hybrid_chase_entry_error))
+        cfg.hybrid_chase_motion_error = max(cfg.hybrid_chase_exit_error, min(cfg.hybrid_chase_entry_error, cfg.hybrid_chase_motion_error))
+        cfg.hybrid_chase_motion_speed_norm = max(0.005, min(1.0, cfg.hybrid_chase_motion_speed_norm))
+        cfg.hybrid_chase_miss_grace = max(0.0, min(0.75, cfg.hybrid_chase_miss_grace))
         cfg.hybrid_chase_min_speed = max(1, min(8, cfg.hybrid_chase_min_speed))
         cfg.hybrid_chase_max_speed = max(cfg.hybrid_chase_min_speed, min(8, cfg.hybrid_chase_max_speed))
         cfg.hybrid_chase_full_speed_error = max(cfg.hybrid_chase_entry_error + 0.01, min(1.0, cfg.hybrid_chase_full_speed_error))
@@ -405,6 +416,9 @@ class TrackerConfig:
             "hybrid_chase_enabled": self.hybrid_chase_enabled,
             "hybrid_chase_entry_error": self.hybrid_chase_entry_error,
             "hybrid_chase_exit_error": self.hybrid_chase_exit_error,
+            "hybrid_chase_motion_error": self.hybrid_chase_motion_error,
+            "hybrid_chase_motion_speed_norm": self.hybrid_chase_motion_speed_norm,
+            "hybrid_chase_miss_grace": self.hybrid_chase_miss_grace,
             "hybrid_chase_min_speed": self.hybrid_chase_min_speed,
             "hybrid_chase_max_speed": self.hybrid_chase_max_speed,
             "hybrid_chase_full_speed_error": self.hybrid_chase_full_speed_error,
@@ -1907,6 +1921,11 @@ class DogTracker:
             return
 
         if self._hybrid_chase_active:
+            # Keep the bounded chase alive across one or two blurred YOLO misses.
+            hybrid_missing_for = max(0.0, now - self.target.last_seen)
+            if hybrid_missing_for <= self.cfg.hybrid_chase_miss_grace:
+                self.state = "ESCAPE_CHASE"
+                return
             await self._stop_hybrid_chase("target_missing", seq=seq)
 
         # A temporary detector miss while the camera is moving is not evidence that
@@ -2096,12 +2115,32 @@ class DogTracker:
             )
             dominant_error = max(abs(err_x), abs(err_y))
             hard_escape_error = max(0.90, self.cfg.hybrid_chase_entry_error + 0.08)
+
+            # Dynamic handoff: keep moveDirectly for slow/stable motion, but a
+            # fast target that is already well outside center and still moving
+            # outward should not be committed to another ~1.5s positional move.
+            frame_diag = max(1.0, math.hypot(w, h))
+            target_speed_norm = (
+                math.hypot(self.target.vx, self.target.vy) / frame_diag
+                if self.target.velocity_valid
+                else 0.0
+            )
+            moving_outward = self.target.velocity_valid and (
+                (abs(err_x) >= self.cfg.hybrid_chase_motion_error and err_x * self.target.vx > 0.0)
+                or (abs(err_y) >= self.cfg.hybrid_chase_motion_error and err_y * self.target.vy > 0.0)
+            )
+            motion_escape = (
+                dominant_error >= self.cfg.hybrid_chase_motion_error
+                and target_speed_norm >= self.cfg.hybrid_chase_motion_speed_norm
+                and moving_outward
+            )
             hybrid_entry = (
                 self.cfg.hybrid_chase_enabled
                 and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
                 and (
                     (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error)
                     or dominant_error >= hard_escape_error
+                    or motion_escape
                 )
             )
             if hybrid_entry:
@@ -2110,8 +2149,14 @@ class DogTracker:
                 self._record_event(
                     "hybrid_chase_enter",
                     label=self.target.label,
+                    entry_reason=(
+                        "motion_escape" if motion_escape else
+                        ("edge_clipped" if edge_clipped_now else "hard_escape")
+                    ),
                     error_x=round(err_x, 3),
                     error_y=round(err_y, 3),
+                    target_speed_norm=round(target_speed_norm, 4),
+                    moving_outward=bool(moving_outward),
                     edge_clipped=edge_clipped_now,
                     pan_speed=pan_speed,
                     tilt_speed=tilt_speed,
