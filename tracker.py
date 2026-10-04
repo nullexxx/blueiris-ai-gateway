@@ -146,16 +146,17 @@ class TrackerConfig:
     # of leaving the frame, and stops well before center so motor inertia cannot
     # create the oscillation seen when continuous control was used as the main loop.
     hybrid_chase_enabled: bool = True
+    hybrid_chase_pan_sign: int = -1
     hybrid_chase_entry_error: float = 0.82
-    hybrid_chase_exit_error: float = 0.42
+    hybrid_chase_exit_error: float = 0.50
     # Fast-moving targets may enter chase before the hard edge threshold.
-    hybrid_chase_motion_error: float = 0.45
+    hybrid_chase_motion_error: float = 0.55
     hybrid_chase_motion_speed_norm: float = 0.03
     # Coast through very short detector dropouts caused by PTZ motion blur.
-    hybrid_chase_miss_grace: float = 0.60
+    hybrid_chase_miss_grace: float = 0.15
     hybrid_chase_min_speed: int = 1
-    hybrid_chase_max_speed: int = 8
-    hybrid_chase_full_speed_error: float = 0.82
+    hybrid_chase_max_speed: int = 6
+    hybrid_chase_full_speed_error: float = 0.90
     hybrid_chase_command_interval: float = 0.18
     hybrid_chase_keepalive: float = 0.45
     hybrid_chase_camera_timeout: int = 1
@@ -240,14 +241,15 @@ class TrackerConfig:
             edge_rescue_error=_env_float("TRACKER_EDGE_RESCUE_ERROR", 0.75),
             edge_rescue_gain=_env_float("TRACKER_EDGE_RESCUE_GAIN", 0.85),
             hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),
+            hybrid_chase_pan_sign=_env_int("TRACKER_HYBRID_CHASE_PAN_SIGN", -1),
             hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
-            hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
-            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.45),
+            hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.50),
+            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.55),
             hybrid_chase_motion_speed_norm=_env_float("TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM", 0.03),
-            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.60),
+            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.15),
             hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
-            hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 8),
-            hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.82),
+            hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 6),
+            hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.90),
             hybrid_chase_command_interval=_env_float("TRACKER_HYBRID_CHASE_COMMAND_INTERVAL", 0.18),
             hybrid_chase_keepalive=_env_float("TRACKER_HYBRID_CHASE_KEEPALIVE", 0.45),
             hybrid_chase_camera_timeout=_env_int("TRACKER_HYBRID_CHASE_CAMERA_TIMEOUT", 1),
@@ -307,6 +309,7 @@ class TrackerConfig:
         cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))
         cfg.edge_rescue_error = max(0.40, min(0.98, cfg.edge_rescue_error))
         cfg.edge_rescue_gain = max(cfg.move_gain, min(1.00, cfg.edge_rescue_gain))
+        cfg.hybrid_chase_pan_sign = 1 if cfg.hybrid_chase_pan_sign >= 0 else -1
         cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))
         cfg.hybrid_chase_entry_error = max(cfg.hybrid_chase_exit_error + 0.10, min(0.98, cfg.hybrid_chase_entry_error))
         cfg.hybrid_chase_motion_error = max(cfg.hybrid_chase_exit_error, min(cfg.hybrid_chase_entry_error, cfg.hybrid_chase_motion_error))
@@ -414,6 +417,7 @@ class TrackerConfig:
             "edge_rescue_error": self.edge_rescue_error,
             "edge_rescue_gain": self.edge_rescue_gain,
             "hybrid_chase_enabled": self.hybrid_chase_enabled,
+            "hybrid_chase_pan_sign": self.hybrid_chase_pan_sign,
             "hybrid_chase_entry_error": self.hybrid_chase_entry_error,
             "hybrid_chase_exit_error": self.hybrid_chase_exit_error,
             "hybrid_chase_motion_error": self.hybrid_chase_motion_error,
@@ -1499,7 +1503,10 @@ class DogTracker:
         if max(abs(err_x), abs(err_y)) <= self.cfg.hybrid_chase_exit_error:
             await self._stop_hybrid_chase("safe_inner_region", seq=seq)
             return
-        pan_speed = self._hybrid_axis_speed(err_x)
+        if self.target is not None and self.target.confidence < self.cfg.reacquire_conf:
+            await self._stop_hybrid_chase("low_confidence", seq=seq)
+            return
+        pan_speed = self.cfg.hybrid_chase_pan_sign * self._hybrid_axis_speed(err_x)
         tilt_speed = -self._hybrid_axis_speed(err_y)
         await self._set_hybrid_chase_speed(
             pan_speed,
@@ -2155,7 +2162,7 @@ class DogTracker:
                 )
             )
             if hybrid_entry:
-                pan_speed = self._hybrid_axis_speed(err_x)
+                pan_speed = self.cfg.hybrid_chase_pan_sign * self._hybrid_axis_speed(err_x)
                 tilt_speed = -self._hybrid_axis_speed(err_y)
                 self._record_event(
                     "hybrid_chase_enter",
