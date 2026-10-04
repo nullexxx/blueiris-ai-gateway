@@ -1,0 +1,104 @@
+services:
+  blueiris-ai:
+    image: ghcr.io/nullexxx/blueiris-ai-gateway:latest
+    container_name: blueiris-ai
+    restart: unless-stopped
+
+    ports:
+      - "32169:32168"
+
+    shm_size: "1gb"
+
+    environment:
+      # Core gateway
+      TZ: "${TZ:-America/New_York}"
+      PYTHONUNBUFFERED: "1"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-yolo11m}"
+      PRELOAD_MODELS: "${PRELOAD_MODELS:-yolo11m}"
+      ALLOW_LAZY_LOAD: "false"
+      HALF_PRECISION: "true"
+      INFERENCE_TIMEOUT: "8.0"
+      RECOVERY_GRACE_PERIOD: "4.0"
+      ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
+      NVIDIA_VISIBLE_DEVICES: "all"
+
+      # Optional PTZ tracker
+      TRACKER_ENABLED: "true"
+      TRACKER_AUTOSTART: "false"
+      TRACKER_CAMERA_IP: "${TRACKER_CAMERA_IP}"
+      TRACKER_CAMERA_USER: "${TRACKER_CAMERA_USER:-admin}"
+      TRACKER_CAMERA_PASSWORD: "${TRACKER_CAMERA_PASSWORD}"
+      TRACKER_CAMERA_CHANNEL: "0"
+      TRACKER_RTSP_CHANNEL: "1"
+      TRACKER_RTSP_SUBTYPE: "1"
+      TRACKER_MODEL: "${TRACKER_MODEL:-yolo11m}"
+
+      TRACKER_TARGET_CLASSES: "person,dog,cat,bird,bear"
+      TRACKER_TARGET_PRIORITY: "dog,person,bear,cat,bird"
+      TRACKER_FPS: "15"
+      TRACKER_ACQUIRE_CONF: "0.40"
+      TRACKER_HOLD_CONF: "0.22"
+      TRACKER_REACQUIRE_CONF: "0.35"
+      TRACKER_ACQUIRE_FRAMES: "2"
+      TRACKER_ASSOCIATION_IDLE_DISTANCE: "0.22"
+      TRACKER_ASSOCIATION_MOVING_DISTANCE: "0.40"
+
+      # Native 3D pan/tilt + bounded predictive lead
+      TRACKER_MOVE_DIRECTLY_ENABLED: "true"
+      TRACKER_MOVE_DEADZONE_X: "0.14"
+      TRACKER_MOVE_DEADZONE_Y: "0.18"
+      TRACKER_MOVE_GAIN: "0.60"
+      TRACKER_LEAD_TIME: "0.75"
+      TRACKER_VELOCITY_MIN_SAMPLE_MS: "100"
+      TRACKER_LEAD_MIN_CONF: "0.50"
+      TRACKER_LEAD_MIN_SPAN: "0.08"
+      TRACKER_LEAD_EDGE_MARGIN: "0.02"
+
+      # Wait for the physical camera to finish before another PTZ command
+      TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.06"
+      TRACKER_PTZ_OPERATION_TIMEOUT: "4.0"
+      TRACKER_POST_MOVE_FRAMES: "1"
+      TRACKER_PTZ_HTTP_TIMEOUT: "0.75"
+
+      # Conservative bounded auto-zoom
+      TRACKER_AUTOZOOM: "true"
+      TRACKER_ZOOM_WIDE_POSITION: "5.12"
+      TRACKER_ZOOM_MIN_FACTOR: "1.0"
+      TRACKER_ZOOM_MAX_FACTOR: "6.0"
+      TRACKER_ZOOM_TARGET_MIN: "0.18"
+      TRACKER_ZOOM_TARGET_MAX: "0.42"
+      TRACKER_ZOOM_IN_STEP_MS: "90"
+      TRACKER_ZOOM_OUT_STEP_MS: "140"
+      TRACKER_ZOOM_COOLDOWN: "1.0"
+
+      # Target-loss / home behavior
+      TRACKER_COAST_TIME: "0.20"
+      TRACKER_REACQUIRE_TIME: "1.25"
+      TRACKER_HOME_TIMEOUT: "3.0"
+      TRACKER_HOME_PRESET: "5"
+      TRACKER_GOTO_HOME_ON_START: "true"
+      TRACKER_RETURN_HOME_ON_LOST: "true"
+      TRACKER_FRAME_STALE_TIMEOUT: "1.0"
+      TRACKER_HISTORY_SIZE: "300"
+
+    volumes:
+      - "${BI_AI_MODELS_PATH:-/mnt/Docker_Data/bi-ai/models}:/app/models"
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:32168/', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
