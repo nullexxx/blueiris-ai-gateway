@@ -1,0 +1,35 @@
+name: Apply PTZ retarget patch
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/apply-ptz-retarget.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply and validate tracker patch
+        run: |
+          git apply --check inflight-retarget.patch
+          git apply inflight-retarget.patch
+          python3 -m py_compile tracker.py
+          python3 -m tabnanny tracker.py
+
+      - name: Commit patched tracker and remove one-shot files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracker.py
+          git rm inflight-retarget.patch .github/workflows/apply-ptz-retarget.yml
+          git commit -m "Add bounded in-flight PTZ retargeting"
+          git push origin HEAD:main
