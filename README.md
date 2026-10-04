@@ -16,6 +16,8 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 - **Latest-frame-only RTSP capture** for tracking, avoiding a backlog of stale frames.
 - **Native Dahua/Amcrest 3D positioning** using `moveDirectly`, with status-driven PTZ settling rather than fixed movement sleeps.
 - **Bounded predictive lead** based only on stationary-camera target motion.
+- **Bounded in-flight retargeting** so a slow native `moveDirectly` slew can have its destination replaced when the target reverses or is escaping toward a frame edge.
+- **Escape-zone gain** for stronger corrections near frame edges while retaining the normal conservative gain near center.
 - **Conservative auto-zoom** with configurable minimum/maximum optical zoom bounds.
 - **GitHub Actions -> GHCR** builds on pushes to `main`.
 
@@ -111,11 +113,17 @@ curl -s 'http://HOST:32169/v1/tracker/history?limit=300' | python3 -m json.tool
 
 The tracker uses the camera RTSP substream continuously and retains only the newest decoded frame. Tracker inference is opportunistic: regular gateway work keeps priority, and the tracker skips a frame rather than waiting behind normal Blue Iris inference.
 
-For pan/tilt, the tracker uses Dahua/Amcrest `moveDirectly` 3D positioning. Only one physical PTZ operation is allowed at a time. After a command, the gateway polls camera status and position until the camera is actually idle and stable before issuing another movement command.
+For pan/tilt, the tracker uses Dahua/Amcrest `moveDirectly` 3D positioning. The camera's native positional move can take substantially longer than a manual joystick/continuous movement on some models, so the tracker does not assume a fixed travel time. It polls camera status and position until the camera reports idle and stable.
 
-Target loss is paused while the camera is moving so global image motion does not look like the subject disappeared. After movement stops, the tracker waits for fresh stationary-camera observations before learning subject velocity again.
+While a normal positional move is underway, detections continue. The tracker can issue a **bounded in-flight retarget** when the target clearly reverses direction, is escaping near a frame edge, or the tracking error grows sharply. This replaces the current destination without waiting for the old destination to finish. Retargeting is rate-limited and capped per movement chain so the camera is not flooded with commands.
 
-Predictive lead is deliberately conservative. It is suppressed when the velocity sample is not mature, confidence is too low, the target is too small, or the detection touches the configured frame-edge margin. In those cases the camera still follows the target's current position; only the predictive lead is disabled.
+Predictive velocity is **never learned from moving-camera frames**. In-flight retargets therefore use the target's current observed center only, not predictive lead. After the camera becomes stationary, one clean velocity baseline is taken and a minimum stationary-camera sample window must mature before predictive lead is trusted again.
+
+Normal stationary-camera predictive lead is deliberately conservative. It is suppressed when the velocity sample is not mature, confidence is too low, the target is too small, or the detection touches the configured frame-edge margin. In those cases the camera still follows the target's current position; only the predictive lead is disabled.
+
+An **escape zone** is entered when the target approaches a frame edge or the normalized error is very large. In that state, pan/tilt uses a stronger configurable gain (`TRACKER_ESCAPE_GAIN`) to reduce the chance that a fast target leaves the frame.
+
+Target loss is paused while the camera is moving so global image motion does not look like the subject disappeared. When PTZ movement completes, the target-loss clock is restarted before normal coast/reacquisition timing resumes.
 
 The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, including an Amcrest IP2M-863EW-AI. Other cameras may require changes to the PTZ transport or coordinate behavior.
 
@@ -169,7 +177,7 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_MOVE_DIRECTLY_ENABLED` | `true` | Use Dahua/Amcrest 3D `moveDirectly`. |
 | `TRACKER_MOVE_DEADZONE_X` | `0.14` | Horizontal normalized deadzone. |
 | `TRACKER_MOVE_DEADZONE_Y` | `0.18` | Vertical normalized deadzone. |
-| `TRACKER_MOVE_GAIN` | `0.60` | Fraction of projected frame error applied to each 3D move. |
+| `TRACKER_MOVE_GAIN` | `0.60` | Fraction of projected frame error applied to a normal 3D move. |
 | `TRACKER_LEAD_TIME` | `0.75` | Seconds of target-velocity lead before clamping. |
 | `TRACKER_VELOCITY_MIN_SAMPLE_MS` | `100` | Minimum stationary-camera observation window before velocity is trusted. |
 | `TRACKER_LEAD_MIN_CONF` | `0.50` | Suppress predictive lead below this confidence. |
@@ -178,12 +186,25 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 
 Predictive lead is additionally hard-clamped to 20% of frame width/height per axis in code.
 
+### In-Flight Retargeting / Escape Zone
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TRACKER_INFLIGHT_RETARGET_ENABLED` | `true` | Allow a small number of destination replacements while `moveDirectly` is still moving. |
+| `TRACKER_INFLIGHT_RETARGET_INTERVAL` | `0.30` | Minimum seconds between in-flight retarget commands. |
+| `TRACKER_INFLIGHT_RETARGET_MAX` | `2` | Maximum retargets during one physical move chain. |
+| `TRACKER_INFLIGHT_REVERSAL_ERROR` | `0.22` | Minimum normalized opposite-side error required to treat a crossing as a reversal. |
+| `TRACKER_ESCAPE_ERROR` | `0.72` | Normalized error that enters escape mode even if the bbox is not yet near the edge. |
+| `TRACKER_ESCAPE_GAIN` | `0.85` | Stronger pan/tilt gain used in escape mode. |
+
+In-flight retargets deliberately use the current target center with **no predictive lead**, because bbox motion while the PTZ is slewing contains global camera motion. The tracker may retarget for `reversal`, `escape`, or `error_growth`, and history records the reason.
+
 ### PTZ Operation Settling
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `TRACKER_PTZ_STATUS_POLL_INTERVAL` | `0.12` | Seconds between camera PTZ status polls. Example Compose uses `0.06`. |
-| `TRACKER_PTZ_OPERATION_TIMEOUT` | `4.0` | Hard timeout for a physical PTZ operation. |
+| `TRACKER_PTZ_OPERATION_TIMEOUT` | `4.0` | Hard timeout for the latest physical PTZ destination. |
 | `TRACKER_POST_MOVE_FRAMES` | `1` | Fresh frames required after PTZ completion before another action. |
 | `TRACKER_PTZ_HTTP_TIMEOUT` | `0.75` | HTTP timeout for camera CGI requests. |
 
@@ -219,13 +240,21 @@ TRACKER_VELOCITY_MIN_SAMPLE_MS=100
 TRACKER_LEAD_MIN_CONF=0.50
 TRACKER_LEAD_MIN_SPAN=0.08
 TRACKER_LEAD_EDGE_MARGIN=0.02
+TRACKER_INFLIGHT_RETARGET_ENABLED=true
+TRACKER_INFLIGHT_RETARGET_INTERVAL=0.30
+TRACKER_INFLIGHT_RETARGET_MAX=2
+TRACKER_INFLIGHT_REVERSAL_ERROR=0.22
+TRACKER_ESCAPE_ERROR=0.72
+TRACKER_ESCAPE_GAIN=0.85
 TRACKER_PTZ_STATUS_POLL_INTERVAL=0.06
 TRACKER_PTZ_OPERATION_TIMEOUT=4.0
 TRACKER_POST_MOVE_FRAMES=1
 TRACKER_ZOOM_MAX_FACTOR=6.0
 ```
 
-When tuning, use `/v1/tracker/history` rather than guessing from visual behavior alone. `move_directly` history events include the target center, predicted center, command center, velocity sample duration, predictive-lead validity/suppression reason, lead pixels, HTTP duration, and target confidence.
+When tuning, use `/v1/tracker/history` rather than guessing from visual behavior alone. Normal `move_directly` history events include the target center, predicted center, command center, velocity sample duration, predictive-lead validity/suppression reason, lead pixels, effective gain, HTTP duration, and target confidence.
+
+In-flight destination changes are logged as `move_directly_retarget`, including the retarget reason, index, current target center, command center, gain, current normalized error, total move-chain elapsed time, and HTTP duration. The final `ptz_operation_complete` event includes both the time since the latest destination and the total `chain_elapsed_ms`, plus the number of retargets used.
 
 ## Updating
 
