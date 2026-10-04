@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir --no-deps facenet-pytorch
 RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1(pretrained='vggface2')"
 
 COPY app.py /app/app.py
+COPY tracker.py /app/tracker.py
 
 EXPOSE 32168
 
