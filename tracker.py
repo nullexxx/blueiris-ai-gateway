@@ -605,16 +605,23 @@ class TargetTrack:
     vy: float = 0.0
     acquire_hits: int = 1
 
-    def update(self, det: Detection, now: float) -> None:
+    def update(self, det: Detection, now: float, *, update_velocity: bool = True) -> None:
         if det.class_id != self.class_id:
             raise ValueError("TargetTrack.update received a different object class")
         new_center = det.center
-        dt = max(0.001, now - self.last_update)
-        inst_vx = (new_center[0] - self.center[0]) / dt
-        inst_vy = (new_center[1] - self.center[1]) / dt
-        alpha = 0.35
-        self.vx = (1.0 - alpha) * self.vx + alpha * inst_vx
-        self.vy = (1.0 - alpha) * self.vy + alpha * inst_vy
+        if update_velocity:
+            dt = max(0.001, now - self.last_update)
+            inst_vx = (new_center[0] - self.center[0]) / dt
+            inst_vy = (new_center[1] - self.center[1]) / dt
+            alpha = 0.35
+            self.vx = (1.0 - alpha) * self.vx + alpha * inst_vx
+            self.vy = (1.0 - alpha) * self.vy + alpha * inst_vy
+        else:
+            # The bbox still needs to follow the target for association while the
+            # camera is slewing, but global image motion must never be learned as
+            # subject velocity. This also refreshes the velocity baseline.
+            self.vx = 0.0
+            self.vy = 0.0
         self.bbox = det.bbox
         self.confidence = det.confidence
         self.center = new_center
@@ -683,6 +690,7 @@ class DogTracker:
         self._post_motion_release_seq = -1
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        self._velocity_rebase_required = False
 
         self._last_detection_count = 0
         self._last_inference_ms = 0
@@ -786,6 +794,7 @@ class DogTracker:
         self._post_motion_release_seq = -1
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        self._velocity_rebase_required = False
 
     async def start(self) -> dict:
         self._history.clear()
@@ -984,10 +993,14 @@ class DogTracker:
         # PTZ movement itself must never count as target-loss time. Always restart
         # the loss clock when the camera finishes, even if YOLO briefly saw the
         # target during the slew and then lost it again before PTZ became idle.
+        # The first post-move matched detection becomes a clean velocity baseline;
+        # only subsequent stationary detections are allowed to learn subject motion.
         if self.target is not None:
             self.target.last_seen = now
+            self.target.last_update = now
             self.target.vx = 0.0
             self.target.vy = 0.0
+            self._velocity_rebase_required = True
 
         self._ptz_operation = None
         self._ptz_operation_started_at = 0.0
@@ -1199,7 +1212,20 @@ class DogTracker:
 
         if matched is not None:
             was_acquiring = self.target.acquire_hits < self.cfg.acquire_frames
-            self.target.update(matched, now)
+
+            ptz_ready = self._ptz_action_ready(seq)
+            velocity_learning_allowed = (
+                self._ptz_operation is None
+                and ptz_ready
+                and not self._velocity_rebase_required
+            )
+            self.target.update(matched, now, update_velocity=velocity_learning_allowed)
+
+            # After a PTZ move completes, deliberately consume one matched target
+            # observation as the new image-space baseline before learning velocity.
+            if self._ptz_operation is None and ptz_ready and self._velocity_rebase_required:
+                self._velocity_rebase_required = False
+
             self._home_sent = False
             self._loss_pause_logged = False
             if self._ptz_operation is not None:
@@ -1390,14 +1416,17 @@ class DogTracker:
             # move takes long enough that the instantaneous YOLO point is stale by
             # arrival. Use a deliberately simple correction:
             #
-            #   1. Project the target a short distance using its filtered velocity.
+            #   1. Project the target a short distance using velocity learned only
+            #      from stationary-camera observations.
             #   2. Bound that lead to 20% of the frame per axis so bbox jitter or a
-            #      bad velocity sample can never fling the camera toward an edge.
+            #      bad sample can never fling the camera toward an edge.
             #   3. Move only move_gain of the way from frame center to that projected
             #      point. This avoids the full-error overshoot seen in V6.
             target_cx, target_cy = self.target.center
-            lead_dx = self.target.vx * self.cfg.lead_time
-            lead_dy = self.target.vy * self.cfg.lead_time
+            velocity_x = self.target.vx
+            velocity_y = self.target.vy
+            lead_dx = velocity_x * self.cfg.lead_time
+            lead_dy = velocity_y * self.cfg.lead_time
             max_lead_x = w * 0.20
             max_lead_y = h * 0.20
             lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
@@ -1430,7 +1459,7 @@ class DogTracker:
                     center_px=[round(target_cx, 1), round(target_cy, 1)],
                     predicted_center_px=[round(predicted_cx, 1), round(predicted_cy, 1)],
                     command_center_px=[round(command_center[0], 1), round(command_center[1], 1)],
-                    velocity_px_s=[round(self.target.vx, 1), round(self.target.vy, 1)],
+                    velocity_px_s=[round(velocity_x, 1), round(velocity_y, 1)],
                     lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
                     move_gain=round(self.cfg.move_gain, 3),
                     lead_time=round(self.cfg.lead_time, 3),
