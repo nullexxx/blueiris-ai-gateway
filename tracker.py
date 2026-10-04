@@ -133,6 +133,14 @@ class TrackerConfig:
     velocity_consistency_cosine: float = 0.25
     velocity_jump_ratio: float = 4.0
 
+    # Measured escape behavior: keep the known-good partial correction for normal
+    # tracking, but use a stronger one-shot moveDirectly correction when the bbox
+    # is already clipped or the target is close to escaping the frame. No command
+    # overlap or continuous steering is introduced.
+    edge_rescue_enabled: bool = True
+    edge_rescue_error: float = 0.75
+    edge_rescue_gain: float = 0.85
+
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
@@ -206,6 +214,9 @@ class TrackerConfig:
             move_eta_max=_env_float("TRACKER_MOVE_ETA_MAX", 2.00),
             velocity_consistency_cosine=_env_float("TRACKER_VELOCITY_CONSISTENCY_COSINE", 0.25),
             velocity_jump_ratio=_env_float("TRACKER_VELOCITY_JUMP_RATIO", 4.0),
+            edge_rescue_enabled=_env_bool("TRACKER_EDGE_RESCUE_ENABLED", True),
+            edge_rescue_error=_env_float("TRACKER_EDGE_RESCUE_ERROR", 0.75),
+            edge_rescue_gain=_env_float("TRACKER_EDGE_RESCUE_GAIN", 0.85),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
@@ -257,6 +268,8 @@ class TrackerConfig:
         cfg.move_eta_max = max(cfg.move_eta_min, min(4.0, cfg.move_eta_max))
         cfg.velocity_consistency_cosine = max(-1.0, min(1.0, cfg.velocity_consistency_cosine))
         cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))
+        cfg.edge_rescue_error = max(0.40, min(0.98, cfg.edge_rescue_error))
+        cfg.edge_rescue_gain = max(cfg.move_gain, min(1.00, cfg.edge_rescue_gain))
         cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))
         cfg.ptz_operation_timeout = max(0.75, min(15.0, cfg.ptz_operation_timeout))
         cfg.post_move_frames = max(1, min(20, cfg.post_move_frames))
@@ -346,6 +359,9 @@ class TrackerConfig:
             "move_eta_max": self.move_eta_max,
             "velocity_consistency_cosine": self.velocity_consistency_cosine,
             "velocity_jump_ratio": self.velocity_jump_ratio,
+            "edge_rescue_enabled": self.edge_rescue_enabled,
+            "edge_rescue_error": self.edge_rescue_error,
+            "edge_rescue_gain": self.edge_rescue_gain,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -1154,12 +1170,13 @@ class DogTracker:
             return False, "velocity_magnitude"
 
         previous = self._trusted_velocity
-        self._trusted_velocity = (vx, vy)
         if previous is None:
+            self._trusted_velocity = (vx, vy)
             return True, None
 
         prev_speed = math.hypot(previous[0], previous[1])
         if speed < 20.0 or prev_speed < 20.0:
+            self._trusted_velocity = (vx, vy)
             return True, None
 
         cosine = (vx * previous[0] + vy * previous[1]) / max(1e-6, speed * prev_speed)
@@ -1170,6 +1187,9 @@ class DogTracker:
         if ratio > self.cfg.velocity_jump_ratio:
             return False, "velocity_jump"
 
+        # Invalid samples must never become the reference used to validate the
+        # next sample. Promote the candidate only after every sanity check passes.
+        self._trusted_velocity = (vx, vy)
         return True, None
 
     def _begin_ptz_operation(self, kind: str, seq: int, now: float) -> None:
@@ -1748,6 +1768,23 @@ class DogTracker:
                 or y2 >= (h - margin_y)
             )
 
+            # When the bbox is already clipped or the centroid is near escape,
+            # a normal partial correction is too timid for a 1.3-1.6 s move.
+            # Strengthen only this one camera-managed move; do not overlap moves.
+            edge_rescue_active = self.cfg.edge_rescue_enabled and (
+                edge_clipped
+                or abs(err_x) >= self.cfg.edge_rescue_error
+                or abs(err_y) >= self.cfg.edge_rescue_error
+            )
+            edge_rescue_reason: Optional[str] = None
+            if edge_rescue_active:
+                edge_rescue_reason = "edge_clipped" if edge_clipped else "extreme_error"
+            active_move_gain = (
+                max(self.cfg.move_gain, self.cfg.edge_rescue_gain)
+                if edge_rescue_active
+                else self.cfg.move_gain
+            )
+
             frame_cx = w / 2.0
             frame_cy = h / 2.0
 
@@ -1755,8 +1792,8 @@ class DogTracker:
             # camera's own completed-move history. Before enough samples exist,
             # TRACKER_LEAD_TIME remains the conservative known-good fallback.
             base_command_center = (
-                frame_cx + (target_cx - frame_cx) * self.cfg.move_gain,
-                frame_cy + (target_cy - frame_cy) * self.cfg.move_gain,
+                frame_cx + (target_cx - frame_cx) * active_move_gain,
+                frame_cy + (target_cy - frame_cy) * active_move_gain,
             )
             base_move_distance = self._move_distance_from_center(base_command_center, frame_shape)
             lead_horizon_s = self._predict_move_eta(base_move_distance)
@@ -1791,8 +1828,8 @@ class DogTracker:
             predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))
 
             command_center = (
-                frame_cx + (predicted_cx - frame_cx) * self.cfg.move_gain,
-                frame_cy + (predicted_cy - frame_cy) * self.cfg.move_gain,
+                frame_cx + (predicted_cx - frame_cx) * active_move_gain,
+                frame_cy + (predicted_cy - frame_cy) * active_move_gain,
             )
             move_distance = self._move_distance_from_center(command_center, frame_shape)
 
@@ -1830,7 +1867,10 @@ class DogTracker:
                     lead_suppressed_reason=lead_suppressed_reason,
                     edge_clipped=edge_clipped,
                     lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
-                    move_gain=round(self.cfg.move_gain, 3),
+                    move_gain=round(active_move_gain, 3),
+                    base_move_gain=round(self.cfg.move_gain, 3),
+                    edge_rescue_active=edge_rescue_active,
+                    edge_rescue_reason=edge_rescue_reason,
                     lead_time=round(self.cfg.lead_time, 3),
                     lead_horizon_s=round(lead_horizon_s, 3),
                     predicted_move_eta_ms=int(lead_horizon_s * 1000),
