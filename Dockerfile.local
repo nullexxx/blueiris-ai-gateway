@@ -1,7 +1,0 @@
-# Fast test image: inherit the user's current published gateway image and only
-# overlay the modified application + tracker module.
-FROM ghcr.io/nullexxx/blueiris-ai-gateway:latest
-
-WORKDIR /app
-COPY app.py /app/app.py
-COPY tracker.py /app/tracker.py
