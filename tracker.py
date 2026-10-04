@@ -106,6 +106,12 @@ class TrackerConfig:
     move_deadzone_x: float = 0.14
     move_deadzone_y: float = 0.18
 
+    # Native 3D moves take roughly 1.5-2.1 seconds on this camera. Correct only
+    # part of the current error and add a bounded subject-velocity lead so we do
+    # not chase a point that is already stale by the time the PTZ arrives.
+    move_gain: float = 0.60
+    lead_time: float = 0.75
+
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
@@ -166,6 +172,8 @@ class TrackerConfig:
             move_directly_enabled=_env_bool("TRACKER_MOVE_DIRECTLY_ENABLED", True),
             move_deadzone_x=_env_float("TRACKER_MOVE_DEADZONE_X", 0.14),
             move_deadzone_y=_env_float("TRACKER_MOVE_DEADZONE_Y", 0.18),
+            move_gain=_env_float("TRACKER_MOVE_GAIN", 0.60),
+            lead_time=_env_float("TRACKER_LEAD_TIME", 0.75),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 2),
@@ -205,6 +213,8 @@ class TrackerConfig:
         )
         cfg.move_deadzone_x = max(0.02, min(0.80, cfg.move_deadzone_x))
         cfg.move_deadzone_y = max(0.02, min(0.80, cfg.move_deadzone_y))
+        cfg.move_gain = max(0.20, min(1.00, cfg.move_gain))
+        cfg.lead_time = max(0.0, min(1.50, cfg.lead_time))
         cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))
         cfg.ptz_operation_timeout = max(0.75, min(15.0, cfg.ptz_operation_timeout))
         cfg.post_move_frames = max(1, min(20, cfg.post_move_frames))
@@ -281,6 +291,8 @@ class TrackerConfig:
             "move_directly_enabled": self.move_directly_enabled,
             "move_deadzone_x": self.move_deadzone_x,
             "move_deadzone_y": self.move_deadzone_y,
+            "move_gain": self.move_gain,
+            "lead_time": self.lead_time,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -969,11 +981,11 @@ class DogTracker:
             position=None if position is None else [round(v, 3) for v in position],
         )
 
-        # PTZ movement itself should never count as target-loss time. If YOLO could
-        # not see the locked target during the move, start its loss clock now.
+        # PTZ movement itself must never count as target-loss time. Always restart
+        # the loss clock when the camera finishes, even if YOLO briefly saw the
+        # target during the slew and then lost it again before PTZ became idle.
         if self.target is not None:
-            if not self._target_seen_during_ptz_operation:
-                self.target.last_seen = now
+            self.target.last_seen = now
             self.target.vx = 0.0
             self.target.vy = 0.0
 
@@ -1373,10 +1385,37 @@ class DogTracker:
         if outside_deadzone:
             if not self.cfg.move_directly_enabled:
                 return
-            center = self.target.center
-            scaled = self.ptz._scale_point(center, frame_shape)
+
+            # moveDirectly centers the point we give the camera, but a native 3D
+            # move takes long enough that the instantaneous YOLO point is stale by
+            # arrival. Use a deliberately simple correction:
+            #
+            #   1. Project the target a short distance using its filtered velocity.
+            #   2. Bound that lead to 20% of the frame per axis so bbox jitter or a
+            #      bad velocity sample can never fling the camera toward an edge.
+            #   3. Move only move_gain of the way from frame center to that projected
+            #      point. This avoids the full-error overshoot seen in V6.
+            target_cx, target_cy = self.target.center
+            lead_dx = self.target.vx * self.cfg.lead_time
+            lead_dy = self.target.vy * self.cfg.lead_time
+            max_lead_x = w * 0.20
+            max_lead_y = h * 0.20
+            lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
+            lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))
+
+            predicted_cx = max(w * 0.05, min(w * 0.95, target_cx + lead_dx))
+            predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))
+
+            frame_cx = w / 2.0
+            frame_cy = h / 2.0
+            command_center = (
+                frame_cx + (predicted_cx - frame_cx) * self.cfg.move_gain,
+                frame_cy + (predicted_cy - frame_cy) * self.cfg.move_gain,
+            )
+            scaled = self.ptz._scale_point(command_center, frame_shape)
+
             t0 = time.monotonic()
-            ok = await asyncio.to_thread(self.ptz.move_directly_point, center, frame_shape)
+            ok = await asyncio.to_thread(self.ptz.move_directly_point, command_center, frame_shape)
             t1 = time.monotonic()
             if ok:
                 self.ptz_commands += 1
@@ -1388,7 +1427,13 @@ class DogTracker:
                     "move_directly",
                     label=self.target.label,
                     point_8192=[scaled[0], scaled[1]],
-                    center_px=[round(center[0], 1), round(center[1], 1)],
+                    center_px=[round(target_cx, 1), round(target_cy, 1)],
+                    predicted_center_px=[round(predicted_cx, 1), round(predicted_cy, 1)],
+                    command_center_px=[round(command_center[0], 1), round(command_center[1], 1)],
+                    velocity_px_s=[round(self.target.vx, 1), round(self.target.vy, 1)],
+                    lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
+                    move_gain=round(self.cfg.move_gain, 3),
+                    lead_time=round(self.cfg.lead_time, 3),
                     error_x=round(err_x, 3),
                     error_y=round(err_y, 3),
                     target_span=round(target_span, 3),
