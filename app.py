@@ -809,6 +809,16 @@ async def tracker_camera_status():
     return await _require_tracker().camera_status()
 
 
+@app.get("/v1/tracker/history")
+async def tracker_history(limit: int = 200):
+    return _require_tracker().history(limit=limit)
+
+
+@app.post("/v1/tracker/history/clear")
+async def tracker_history_clear():
+    return _require_tracker().clear_history()
+
+
 @app.get("/v1/tracker/debug.jpg")
 async def tracker_debug_frame():
     jpeg = _require_tracker().debug_jpeg()
