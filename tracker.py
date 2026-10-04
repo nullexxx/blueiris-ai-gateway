@@ -107,6 +107,14 @@ class TrackerConfig:
     association_moving_distance: float = 0.35
     history_size: int = 300
 
+    # Control-loop compensation for PTZ/network/video latency. The camera can
+    # move a meaningful distance before a stop is visible in the RTSP feed, so
+    # brake predictively and pause briefly before allowing a direction reversal.
+    control_lookahead: float = 0.20
+    reversal_settle_time: float = 0.25
+    home_settle_time: float = 2.0
+    reacquire_conf: float = 0.35
+
     coast_time: float = 0.25
     reacquire_time: float = 1.50
     home_timeout: float = 6.0
@@ -157,6 +165,10 @@ class TrackerConfig:
             association_idle_distance=max(0.05, min(0.80, _env_float("TRACKER_ASSOCIATION_IDLE_DISTANCE", 0.22))),
             association_moving_distance=max(0.05, min(0.80, _env_float("TRACKER_ASSOCIATION_MOVING_DISTANCE", 0.35))),
             history_size=max(50, min(2000, _env_int("TRACKER_HISTORY_SIZE", 300))),
+            control_lookahead=max(0.0, min(1.0, _env_float("TRACKER_CONTROL_LOOKAHEAD", 0.20))),
+            reversal_settle_time=max(0.0, min(2.0, _env_float("TRACKER_REVERSAL_SETTLE_TIME", 0.25))),
+            home_settle_time=max(0.0, min(10.0, _env_float("TRACKER_HOME_SETTLE_TIME", 2.0))),
+            reacquire_conf=max(0.01, min(0.99, _env_float("TRACKER_REACQUIRE_CONF", 0.35))),
             coast_time=max(0.0, _env_float("TRACKER_COAST_TIME", 0.25)),
             reacquire_time=max(0.1, _env_float("TRACKER_REACQUIRE_TIME", 1.50)),
             home_timeout=max(0.5, _env_float("TRACKER_HOME_TIMEOUT", 6.0)),
@@ -184,6 +196,7 @@ class TrackerConfig:
         cfg.fps = max(1.0, min(30.0, cfg.fps))
         cfg.acquire_conf = max(0.01, min(0.99, cfg.acquire_conf))
         cfg.hold_conf = max(0.01, min(cfg.acquire_conf, cfg.hold_conf))
+        cfg.reacquire_conf = max(cfg.hold_conf, min(cfg.acquire_conf, cfg.reacquire_conf))
         cfg.association_moving_distance = max(cfg.association_idle_distance, cfg.association_moving_distance)
         cfg.reacquire_time = max(cfg.coast_time, cfg.reacquire_time)
         cfg.home_timeout = max(cfg.reacquire_time, cfg.home_timeout)
@@ -238,6 +251,10 @@ class TrackerConfig:
             "association_idle_distance": self.association_idle_distance,
             "association_moving_distance": self.association_moving_distance,
             "history_size": self.history_size,
+            "control_lookahead": self.control_lookahead,
+            "reversal_settle_time": self.reversal_settle_time,
+            "home_settle_time": self.home_settle_time,
+            "reacquire_conf": self.reacquire_conf,
             "coast_time": self.coast_time,
             "reacquire_time": self.reacquire_time,
             "home_timeout": self.home_timeout,
@@ -570,6 +587,12 @@ class DogTracker:
         self._home_sent = False
         self._last_error_x: Optional[float] = None
         self._last_error_y: Optional[float] = None
+        self._prev_error_x: Optional[float] = None
+        self._prev_error_y: Optional[float] = None
+        self._prev_error_time: Optional[float] = None
+        self._x_hold_until: float = 0.0
+        self._y_hold_until: float = 0.0
+        self._home_hold_until: float = 0.0
         self._last_detection_count = 0
         self._last_inference_ms = 0
         self._last_inference_outcome = "never"
@@ -662,6 +685,12 @@ class DogTracker:
         self._y_active = False
         self._last_pan = 0
         self._last_tilt = 0
+        self._prev_error_x = None
+        self._prev_error_y = None
+        self._prev_error_time = None
+        self._x_hold_until = 0.0
+        self._y_hold_until = 0.0
+        self._home_hold_until = 0.0
         if self.cfg.goto_home_on_start:
             await self.home()
         self._record_event("tracker_started", goto_home_on_start=self.cfg.goto_home_on_start)
@@ -677,6 +706,12 @@ class DogTracker:
         self._y_active = False
         self._last_pan = 0
         self._last_tilt = 0
+        self._prev_error_x = None
+        self._prev_error_y = None
+        self._prev_error_time = None
+        self._x_hold_until = 0.0
+        self._y_hold_until = 0.0
+        self._home_hold_until = 0.0
         await asyncio.to_thread(self.ptz.stop, True)
         self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
@@ -691,6 +726,12 @@ class DogTracker:
         self._last_tilt = 0
         self.state = "HOME" if self.active else "OFF"
         ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
+        self._home_hold_until = time.monotonic() + self.cfg.home_settle_time if ok else 0.0
+        self._prev_error_x = None
+        self._prev_error_y = None
+        self._prev_error_time = None
+        self._x_hold_until = 0.0
+        self._y_hold_until = 0.0
         if ok:
             self.home_returns += 1
         self._record_event("home_command", preset=self.cfg.home_preset, success=bool(ok))
@@ -729,6 +770,7 @@ class DogTracker:
             "session_started": self._session_started_wall,
             "history_events": len(self._history),
             "state": self.state,
+            "home_settle_remaining_ms": max(0, int((self._home_hold_until - now) * 1000)),
             "camera_connected": self.capture.connected,
             "capture_reconnects": self.capture.reconnects,
             "capture_error": self.capture.last_error,
@@ -840,6 +882,17 @@ class DogTracker:
                 pass
 
     async def _process_observation(self, frame: np.ndarray, detections: List[Detection], now: float) -> None:
+        # After a GotoPreset command, do not immediately reacquire while the
+        # camera is physically slewing home. Doing so lets continuous PTZ
+        # commands fight the preset movement and was a major source of chaos in
+        # the first tuning runs.
+        if now < self._home_hold_until:
+            self.state = "HOME"
+            self.target = None
+            self._last_error_x = None
+            self._last_error_y = None
+            return
+
         if self.target is None:
             candidates = [d for d in detections if d.confidence >= self.cfg.acquire_conf]
             if not candidates:
@@ -884,6 +937,16 @@ class DogTracker:
             return
 
         matched = self._associate(detections, frame.shape, now)
+        # A single low-confidence edge detection should not restart PTZ motion
+        # after we've already entered a lost/reacquire phase. Normal locked
+        # tracking still uses the lower hold_conf threshold.
+        if (
+            matched is not None
+            and self.state in ("COAST", "REACQUIRE", "LOST")
+            and matched.confidence < self.cfg.reacquire_conf
+        ):
+            matched = None
+
         if matched is not None:
             was_acquiring = self.target.acquire_hits < self.cfg.acquire_frames
             self.target.update(matched, now)
@@ -902,6 +965,11 @@ class DogTracker:
                     confidence=round(self.target.confidence, 3),
                     bbox=[round(v, 1) for v in self.target.bbox],
                 )
+                self._prev_error_x = None
+                self._prev_error_y = None
+                self._prev_error_time = None
+                self._x_hold_until = 0.0
+                self._y_hold_until = 0.0
                 self.logger.info(
                     "%s target acquired: conf=%.2f bbox=%s",
                     self.target.label,
@@ -926,6 +994,11 @@ class DogTracker:
             self.state = "SEARCHING"
             self._x_active = False
             self._y_active = False
+            self._prev_error_x = None
+            self._prev_error_y = None
+            self._prev_error_time = None
+            self._x_hold_until = 0.0
+            self._y_hold_until = 0.0
             await self._stop_ptz_if_needed()
             return
 
@@ -965,6 +1038,8 @@ class DogTracker:
                     self.cfg.home_preset,
                 )
             self._home_sent = True
+            if ok:
+                self._home_hold_until = time.monotonic() + self.cfg.home_settle_time
         self._record_event(
             "target_released",
             label=self.target.label if self.target is not None else None,
@@ -978,6 +1053,11 @@ class DogTracker:
         self._last_tilt = 0
         self._last_error_x = None
         self._last_error_y = None
+        self._prev_error_x = None
+        self._prev_error_y = None
+        self._prev_error_time = None
+        self._x_hold_until = 0.0
+        self._y_hold_until = 0.0
         self.state = "HOME" if self._home_sent else "SEARCHING"
 
     def _associate(self, detections: List[Detection], frame_shape: Tuple[int, int, int], now: float) -> Optional[Detection]:
@@ -1028,6 +1108,19 @@ class DogTracker:
         # +Y PTZ means up, therefore vertical error is intentionally inverted.
         err_x = (cx - (w / 2.0)) / (w / 2.0)
         err_y = ((h / 2.0) - cy) / (h / 2.0)
+        now = time.monotonic()
+
+        # Estimate observed image-error velocity. This includes both subject
+        # motion and camera motion, which is exactly what we need for braking.
+        rate_x = 0.0
+        rate_y = 0.0
+        if self._prev_error_time is not None:
+            dt = max(0.02, now - self._prev_error_time)
+            if self._prev_error_x is not None:
+                rate_x = (err_x - self._prev_error_x) / dt
+            if self._prev_error_y is not None:
+                rate_y = (err_y - self._prev_error_y) / dt
+
         self._last_error_x = err_x
         self._last_error_y = err_y
 
@@ -1046,8 +1139,36 @@ class DogTracker:
             self.cfg.max_tilt_speed,
         )
 
-        pan = self._slew(self._last_pan, desired_pan)
-        tilt = self._slew(self._last_tilt, desired_tilt)
+        desired_pan, self._x_active, self._x_hold_until = self._apply_predictive_brake(
+            axis="x",
+            error=err_x,
+            previous_error=self._prev_error_x,
+            error_rate=rate_x,
+            desired=desired_pan,
+            active=self._x_active,
+            inner=self.cfg.deadzone_x_in,
+            hold_until=self._x_hold_until,
+            now=now,
+            current_axis_vector=self.ptz.current_vector[0],
+        )
+        desired_tilt, self._y_active, self._y_hold_until = self._apply_predictive_brake(
+            axis="y",
+            error=err_y,
+            previous_error=self._prev_error_y,
+            error_rate=rate_y,
+            desired=desired_tilt,
+            active=self._y_active,
+            inner=self.cfg.deadzone_y_in,
+            hold_until=self._y_hold_until,
+            now=now,
+            current_axis_vector=self.ptz.current_vector[1],
+        )
+
+        # A predictive brake is a safety stop, not a normal slew-rate change.
+        # Drop that axis straight to zero so a speed-2 command does not spend an
+        # extra frame at speed 1 while we already know it will overshoot.
+        pan = 0 if self._x_hold_until > now else self._slew(self._last_pan, desired_pan)
+        tilt = 0 if self._y_hold_until > now else self._slew(self._last_tilt, desired_tilt)
         self._last_pan, self._last_tilt = pan, tilt
 
         changed = (pan, tilt, 0) != self.ptz.current_vector
@@ -1060,8 +1181,75 @@ class DogTracker:
                 vector=[pan, tilt, 0],
                 error_x=round(err_x, 3),
                 error_y=round(err_y, 3),
+                error_rate_x=round(rate_x, 3),
+                error_rate_y=round(rate_y, 3),
                 confidence=round(self.target.confidence, 3) if self.target is not None else None,
             )
+
+        self._prev_error_x = err_x
+        self._prev_error_y = err_y
+        self._prev_error_time = now
+
+    def _apply_predictive_brake(
+        self,
+        *,
+        axis: str,
+        error: float,
+        previous_error: Optional[float],
+        error_rate: float,
+        desired: int,
+        active: bool,
+        inner: float,
+        hold_until: float,
+        now: float,
+        current_axis_vector: int,
+    ) -> Tuple[int, bool, float]:
+        # While settling after a predictive stop or center crossing, keep this
+        # axis stopped. This prevents immediate left/right or up/down ping-pong.
+        if now < hold_until:
+            return 0, False, hold_until
+
+        # If the observed target error crossed through zero while this axis was
+        # moving, we already overshot. Stop first and wait before considering a
+        # reverse command.
+        if (
+            previous_error is not None
+            and previous_error != 0.0
+            and error != 0.0
+            and (previous_error > 0) != (error > 0)
+            and current_axis_vector != 0
+        ):
+            until = now + self.cfg.reversal_settle_time
+            self._record_event(
+                "predictive_brake",
+                axis=axis,
+                reason="center_cross",
+                error=round(error, 3),
+                error_rate=round(error_rate, 3),
+                hold_ms=int(self.cfg.reversal_settle_time * 1000),
+            )
+            return 0, False, until
+
+        # When the error is moving quickly toward zero, account for the delay
+        # between CGI command, motor response and the next RTSP frame. Stop early
+        # if the projected travel during that latency would carry us into/past
+        # the inner deadzone.
+        moving_toward_center = (error * error_rate) < 0.0
+        projected_travel = abs(error_rate) * self.cfg.control_lookahead
+        if desired != 0 and moving_toward_center and abs(error) <= (inner + projected_travel):
+            until = now + self.cfg.reversal_settle_time
+            self._record_event(
+                "predictive_brake",
+                axis=axis,
+                reason="lookahead",
+                error=round(error, 3),
+                error_rate=round(error_rate, 3),
+                projected=round(projected_travel, 3),
+                hold_ms=int(self.cfg.reversal_settle_time * 1000),
+            )
+            return 0, False, until
+
+        return desired, active, hold_until
 
     @staticmethod
     def _axis_velocity(error: float, active: bool, inner: float, outer: float, max_speed: int) -> Tuple[int, bool]:
