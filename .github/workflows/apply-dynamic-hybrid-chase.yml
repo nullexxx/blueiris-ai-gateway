@@ -1,0 +1,199 @@
+name: Apply dynamic hybrid chase recovery
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/apply-dynamic-hybrid-chase.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply focused tracker fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tracker.py')
+          s = p.read_text()
+
+          def replace_once(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise SystemExit(f'expected exactly one match, found {s.count(old)} for:\n{old}')
+              s = s.replace(old, new, 1)
+
+          replace_once(
+'''    hybrid_chase_entry_error: float = 0.82
+    hybrid_chase_exit_error: float = 0.42
+    hybrid_chase_min_speed: int = 1
+''',
+'''    hybrid_chase_entry_error: float = 0.82
+    hybrid_chase_exit_error: float = 0.42
+    # Fast-moving targets can enter chase earlier than the hard edge threshold.
+    # Speed is normalized by frame diagonal so this remains resolution-independent.
+    hybrid_chase_motion_error: float = 0.50
+    hybrid_chase_motion_speed_norm: float = 0.04
+    # Frigate-style coast through very short detector dropouts during camera motion.
+    # Do not stop the motor on one blurred/missed YOLO frame.
+    hybrid_chase_miss_grace: float = 0.25
+    hybrid_chase_min_speed: int = 1
+''')
+
+          replace_once(
+'''            hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
+            hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
+            hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
+''',
+'''            hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
+            hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
+            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.50),
+            hybrid_chase_motion_speed_norm=_env_float("TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM", 0.04),
+            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.25),
+            hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
+''')
+
+          replace_once(
+'''        cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))
+        cfg.hybrid_chase_entry_error = max(cfg.hybrid_chase_exit_error + 0.10, min(0.98, cfg.hybrid_chase_entry_error))
+        cfg.hybrid_chase_min_speed = max(1, min(8, cfg.hybrid_chase_min_speed))
+''',
+'''        cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))
+        cfg.hybrid_chase_entry_error = max(cfg.hybrid_chase_exit_error + 0.10, min(0.98, cfg.hybrid_chase_entry_error))
+        cfg.hybrid_chase_motion_error = max(cfg.hybrid_chase_exit_error, min(cfg.hybrid_chase_entry_error, cfg.hybrid_chase_motion_error))
+        cfg.hybrid_chase_motion_speed_norm = max(0.005, min(1.0, cfg.hybrid_chase_motion_speed_norm))
+        cfg.hybrid_chase_miss_grace = max(0.0, min(0.75, cfg.hybrid_chase_miss_grace))
+        cfg.hybrid_chase_min_speed = max(1, min(8, cfg.hybrid_chase_min_speed))
+''')
+
+          replace_once(
+'''            "hybrid_chase_entry_error": self.hybrid_chase_entry_error,
+            "hybrid_chase_exit_error": self.hybrid_chase_exit_error,
+            "hybrid_chase_min_speed": self.hybrid_chase_min_speed,
+''',
+'''            "hybrid_chase_entry_error": self.hybrid_chase_entry_error,
+            "hybrid_chase_exit_error": self.hybrid_chase_exit_error,
+            "hybrid_chase_motion_error": self.hybrid_chase_motion_error,
+            "hybrid_chase_motion_speed_norm": self.hybrid_chase_motion_speed_norm,
+            "hybrid_chase_miss_grace": self.hybrid_chase_miss_grace,
+            "hybrid_chase_min_speed": self.hybrid_chase_min_speed,
+''')
+
+          replace_once(
+'''        if self._hybrid_chase_active:
+            await self._stop_hybrid_chase("target_missing", seq=seq)
+
+        # A temporary detector miss while the camera is moving is not evidence that
+''',
+'''        if self._hybrid_chase_active:
+            # A moving PTZ can blur a dog enough to miss one or two YOLO frames.
+            # Keep the current bounded chase command alive briefly instead of
+            # slamming STOP on the first miss. The camera-side 1s timeout remains
+            # the hard fail-safe if inference disappears entirely.
+            hybrid_missing_for = max(0.0, now - self.target.last_seen)
+            if hybrid_missing_for <= self.cfg.hybrid_chase_miss_grace:
+                self.state = "ESCAPE_CHASE"
+                return
+            await self._stop_hybrid_chase("target_missing", seq=seq)
+
+        # A temporary detector miss while the camera is moving is not evidence that
+''')
+
+          replace_once(
+'''            dominant_error = max(abs(err_x), abs(err_y))
+            hard_escape_error = max(0.90, self.cfg.hybrid_chase_entry_error + 0.08)
+            hybrid_entry = (
+                self.cfg.hybrid_chase_enabled
+                and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
+                and (
+                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error)
+                    or dominant_error >= hard_escape_error
+                )
+            )
+            if hybrid_entry:
+''',
+'''            dominant_error = max(abs(err_x), abs(err_y))
+            hard_escape_error = max(0.90, self.cfg.hybrid_chase_entry_error + 0.08)
+
+            # Frigate-inspired dynamic handoff: moveDirectly remains the precision
+            # controller for slow/stable motion, but a genuinely fast target that
+            # is already well outside center and still moving outward should not be
+            # committed to another ~1.5s positional move. Use normalized velocity
+            # so the threshold is independent of stream resolution.
+            frame_diag = max(1.0, math.hypot(w, h))
+            target_speed_norm = (
+                math.hypot(self.target.vx, self.target.vy) / frame_diag
+                if self.target.velocity_valid
+                else 0.0
+            )
+            moving_outward = self.target.velocity_valid and (
+                (abs(err_x) >= self.cfg.hybrid_chase_motion_error and err_x * self.target.vx > 0.0)
+                or (abs(err_y) >= self.cfg.hybrid_chase_motion_error and err_y * self.target.vy > 0.0)
+            )
+            motion_escape = (
+                dominant_error >= self.cfg.hybrid_chase_motion_error
+                and target_speed_norm >= self.cfg.hybrid_chase_motion_speed_norm
+                and moving_outward
+            )
+            hybrid_entry = (
+                self.cfg.hybrid_chase_enabled
+                and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
+                and (
+                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error)
+                    or dominant_error >= hard_escape_error
+                    or motion_escape
+                )
+            )
+            if hybrid_entry:
+''')
+
+          replace_once(
+'''                    "hybrid_chase_enter",
+                    label=self.target.label,
+                    error_x=round(err_x, 3),
+                    error_y=round(err_y, 3),
+                    edge_clipped=edge_clipped_now,
+                    pan_speed=pan_speed,
+''',
+'''                    "hybrid_chase_enter",
+                    label=self.target.label,
+                    entry_reason=(
+                        "motion_escape" if motion_escape else
+                        ("edge_clipped" if edge_clipped_now else "hard_escape")
+                    ),
+                    error_x=round(err_x, 3),
+                    error_y=round(err_y, 3),
+                    target_speed_norm=round(target_speed_norm, 4),
+                    moving_outward=bool(moving_outward),
+                    edge_clipped=edge_clipped_now,
+                    pan_speed=pan_speed,
+''')
+
+          p.write_text(s)
+          PY
+
+      - name: Validate tracker
+        run: |
+          python3 -m py_compile tracker.py
+          git diff --check
+          grep -q 'hybrid_chase_motion_speed_norm' tracker.py
+          grep -q 'hybrid_chase_miss_grace' tracker.py
+          grep -q 'motion_escape' tracker.py
+          grep -q 'hybrid_missing_for' tracker.py
+
+      - name: Commit tracker and remove one-shot workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tracker.py
+          git rm .github/workflows/apply-dynamic-hybrid-chase.yml
+          git commit -m 'Trigger hybrid chase from fast outward motion'
+          git push
