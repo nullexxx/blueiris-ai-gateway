@@ -115,6 +115,17 @@ class TrackerConfig:
     home_settle_time: float = 2.0
     reacquire_conf: float = 0.35
 
+    # PTZ controller mode. ``pulse`` sends a short movement burst, explicitly
+    # stops, then waits for fresh RTSP feedback before issuing another move.
+    # This is much more stable than a continuous servo loop on cameras with
+    # noticeable CGI/motor/video latency.
+    control_mode: str = "pulse"
+    pulse_min_ms: int = 55
+    pulse_max_ms: int = 120
+    pulse_settle_ms: int = 180
+    pulse_tilt_scale: float = 0.70
+    pulse_axis_mode: str = "dominant"
+
     coast_time: float = 0.25
     reacquire_time: float = 1.50
     home_timeout: float = 6.0
@@ -169,6 +180,12 @@ class TrackerConfig:
             reversal_settle_time=max(0.0, min(2.0, _env_float("TRACKER_REVERSAL_SETTLE_TIME", 0.25))),
             home_settle_time=max(0.0, min(10.0, _env_float("TRACKER_HOME_SETTLE_TIME", 2.0))),
             reacquire_conf=max(0.01, min(0.99, _env_float("TRACKER_REACQUIRE_CONF", 0.35))),
+            control_mode=os.getenv("TRACKER_CONTROL_MODE", "pulse").strip().lower(),
+            pulse_min_ms=max(20, min(500, _env_int("TRACKER_PULSE_MIN_MS", 55))),
+            pulse_max_ms=max(20, min(1000, _env_int("TRACKER_PULSE_MAX_MS", 120))),
+            pulse_settle_ms=max(0, min(2000, _env_int("TRACKER_PULSE_SETTLE_MS", 180))),
+            pulse_tilt_scale=max(0.20, min(1.50, _env_float("TRACKER_PULSE_TILT_SCALE", 0.70))),
+            pulse_axis_mode=os.getenv("TRACKER_PULSE_AXIS_MODE", "dominant").strip().lower(),
             coast_time=max(0.0, _env_float("TRACKER_COAST_TIME", 0.25)),
             reacquire_time=max(0.1, _env_float("TRACKER_REACQUIRE_TIME", 1.50)),
             home_timeout=max(0.5, _env_float("TRACKER_HOME_TIMEOUT", 6.0)),
@@ -198,6 +215,11 @@ class TrackerConfig:
         cfg.hold_conf = max(0.01, min(cfg.acquire_conf, cfg.hold_conf))
         cfg.reacquire_conf = max(cfg.hold_conf, min(cfg.acquire_conf, cfg.reacquire_conf))
         cfg.association_moving_distance = max(cfg.association_idle_distance, cfg.association_moving_distance)
+        if cfg.control_mode not in ("pulse", "continuous"):
+            cfg.control_mode = "pulse"
+        if cfg.pulse_axis_mode not in ("dominant", "diagonal"):
+            cfg.pulse_axis_mode = "dominant"
+        cfg.pulse_max_ms = max(cfg.pulse_min_ms, cfg.pulse_max_ms)
         cfg.reacquire_time = max(cfg.coast_time, cfg.reacquire_time)
         cfg.home_timeout = max(cfg.reacquire_time, cfg.home_timeout)
         return cfg
@@ -255,6 +277,12 @@ class TrackerConfig:
             "reversal_settle_time": self.reversal_settle_time,
             "home_settle_time": self.home_settle_time,
             "reacquire_conf": self.reacquire_conf,
+            "control_mode": self.control_mode,
+            "pulse_min_ms": self.pulse_min_ms,
+            "pulse_max_ms": self.pulse_max_ms,
+            "pulse_settle_ms": self.pulse_settle_ms,
+            "pulse_tilt_scale": self.pulse_tilt_scale,
+            "pulse_axis_mode": self.pulse_axis_mode,
             "coast_time": self.coast_time,
             "reacquire_time": self.reacquire_time,
             "home_timeout": self.home_timeout,
@@ -400,6 +428,32 @@ class AmcrestPTZ:
             return True
         except Exception:
             return False
+
+    def pulse(self, pan: int, tilt: int, zoom: int = 0, duration_ms: int = 80) -> bool:
+        """Send one short movement burst and explicitly stop.
+
+        The start request is allowed to complete before the pulse timer begins; this
+        makes the requested duration approximate actual motor-on time rather than
+        including outbound CGI latency. A stop is always attempted in ``finally``.
+        """
+        pan = max(-8, min(8, int(pan)))
+        tilt = max(-8, min(8, int(tilt)))
+        zoom = max(-100, min(100, int(zoom)))
+        duration_ms = max(10, min(2000, int(duration_ms)))
+        if (pan, tilt, zoom) == (0, 0, 0):
+            return self.stop(force=True)
+
+        started = False
+        try:
+            started = self.continuous(pan, tilt, zoom, force=True)
+            if not started:
+                return False
+            time.sleep(duration_ms / 1000.0)
+            return True
+        finally:
+            # Explicit stop is the primary brake; the camera-side 1 s timeout on
+            # the start command remains a secondary failsafe if this request fails.
+            self.stop(force=True)
 
     def stop(self, force: bool = False) -> bool:
         now = time.monotonic()
@@ -593,6 +647,8 @@ class DogTracker:
         self._x_hold_until: float = 0.0
         self._y_hold_until: float = 0.0
         self._home_hold_until: float = 0.0
+        self._pulse_settle_until: float = 0.0
+        self._last_pulse_axis: Optional[str] = None
         self._last_detection_count = 0
         self._last_inference_ms = 0
         self._last_inference_outcome = "never"
@@ -691,6 +747,8 @@ class DogTracker:
         self._x_hold_until = 0.0
         self._y_hold_until = 0.0
         self._home_hold_until = 0.0
+        self._pulse_settle_until = 0.0
+        self._last_pulse_axis = None
         if self.cfg.goto_home_on_start:
             await self.home()
         self._record_event("tracker_started", goto_home_on_start=self.cfg.goto_home_on_start)
@@ -712,6 +770,8 @@ class DogTracker:
         self._x_hold_until = 0.0
         self._y_hold_until = 0.0
         self._home_hold_until = 0.0
+        self._pulse_settle_until = 0.0
+        self._last_pulse_axis = None
         await asyncio.to_thread(self.ptz.stop, True)
         self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
@@ -727,6 +787,8 @@ class DogTracker:
         self.state = "HOME" if self.active else "OFF"
         ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
         self._home_hold_until = time.monotonic() + self.cfg.home_settle_time if ok else 0.0
+        self._pulse_settle_until = self._home_hold_until
+        self._last_pulse_axis = None
         self._prev_error_x = None
         self._prev_error_y = None
         self._prev_error_time = None
@@ -771,6 +833,8 @@ class DogTracker:
             "history_events": len(self._history),
             "state": self.state,
             "home_settle_remaining_ms": max(0, int((self._home_hold_until - now) * 1000)),
+            "pulse_settle_remaining_ms": max(0, int((self._pulse_settle_until - now) * 1000)),
+            "control_mode": self.cfg.control_mode,
             "camera_connected": self.capture.connected,
             "capture_reconnects": self.capture.reconnects,
             "capture_error": self.capture.last_error,
@@ -1058,6 +1122,8 @@ class DogTracker:
         self._prev_error_time = None
         self._x_hold_until = 0.0
         self._y_hold_until = 0.0
+        self._pulse_settle_until = self._home_hold_until
+        self._last_pulse_axis = None
         self.state = "HOME" if self._home_sent else "SEARCHING"
 
     def _associate(self, detections: List[Detection], frame_shape: Tuple[int, int, int], now: float) -> Optional[Detection]:
@@ -1078,7 +1144,7 @@ class DogTracker:
                 continue
             cx, cy = det.center
             dist_norm = math.hypot(cx - px, cy - py) / diag
-            moving = self.ptz.current_vector != (0, 0, 0)
+            moving = self.ptz.current_vector != (0, 0, 0) or now < self._pulse_settle_until
             proximity_span = 0.60 if moving else 0.45
             proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
             overlap = _iou(self.target.bbox, det.bbox)
@@ -1092,7 +1158,7 @@ class DogTracker:
         # IoU can be near zero while the PTZ itself is moving because camera motion
         # shifts every pixel in the frame. Use a wider configurable proximity gate
         # while the PTZ is active, then tighten it again when the camera is still.
-        moving = self.ptz.current_vector != (0, 0, 0)
+        moving = self.ptz.current_vector != (0, 0, 0) or now < self._pulse_settle_until
         max_dist = self.cfg.association_moving_distance if moving else self.cfg.association_idle_distance
         if best is not None and (best_score >= 0.22 or best_dist_norm <= max_dist):
             return best
@@ -1100,6 +1166,9 @@ class DogTracker:
 
     async def _drive_to_target(self, frame_shape: Tuple[int, int, int]) -> None:
         if self.target is None:
+            return
+        if self.cfg.control_mode == "pulse":
+            await self._drive_to_target_pulse(frame_shape)
             return
         h, w = frame_shape[:2]
         cx, cy = self.target.center
@@ -1189,6 +1258,117 @@ class DogTracker:
         self._prev_error_x = err_x
         self._prev_error_y = err_y
         self._prev_error_time = now
+
+    async def _drive_to_target_pulse(self, frame_shape: Tuple[int, int, int]) -> None:
+        """Latency-tolerant sample/move/settle controller.
+
+        Unlike the continuous servo controller, this never leaves the motor running
+        while waiting for delayed RTSP feedback. It sends one short burst, sends an
+        explicit stop, then observes fresh frames for ``pulse_settle_ms`` before
+        another correction is allowed.
+        """
+        if self.target is None:
+            return
+
+        h, w = frame_shape[:2]
+        cx, cy = self.target.center
+        err_x = (cx - (w / 2.0)) / (w / 2.0)
+        err_y = ((h / 2.0) - cy) / (h / 2.0)
+        now = time.monotonic()
+        self._last_error_x = err_x
+        self._last_error_y = err_y
+
+        # During the settle window we continue inference/association but do not
+        # issue another motor command. This is the key difference from v1-v3.
+        if now < self._pulse_settle_until:
+            return
+
+        def excess(error: float, outer: float) -> float:
+            mag = abs(error)
+            if mag <= outer:
+                return 0.0
+            return max(0.0, min(1.0, (mag - outer) / max(0.001, 1.0 - outer)))
+
+        x_excess = excess(err_x, self.cfg.deadzone_x_out)
+        y_excess = excess(err_y, self.cfg.deadzone_y_out)
+
+        if x_excess <= 0.0 and y_excess <= 0.0:
+            self._x_active = False
+            self._y_active = False
+            self._last_pan = 0
+            self._last_tilt = 0
+            return
+
+        pan = 0
+        tilt = 0
+        axis = "none"
+
+        if self.cfg.pulse_axis_mode == "diagonal":
+            if x_excess > 0.0:
+                pan_speed = 1 if x_excess < 0.60 else self.cfg.max_pan_speed
+                pan = pan_speed if err_x > 0 else -pan_speed
+            if y_excess > 0.0:
+                tilt_speed = 1 if y_excess < 0.70 else self.cfg.max_tilt_speed
+                tilt = tilt_speed if err_y > 0 else -tilt_speed
+            axis = "xy" if pan and tilt else ("x" if pan else "y")
+            severity = max(x_excess, y_excess * self.cfg.pulse_tilt_scale)
+        else:
+            # Default: correct only the more urgent axis per burst. This avoids
+            # pan/tilt overshoot compounding into a diagonal loss of the target.
+            x_score = x_excess
+            y_score = y_excess * self.cfg.pulse_tilt_scale
+            if x_score >= y_score and x_excess > 0.0:
+                pan_speed = 1 if x_excess < 0.60 else self.cfg.max_pan_speed
+                pan = pan_speed if err_x > 0 else -pan_speed
+                axis = "x"
+                severity = x_excess
+            elif y_excess > 0.0:
+                tilt_speed = 1 if y_excess < 0.70 else self.cfg.max_tilt_speed
+                tilt = tilt_speed if err_y > 0 else -tilt_speed
+                axis = "y"
+                severity = y_excess * self.cfg.pulse_tilt_scale
+            else:
+                return
+
+        duration = self.cfg.pulse_min_ms + int(
+            max(0.0, min(1.0, severity)) * (self.cfg.pulse_max_ms - self.cfg.pulse_min_ms)
+        )
+        if axis == "y":
+            duration = max(20, int(duration * self.cfg.pulse_tilt_scale))
+
+        # The CGI start + stop calls themselves can take tens of milliseconds.
+        # Execute the whole burst off the event loop, then impose an additional
+        # observation settle period before another movement is allowed.
+        t0 = time.monotonic()
+        ok = await asyncio.to_thread(self.ptz.pulse, pan, tilt, 0, duration)
+        t1 = time.monotonic()
+        self._pulse_settle_until = t1 + (self.cfg.pulse_settle_ms / 1000.0)
+        self._last_pulse_axis = axis
+
+        if ok:
+            self.ptz_commands += 1
+            self._record_event(
+                "ptz_pulse",
+                label=self.target.label if self.target is not None else None,
+                axis=axis,
+                vector=[pan, tilt, 0],
+                duration_ms=duration,
+                roundtrip_ms=int((t1 - t0) * 1000),
+                settle_ms=self.cfg.pulse_settle_ms,
+                error_x=round(err_x, 3),
+                error_y=round(err_y, 3),
+                confidence=round(self.target.confidence, 3) if self.target is not None else None,
+            )
+
+        # A pulse always ends stopped, so continuous-controller state must not
+        # leak into association/hysteresis decisions.
+        self._x_active = False
+        self._y_active = False
+        self._last_pan = 0
+        self._last_tilt = 0
+        self._prev_error_x = err_x
+        self._prev_error_y = err_y
+        self._prev_error_time = t1
 
     def _apply_predictive_brake(
         self,
@@ -1325,7 +1505,8 @@ class DogTracker:
             if self.target is not None:
                 target_text = f" {self.target.label} {self.target.confidence:.2f}"
             text = (
-                f"{self.state}{target_text} PTZ={self.ptz.current_vector[0]},{self.ptz.current_vector[1]} "
+                f"{self.state}{target_text} mode={self.cfg.control_mode} "
+                f"PTZ={self.ptz.current_vector[0]},{self.ptz.current_vector[1]} "
                 f"err={self._last_error_x if self._last_error_x is not None else 0:+.2f},"
                 f"{self._last_error_y if self._last_error_y is not None else 0:+.2f} "
                 f"infer={self._last_inference_ms}ms"
