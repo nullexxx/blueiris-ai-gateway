@@ -141,6 +141,23 @@ class TrackerConfig:
     edge_rescue_error: float = 0.75
     edge_rescue_gain: float = 0.85
 
+    # Hybrid fast-escape chase. Normal tracking remains camera-managed moveDirectly.
+    # Continuous movement is used only when a target is already in genuine danger
+    # of leaving the frame, and stops well before center so motor inertia cannot
+    # create the oscillation seen when continuous control was used as the main loop.
+    hybrid_chase_enabled: bool = True
+    hybrid_chase_entry_error: float = 0.82
+    hybrid_chase_exit_error: float = 0.42
+    hybrid_chase_min_speed: int = 1
+    hybrid_chase_max_speed: int = 6
+    hybrid_chase_full_speed_error: float = 0.95
+    hybrid_chase_command_interval: float = 0.18
+    hybrid_chase_keepalive: float = 0.45
+    hybrid_chase_camera_timeout: int = 1
+    hybrid_chase_max_seconds: float = 2.50
+    hybrid_chase_cooldown: float = 0.35
+    hybrid_chase_settle_frames: int = 2
+
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
     ptz_status_poll_interval: float = 0.12
@@ -217,6 +234,18 @@ class TrackerConfig:
             edge_rescue_enabled=_env_bool("TRACKER_EDGE_RESCUE_ENABLED", True),
             edge_rescue_error=_env_float("TRACKER_EDGE_RESCUE_ERROR", 0.75),
             edge_rescue_gain=_env_float("TRACKER_EDGE_RESCUE_GAIN", 0.85),
+            hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),
+            hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
+            hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
+            hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
+            hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 6),
+            hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.95),
+            hybrid_chase_command_interval=_env_float("TRACKER_HYBRID_CHASE_COMMAND_INTERVAL", 0.18),
+            hybrid_chase_keepalive=_env_float("TRACKER_HYBRID_CHASE_KEEPALIVE", 0.45),
+            hybrid_chase_camera_timeout=_env_int("TRACKER_HYBRID_CHASE_CAMERA_TIMEOUT", 1),
+            hybrid_chase_max_seconds=_env_float("TRACKER_HYBRID_CHASE_MAX_SECONDS", 2.50),
+            hybrid_chase_cooldown=_env_float("TRACKER_HYBRID_CHASE_COOLDOWN", 0.35),
+            hybrid_chase_settle_frames=_env_int("TRACKER_HYBRID_CHASE_SETTLE_FRAMES", 2),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
@@ -270,6 +299,17 @@ class TrackerConfig:
         cfg.velocity_jump_ratio = max(1.5, min(20.0, cfg.velocity_jump_ratio))
         cfg.edge_rescue_error = max(0.40, min(0.98, cfg.edge_rescue_error))
         cfg.edge_rescue_gain = max(cfg.move_gain, min(1.00, cfg.edge_rescue_gain))
+        cfg.hybrid_chase_exit_error = max(0.20, min(0.65, cfg.hybrid_chase_exit_error))
+        cfg.hybrid_chase_entry_error = max(cfg.hybrid_chase_exit_error + 0.10, min(0.98, cfg.hybrid_chase_entry_error))
+        cfg.hybrid_chase_min_speed = max(1, min(8, cfg.hybrid_chase_min_speed))
+        cfg.hybrid_chase_max_speed = max(cfg.hybrid_chase_min_speed, min(8, cfg.hybrid_chase_max_speed))
+        cfg.hybrid_chase_full_speed_error = max(cfg.hybrid_chase_entry_error + 0.01, min(1.0, cfg.hybrid_chase_full_speed_error))
+        cfg.hybrid_chase_command_interval = max(0.10, min(0.75, cfg.hybrid_chase_command_interval))
+        cfg.hybrid_chase_keepalive = max(cfg.hybrid_chase_command_interval, min(0.90, cfg.hybrid_chase_keepalive))
+        cfg.hybrid_chase_camera_timeout = max(1, min(5, cfg.hybrid_chase_camera_timeout))
+        cfg.hybrid_chase_max_seconds = max(0.75, min(5.0, cfg.hybrid_chase_max_seconds))
+        cfg.hybrid_chase_cooldown = max(0.0, min(2.0, cfg.hybrid_chase_cooldown))
+        cfg.hybrid_chase_settle_frames = max(1, min(8, cfg.hybrid_chase_settle_frames))
         cfg.ptz_status_poll_interval = max(0.05, min(1.0, cfg.ptz_status_poll_interval))
         cfg.ptz_operation_timeout = max(0.75, min(15.0, cfg.ptz_operation_timeout))
         cfg.post_move_frames = max(1, min(20, cfg.post_move_frames))
@@ -362,6 +402,18 @@ class TrackerConfig:
             "edge_rescue_enabled": self.edge_rescue_enabled,
             "edge_rescue_error": self.edge_rescue_error,
             "edge_rescue_gain": self.edge_rescue_gain,
+            "hybrid_chase_enabled": self.hybrid_chase_enabled,
+            "hybrid_chase_entry_error": self.hybrid_chase_entry_error,
+            "hybrid_chase_exit_error": self.hybrid_chase_exit_error,
+            "hybrid_chase_min_speed": self.hybrid_chase_min_speed,
+            "hybrid_chase_max_speed": self.hybrid_chase_max_speed,
+            "hybrid_chase_full_speed_error": self.hybrid_chase_full_speed_error,
+            "hybrid_chase_command_interval": self.hybrid_chase_command_interval,
+            "hybrid_chase_keepalive": self.hybrid_chase_keepalive,
+            "hybrid_chase_camera_timeout": self.hybrid_chase_camera_timeout,
+            "hybrid_chase_max_seconds": self.hybrid_chase_max_seconds,
+            "hybrid_chase_cooldown": self.hybrid_chase_cooldown,
+            "hybrid_chase_settle_frames": self.hybrid_chase_settle_frames,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -599,6 +651,50 @@ class AmcrestPTZ:
         except Exception:
             return False
 
+    def continuous_move(self, pan_speed: int, tilt_speed: int, timeout_s: int = 1) -> bool:
+        """Drive pan/tilt continuously with signed Dahua speeds (-8..8)."""
+        pan_speed = max(-8, min(8, int(pan_speed)))
+        tilt_speed = max(-8, min(8, int(tilt_speed)))
+        timeout_s = max(1, min(5, int(timeout_s)))
+        if pan_speed == 0 and tilt_speed == 0:
+            return self.continuous_stop()
+        try:
+            self._get(
+                "/cgi-bin/ptz.cgi",
+                {
+                    "action": "start",
+                    "channel": self.cfg.camera_channel,
+                    "code": "Continuously",
+                    "arg1": pan_speed,
+                    "arg2": tilt_speed,
+                    "arg3": 0,
+                    "arg4": timeout_s,
+                },
+            )
+            self.last_move_point = None
+            return True
+        except Exception:
+            return False
+
+    def continuous_stop(self) -> bool:
+        """Immediately stop continuous pan/tilt movement."""
+        try:
+            self._get(
+                "/cgi-bin/ptz.cgi",
+                {
+                    "action": "stop",
+                    "channel": self.cfg.camera_channel,
+                    "code": "Continuously",
+                    "arg1": 0,
+                    "arg2": 0,
+                    "arg3": 0,
+                    "arg4": 0,
+                },
+            )
+            return True
+        except Exception:
+            return False
+
     def zoom_step(self, direction: str, duration_ms: int) -> bool:
         """Perform one bounded optical-zoom step using ZoomTele/ZoomWide."""
         if direction not in ("in", "out"):
@@ -823,6 +919,17 @@ class DogTracker:
         # reference; a sudden reversal/jump suppresses predictive lead for one move.
         self._trusted_velocity: Optional[Tuple[float, float]] = None
 
+        # Fast continuous motion is deliberately an escape-only mode. It pulls a
+        # target away from an edge, stops early (well before the normal deadzone),
+        # then hands control back to moveDirectly. This keeps normal tracking smooth
+        # and avoids the center-crossing oscillation of the earlier all-continuous build.
+        self._hybrid_chase_active = False
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_started_at = 0.0
+        self._hybrid_last_command_at = 0.0
+        self._hybrid_last_stopped_at = 0.0
+
         self._last_detection_count = 0
         self._last_inference_ms = 0
         self._last_inference_outcome = "never"
@@ -838,6 +945,9 @@ class DogTracker:
         self.ptz_commands = 0
         self.move_direct_commands = 0
         self.zoom_commands = 0
+        self.hybrid_chase_entries = 0
+        self.hybrid_chase_commands = 0
+        self.hybrid_chase_stops = 0
         self.targets_acquired = 0
         self.home_returns = 0
 
@@ -898,6 +1008,7 @@ class DogTracker:
         self._shutdown = True
         self.active = False
         self.state = "SHUTDOWN"
+        await self._stop_hybrid_chase("shutdown", force=True)
         if self._task:
             self._task.cancel()
             try:
@@ -930,6 +1041,11 @@ class DogTracker:
         self._association_motion_start_center = None
         self._association_motion_end_center = None
         self._trusted_velocity = None
+        self._hybrid_chase_active = False
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_started_at = 0.0
+        self._hybrid_last_command_at = 0.0
 
     async def start(self) -> dict:
         self._history.clear()
@@ -954,12 +1070,14 @@ class DogTracker:
         self._record_event("tracker_stopping")
         self.active = False
         self.state = "OFF"
+        await self._stop_hybrid_chase("tracker_stop", force=True)
         self._reset_tracking_state()
         self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
     async def home(self) -> dict:
+        await self._stop_hybrid_chase("home", force=True)
         self._reset_tracking_state()
         self._home_sent = True
         self.state = "HOME" if self.active else "OFF"
@@ -1020,7 +1138,15 @@ class DogTracker:
             "session_started": self._session_started_wall,
             "history_events": len(self._history),
             "state": self.state,
-            "control_mode": "moveDirectly",
+            "control_mode": "hybrid",
+            "primary_control_mode": "moveDirectly",
+            "hybrid_chase_active": self._hybrid_chase_active,
+            "hybrid_chase_speed": [self._hybrid_pan_speed, self._hybrid_tilt_speed],
+            "hybrid_chase_elapsed_ms": (
+                None
+                if not self._hybrid_chase_active or self._hybrid_started_at <= 0
+                else int(max(0.0, now - self._hybrid_started_at) * 1000)
+            ),
             "move_timing_model": {
                 "samples": len(self._move_timing_samples),
                 "ready": self._move_eta_model_ready,
@@ -1068,6 +1194,9 @@ class DogTracker:
                 "ptz_commands": self.ptz_commands,
                 "move_direct_commands": self.move_direct_commands,
                 "zoom_commands": self.zoom_commands,
+                "hybrid_chase_entries": self.hybrid_chase_entries,
+                "hybrid_chase_commands": self.hybrid_chase_commands,
+                "hybrid_chase_stops": self.hybrid_chase_stops,
                 "targets_acquired": self.targets_acquired,
                 "home_returns": self.home_returns,
             },
@@ -1181,16 +1310,192 @@ class DogTracker:
 
         cosine = (vx * previous[0] + vy * previous[1]) / max(1e-6, speed * prev_speed)
         if cosine < self.cfg.velocity_consistency_cosine:
+            # One-sample quarantine: suppress this lead, but do not keep comparing
+            # a legitimate new direction against a stale pre-turn reference forever.
+            self._trusted_velocity = None
             return False, "velocity_direction_change"
 
         ratio = max(speed, prev_speed) / max(1.0, min(speed, prev_speed))
         if ratio > self.cfg.velocity_jump_ratio:
+            self._trusted_velocity = None
             return False, "velocity_jump"
 
         # Invalid samples must never become the reference used to validate the
         # next sample. Promote the candidate only after every sanity check passes.
         self._trusted_velocity = (vx, vy)
         return True, None
+
+    def _hybrid_axis_speed(self, error: float) -> int:
+        magnitude = abs(error)
+        if magnitude <= self.cfg.hybrid_chase_exit_error:
+            return 0
+        span = max(0.01, self.cfg.hybrid_chase_full_speed_error - self.cfg.hybrid_chase_exit_error)
+        ratio = max(0.0, min(1.0, (magnitude - self.cfg.hybrid_chase_exit_error) / span))
+        speed = int(round(
+            self.cfg.hybrid_chase_min_speed
+            + ratio * (self.cfg.hybrid_chase_max_speed - self.cfg.hybrid_chase_min_speed)
+        ))
+        speed = max(self.cfg.hybrid_chase_min_speed, min(self.cfg.hybrid_chase_max_speed, speed))
+        return speed if error > 0 else -speed
+
+    async def _stop_hybrid_chase(
+        self,
+        reason: str,
+        *,
+        seq: Optional[int] = None,
+        force: bool = False,
+    ) -> bool:
+        was_active = (
+            self._hybrid_chase_active
+            or self._hybrid_pan_speed != 0
+            or self._hybrid_tilt_speed != 0
+        )
+        if not was_active and not force:
+            return True
+        t0 = time.monotonic()
+        ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        t1 = time.monotonic()
+        self._hybrid_chase_active = False
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_started_at = 0.0
+        self._hybrid_last_command_at = t1
+        self._hybrid_last_stopped_at = t1
+        if ok and was_active:
+            self.ptz_commands += 1
+            self.hybrid_chase_stops += 1
+            self._record_event(
+                "hybrid_chase_stop",
+                reason=reason,
+                http_ms=int((t1 - t0) * 1000),
+            )
+        elif not ok and was_active:
+            self._record_event("hybrid_chase_stop_failed", reason=reason, error=self.ptz.last_error)
+        if was_active:
+            if self.target is not None:
+                self.target.clear_velocity()
+                self._velocity_rebase_required = True
+            self._association_motion_start_center = None
+            self._association_motion_end_center = None
+            if seq is not None:
+                self._post_motion_release_seq = max(
+                    self._post_motion_release_seq,
+                    seq + self.cfg.hybrid_chase_settle_frames,
+                )
+        return ok
+
+    async def _set_hybrid_chase_speed(
+        self,
+        pan_speed: int,
+        tilt_speed: int,
+        *,
+        seq: int,
+        now: float,
+        error_x: float,
+        error_y: float,
+        target_span: float,
+    ) -> bool:
+        pan_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(pan_speed)))
+        tilt_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(tilt_speed)))
+        if pan_speed == 0 and tilt_speed == 0:
+            return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
+
+        desired = (pan_speed, tilt_speed)
+        current = (self._hybrid_pan_speed, self._hybrid_tilt_speed)
+
+        # Escape chase never reverses through center. A sign flip means we have
+        # recovered enough (or inertia carried us through); stop and let the
+        # slower camera-managed moveDirectly controller take over after settling.
+        def sign_flip(old: int, new: int) -> bool:
+            return old != 0 and new != 0 and ((old > 0) != (new > 0))
+        if self._hybrid_chase_active and (sign_flip(current[0], desired[0]) or sign_flip(current[1], desired[1])):
+            return await self._stop_hybrid_chase("direction_reversal", seq=seq)
+
+        elapsed = max(0.0, now - self._hybrid_last_command_at)
+        same_speed = self._hybrid_chase_active and desired == current
+        if same_speed and elapsed < self.cfg.hybrid_chase_keepalive:
+            return True
+        if self._hybrid_chase_active and not same_speed and elapsed < self.cfg.hybrid_chase_command_interval:
+            return True
+
+        t0 = time.monotonic()
+        ok = await asyncio.to_thread(
+            self.ptz.continuous_move,
+            pan_speed,
+            tilt_speed,
+            self.cfg.hybrid_chase_camera_timeout,
+        )
+        t1 = time.monotonic()
+        if not ok:
+            self._record_event(
+                "hybrid_chase_move_failed",
+                pan_speed=pan_speed,
+                tilt_speed=tilt_speed,
+                error=self.ptz.last_error,
+            )
+            if self._hybrid_chase_active:
+                await self._stop_hybrid_chase("command_failed", seq=seq, force=True)
+            return False
+
+        entering = not self._hybrid_chase_active
+        if entering:
+            self._hybrid_started_at = t1
+            self.hybrid_chase_entries += 1
+        self._hybrid_chase_active = True
+        self._hybrid_pan_speed = pan_speed
+        self._hybrid_tilt_speed = tilt_speed
+        self._hybrid_last_command_at = t1
+        self.ptz_commands += 1
+        self.hybrid_chase_commands += 1
+        self.state = "ESCAPE_CHASE"
+        if self.target is not None:
+            self.target.clear_velocity()
+            self._velocity_rebase_required = True
+        self._association_motion_start_center = None
+        self._association_motion_end_center = None
+        if entering or desired != current:
+            self._record_event(
+                "hybrid_chase_move",
+                entering=entering,
+                label=None if self.target is None else self.target.label,
+                pan_speed=pan_speed,
+                tilt_speed=tilt_speed,
+                error_x=round(error_x, 3),
+                error_y=round(error_y, 3),
+                target_span=round(target_span, 3),
+                confidence=None if self.target is None else round(self.target.confidence, 3),
+                http_ms=int((t1 - t0) * 1000),
+            )
+        return True
+
+    async def _drive_hybrid_chase(
+        self,
+        frame_shape: Tuple[int, ...],
+        seq: int,
+        now: float,
+        err_x: float,
+        err_y: float,
+        target_span: float,
+    ) -> None:
+        if not self._hybrid_chase_active:
+            return
+        if (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds:
+            await self._stop_hybrid_chase("max_duration", seq=seq)
+            return
+        if max(abs(err_x), abs(err_y)) <= self.cfg.hybrid_chase_exit_error:
+            await self._stop_hybrid_chase("safe_inner_region", seq=seq)
+            return
+        pan_speed = self._hybrid_axis_speed(err_x)
+        tilt_speed = -self._hybrid_axis_speed(err_y)
+        await self._set_hybrid_chase_speed(
+            pan_speed,
+            tilt_speed,
+            seq=seq,
+            now=now,
+            error_x=err_x,
+            error_y=err_y,
+            target_span=target_span,
+        )
 
     def _begin_ptz_operation(self, kind: str, seq: int, now: float) -> None:
         self._ptz_operation = kind
@@ -1370,9 +1675,13 @@ class DogTracker:
                 now = time.monotonic()
 
                 if frame is None or frame_time <= 0:
+                    if self._hybrid_chase_active:
+                        await self._stop_hybrid_chase("frame_unavailable", seq=seq, force=True)
                     self.state = "WAITING_FRAME"
                     continue
                 if (now - frame_time) > self.cfg.frame_stale_timeout:
+                    if self._hybrid_chase_active:
+                        await self._stop_hybrid_chase("stale_frame", seq=seq, force=True)
                     self.frames_stale += 1
                     self.state = "STALE_FRAME"
                     continue
@@ -1395,6 +1704,8 @@ class DogTracker:
                     self.frames_skipped_gpu_busy += 1
                     continue
                 if outcome != "ok":
+                    if self._hybrid_chase_active:
+                        await self._stop_hybrid_chase("inference_error", seq=seq, force=True)
                     self.state = "INFERENCE_ERROR"
                     continue
 
@@ -1417,6 +1728,10 @@ class DogTracker:
             raise
         except Exception as exc:
             self.state = "TRACKER_ERROR"
+            try:
+                await self._stop_hybrid_chase("tracker_error", force=True)
+            except Exception:
+                pass
             self.logger.exception("PTZ tracker loop crashed: %s", exc)
 
     async def _process_observation(
@@ -1502,11 +1817,13 @@ class DogTracker:
             ptz_ready = self._ptz_action_ready(seq)
             rebasing_velocity = (
                 self._ptz_operation is None
+                and not self._hybrid_chase_active
                 and ptz_ready
                 and self._velocity_rebase_required
             )
             velocity_learning_allowed = (
                 self._ptz_operation is None
+                and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
             )
@@ -1551,8 +1868,10 @@ class DogTracker:
                     tuple(round(v, 1) for v in self.target.bbox),
                 )
 
-            self.state = "PTZ_MOVING" if self._ptz_operation is not None else (
-                "PTZ_SETTLING" if not self._ptz_action_ready(seq) else "TRACK"
+            self.state = "ESCAPE_CHASE" if self._hybrid_chase_active else (
+                "PTZ_MOVING" if self._ptz_operation is not None else (
+                    "PTZ_SETTLING" if not self._ptz_action_ready(seq) else "TRACK"
+                )
             )
             if rebasing_velocity:
                 self._record_event(
@@ -1580,10 +1899,15 @@ class DogTracker:
             return
 
         if self.target.acquire_hits < self.cfg.acquire_frames:
+            if self._hybrid_chase_active:
+                await self._stop_hybrid_chase("acquire_dropped", seq=seq, force=True)
             self._record_event("acquire_dropped", label=self.target.label, hits=self.target.acquire_hits)
             self.target = None
             self.state = "SEARCHING"
             return
+
+        if self._hybrid_chase_active:
+            await self._stop_hybrid_chase("target_missing", seq=seq)
 
         # A temporary detector miss while the camera is moving is not evidence that
         # the subject is gone. Pause the loss state machine until PTZ idle + fresh
@@ -1672,12 +1996,18 @@ class DogTracker:
         h, w = frame_shape[:2]
         diag = max(1.0, math.hypot(w, h))
         camera_recently_moved = (
-            self._ptz_operation is not None
+            self._hybrid_chase_active
+            or self._ptz_operation is not None
             or self._last_processed_seq < self._post_motion_release_seq
         )
         motion_start: Optional[Tuple[float, float]] = None
         motion_end: Optional[Tuple[float, float]] = None
-        if camera_recently_moved:
+        if self._hybrid_chase_active:
+            # During continuous rescue the whole frame is translating. Frigate
+            # handles this with camera-motion estimation; our lightweight version
+            # simply follows the latest matched center and uses the wider moving gate.
+            px, py = self.target.center
+        elif camera_recently_moved:
             # Approximate the camera-induced image shift from the moveDirectly
             # command itself. This is a lightweight analogue of Frigate's camera
             # motion compensation: associate against the whole expected image-motion
@@ -1696,7 +2026,12 @@ class DogTracker:
             if det.class_id != self.target.class_id:
                 continue
             cx, cy = det.center
-            if camera_recently_moved and motion_start is not None and motion_end is not None:
+            if (
+                camera_recently_moved
+                and not self._hybrid_chase_active
+                and motion_start is not None
+                and motion_end is not None
+            ):
                 dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag
             else:
                 dist_norm = math.hypot(cx - px, cy - py) / diag
@@ -1732,6 +2067,12 @@ class DogTracker:
         target_span = max(width_ratio, height_ratio)
         self._last_target_span = target_span
 
+        if self._hybrid_chase_active:
+            await self._drive_hybrid_chase(
+                frame_shape, seq, now, err_x, err_y, target_span
+            )
+            return
+
         if not self._ptz_action_ready(seq):
             return
 
@@ -1742,6 +2083,49 @@ class DogTracker:
 
         if outside_deadzone:
             if not self.cfg.move_directly_enabled:
+                return
+
+            x1, y1, x2, y2 = self.target.bbox
+            margin_x = w * self.cfg.lead_edge_margin
+            margin_y = h * self.cfg.lead_edge_margin
+            edge_clipped_now = (
+                x1 <= margin_x
+                or y1 <= margin_y
+                or x2 >= (w - margin_x)
+                or y2 >= (h - margin_y)
+            )
+            dominant_error = max(abs(err_x), abs(err_y))
+            hard_escape_error = max(0.90, self.cfg.hybrid_chase_entry_error + 0.08)
+            hybrid_entry = (
+                self.cfg.hybrid_chase_enabled
+                and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
+                and (
+                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error)
+                    or dominant_error >= hard_escape_error
+                )
+            )
+            if hybrid_entry:
+                pan_speed = self._hybrid_axis_speed(err_x)
+                tilt_speed = -self._hybrid_axis_speed(err_y)
+                self._record_event(
+                    "hybrid_chase_enter",
+                    label=self.target.label,
+                    error_x=round(err_x, 3),
+                    error_y=round(err_y, 3),
+                    edge_clipped=edge_clipped_now,
+                    pan_speed=pan_speed,
+                    tilt_speed=tilt_speed,
+                    confidence=round(self.target.confidence, 3),
+                )
+                await self._set_hybrid_chase_speed(
+                    pan_speed,
+                    tilt_speed,
+                    seq=seq,
+                    now=now,
+                    error_x=err_x,
+                    error_y=err_y,
+                    target_span=target_span,
+                )
                 return
 
             # moveDirectly centers the point we give the camera, but a native 3D
