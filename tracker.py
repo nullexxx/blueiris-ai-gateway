@@ -149,13 +149,13 @@ class TrackerConfig:
     hybrid_chase_entry_error: float = 0.82
     hybrid_chase_exit_error: float = 0.42
     # Fast-moving targets may enter chase before the hard edge threshold.
-    hybrid_chase_motion_error: float = 0.50
-    hybrid_chase_motion_speed_norm: float = 0.04
+    hybrid_chase_motion_error: float = 0.45
+    hybrid_chase_motion_speed_norm: float = 0.03
     # Coast through very short detector dropouts caused by PTZ motion blur.
-    hybrid_chase_miss_grace: float = 0.25
+    hybrid_chase_miss_grace: float = 0.60
     hybrid_chase_min_speed: int = 1
-    hybrid_chase_max_speed: int = 6
-    hybrid_chase_full_speed_error: float = 0.95
+    hybrid_chase_max_speed: int = 8
+    hybrid_chase_full_speed_error: float = 0.82
     hybrid_chase_command_interval: float = 0.18
     hybrid_chase_keepalive: float = 0.45
     hybrid_chase_camera_timeout: int = 1
@@ -242,12 +242,12 @@ class TrackerConfig:
             hybrid_chase_enabled=_env_bool("TRACKER_HYBRID_CHASE_ENABLED", True),
             hybrid_chase_entry_error=_env_float("TRACKER_HYBRID_CHASE_ENTRY_ERROR", 0.82),
             hybrid_chase_exit_error=_env_float("TRACKER_HYBRID_CHASE_EXIT_ERROR", 0.42),
-            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.50),
-            hybrid_chase_motion_speed_norm=_env_float("TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM", 0.04),
-            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.25),
+            hybrid_chase_motion_error=_env_float("TRACKER_HYBRID_CHASE_MOTION_ERROR", 0.45),
+            hybrid_chase_motion_speed_norm=_env_float("TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM", 0.03),
+            hybrid_chase_miss_grace=_env_float("TRACKER_HYBRID_CHASE_MISS_GRACE", 0.60),
             hybrid_chase_min_speed=_env_int("TRACKER_HYBRID_CHASE_MIN_SPEED", 1),
-            hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 6),
-            hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.95),
+            hybrid_chase_max_speed=_env_int("TRACKER_HYBRID_CHASE_MAX_SPEED", 8),
+            hybrid_chase_full_speed_error=_env_float("TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR", 0.82),
             hybrid_chase_command_interval=_env_float("TRACKER_HYBRID_CHASE_COMMAND_INTERVAL", 0.18),
             hybrid_chase_keepalive=_env_float("TRACKER_HYBRID_CHASE_KEEPALIVE", 0.45),
             hybrid_chase_camera_timeout=_env_int("TRACKER_HYBRID_CHASE_CAMERA_TIMEOUT", 1),
@@ -2129,6 +2129,17 @@ class DogTracker:
                 (abs(err_x) >= self.cfg.hybrid_chase_motion_error and err_x * self.target.vx > 0.0)
                 or (abs(err_y) >= self.cfg.hybrid_chase_motion_error and err_y * self.target.vy > 0.0)
             )
+            if abs(err_x) >= abs(err_y):
+                dominant_axis_error = err_x
+                dominant_axis_velocity = self.target.vx
+            else:
+                dominant_axis_error = err_y
+                dominant_axis_velocity = self.target.vy
+            moving_inward_dominant = self.target.velocity_valid and (
+                abs(dominant_axis_error) >= self.cfg.hybrid_chase_exit_error
+                and dominant_axis_error * dominant_axis_velocity < 0.0
+                and abs(dominant_axis_velocity) / frame_diag >= self.cfg.hybrid_chase_motion_speed_norm
+            )
             motion_escape = (
                 dominant_error >= self.cfg.hybrid_chase_motion_error
                 and target_speed_norm >= self.cfg.hybrid_chase_motion_speed_norm
@@ -2138,8 +2149,8 @@ class DogTracker:
                 self.cfg.hybrid_chase_enabled
                 and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
                 and (
-                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error)
-                    or dominant_error >= hard_escape_error
+                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error and not moving_inward_dominant)
+                    or (dominant_error >= hard_escape_error and not moving_inward_dominant)
                     or motion_escape
                 )
             )
@@ -2157,6 +2168,7 @@ class DogTracker:
                     error_y=round(err_y, 3),
                     target_speed_norm=round(target_speed_norm, 4),
                     moving_outward=bool(moving_outward),
+                    moving_inward_dominant=bool(moving_inward_dominant),
                     edge_clipped=edge_clipped_now,
                     pan_speed=pan_speed,
                     tilt_speed=tilt_speed,
@@ -2200,14 +2212,17 @@ class DogTracker:
             # When the bbox is already clipped or the centroid is near escape,
             # a normal partial correction is too timid for a 1.3-1.6 s move.
             # Strengthen only this one camera-managed move; do not overlap moves.
-            edge_rescue_active = self.cfg.edge_rescue_enabled and (
+            edge_rescue_requested = self.cfg.edge_rescue_enabled and (
                 edge_clipped
                 or abs(err_x) >= self.cfg.edge_rescue_error
                 or abs(err_y) >= self.cfg.edge_rescue_error
             )
+            edge_rescue_active = edge_rescue_requested and not moving_inward_dominant
             edge_rescue_reason: Optional[str] = None
             if edge_rescue_active:
                 edge_rescue_reason = "edge_clipped" if edge_clipped else "extreme_error"
+            elif edge_rescue_requested and moving_inward_dominant:
+                edge_rescue_reason = "inward_motion_suppressed"
             active_move_gain = (
                 max(self.cfg.move_gain, self.cfg.edge_rescue_gain)
                 if edge_rescue_active
