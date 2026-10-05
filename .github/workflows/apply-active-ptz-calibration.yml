@@ -36,4 +36,5 @@ jobs:
             exit 0
           fi
           git commit -m "Harden active PTZ calibration results"
+          git pull --rebase origin main
           git push
