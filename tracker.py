@@ -1763,6 +1763,12 @@ class DogTracker:
                 await self._poll_ptz_operation(seq, now)
                 now = time.monotonic()
 
+                # A fail-closed PTZ recovery may disable tracking during the poll.
+                # Do not let the remainder of this iteration overwrite PTZ_ERROR or
+                # acquire/process another target after tracking has been stopped.
+                if not self.active:
+                    continue
+
                 if frame is None or frame_time <= 0:
                     if self._hybrid_chase_active:
                         await self._stop_hybrid_chase("frame_unavailable", seq=seq, force=True)

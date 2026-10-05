@@ -44,6 +44,7 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("async def _halt_tracking_for_ptz_failure", tracker)
         self.assertIn("PTZ status remained unavailable", tracker)
         self.assertIn('self.state = "PTZ_ERROR"', tracker)
+        self.assertIn("if not self.active:\n                    continue", tracker)
 
     def test_latest_ultralytics_base_is_intentional(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
