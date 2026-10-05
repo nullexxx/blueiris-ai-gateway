@@ -44,11 +44,34 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("async def _halt_tracking_for_ptz_failure", tracker)
         self.assertIn("PTZ status remained unavailable", tracker)
         self.assertIn('self.state = "PTZ_ERROR"', tracker)
-        self.assertIn("if not self.active:\n                    continue", tracker)
+        self.assertIn("if not self._session_valid(generation):\n                    continue", tracker)
 
     def test_latest_ultralytics_base_is_intentional(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("FROM ultralytics/ultralytics:latest", dockerfile)
+
+    def test_second_pass_tracker_safety_contracts(self):
+        tracker = (ROOT / "tracker.py").read_text()
+        compose = (ROOT / "docker-compose.example.yml").read_text()
+        self.assertIn("if dist_norm > max_dist and overlap < 0.30", tracker)
+        self.assertNotIn("best_score >= 0.20 or best_dist_norm <= max_dist", tracker)
+        self.assertIn("if not self._session_valid(generation):", tracker)
+        self.assertIn("hybrid_chase_diverging", tracker)
+        self.assertIn("moveDirectly failed", tracker)
+        self.assertIn("CAP_PROP_READ_TIMEOUT_MSEC", tracker)
+        self.assertIn('TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.12"', compose)
+
+    def test_face_and_debug_optimizations(self):
+        app = (ROOT / "app.py").read_text()
+        tracker = (ROOT / "tracker.py").read_text()
+        self.assertIn("face_detector.extract(img, boxes, None)", app)
+        self.assertNotIn("faces = face_detector(img)", app)
+        self.assertIn('kwargs["quantize"] = 16', app)
+        self.assertNotIn('kwargs["half"] = True', app)
+        self.assertIn("MAX_FACE_EMBEDDINGS_PER_USER", app)
+        self.assertNotIn("self._make_debug_frame(frame, detections)", tracker)
+        self.assertIn("async def debug_jpeg", tracker)
+        self.assertIn("await _require_tracker().debug_jpeg()", app)
 
 
 if __name__ == "__main__":

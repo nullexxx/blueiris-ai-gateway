@@ -49,6 +49,7 @@ HALF_PRECISION = os.getenv("HALF_PRECISION", "true").lower() in ("true", "1")
 INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "8.0"))
 MODEL_LOAD_TIMEOUT = float(os.getenv("MODEL_LOAD_TIMEOUT", "180.0"))
 RECOVERY_GRACE_PERIOD = float(os.getenv("RECOVERY_GRACE_PERIOD", "4.0"))
+MAX_FACE_EMBEDDINGS_PER_USER = max(1, min(100, int(os.getenv("MAX_FACE_EMBEDDINGS_PER_USER", "20"))))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 MODEL_EXT_PRIORITY = [".engine", ".onnx", ".pt"]
@@ -217,7 +218,7 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
         "verbose": False,
     }
     if entry.is_pt and HALF_PRECISION:
-        kwargs["half"] = True
+        kwargs["quantize"] = 16
 
     results = entry.model.predict(frame, **kwargs)
     predictions: List[dict] = []
@@ -330,31 +331,32 @@ def _rebuild_face_matrix():
     _face_cache_dirty = False
 
 
-def sync_face_register_embedding(img: Image.Image) -> Optional[torch.Tensor]:
-    """Extract and return one normalized face embedding without mutating shared state."""
+def sync_face_register_embedding(img: Image.Image) -> Tuple[Optional[torch.Tensor], int]:
+    """Extract exactly one normalized face embedding without repeating MTCNN detection."""
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
-    if boxes is None or len(boxes) == 0:
-        return None
+    face_count = 0 if boxes is None else len(boxes)
+    if face_count != 1:
+        return None, face_count
 
-    faces = face_detector(img)
-    if faces is None or len(faces) == 0:
-        return None
+    faces = face_detector.extract(img, boxes, None)
+    if faces is None or len(faces) != 1:
+        return None, face_count
 
     face_tensor = faces[0].unsqueeze(0).to("cuda:0")
     with torch.no_grad():
         emb = face_recognizer(face_tensor)
-        return F.normalize(emb, p=2, dim=1).cpu()
+        return F.normalize(emb, p=2, dim=1).cpu(), face_count
 
 
 def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
-    """Detects faces and compares embeddings against enrolled database."""
+    """Detect faces once, extract crops, and compare embeddings against enrollment data."""
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
     if boxes is None or len(boxes) == 0:
         return []
 
-    faces = face_detector(img)
+    faces = face_detector.extract(img, boxes, None)
     if faces is None or len(faces) == 0:
         return []
 
@@ -366,9 +368,6 @@ def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
     if _face_cache_dirty:
         _rebuild_face_matrix()
 
-    # Both sides are already L2-normalized, so a plain dot product is
-    # equivalent to cosine similarity. One (N faces, D) @ (D, M enrolled)
-    # matmul replaces the old per-user, per-face torch.cat + cosine loop.
     if _face_matrix_cache is not None:
         sims = embeddings @ _face_matrix_cache.T
         best_sims, best_idx = sims.max(dim=1)
@@ -378,7 +377,6 @@ def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
     predictions = []
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box.tolist()
-
         if best_sims is not None:
             sim = float(best_sims[i].item())
             matched_id = _face_labels_cache[int(best_idx[i].item())] if sim >= min_conf else "unknown"
@@ -834,7 +832,7 @@ async def face_register(
         return {"success": False, "error": f"Invalid image: {exc}"}
 
     try:
-        embedding = await run_gpu_job(
+        embedding, face_count = await run_gpu_job(
             sync_face_register_embedding,
             img,
             label=f"Face registration for '{target_id}'",
@@ -850,10 +848,15 @@ async def face_register(
         return {"success": False, "error": str(exc)}
 
     if embedding is None:
-        return {"success": False, "error": "No face detected in provided image."}
+        if face_count == 0:
+            return {"success": False, "error": "No face detected in provided image."}
+        return {"success": False, "error": f"Expected exactly one face for enrollment; detected {face_count}."}
 
     async with face_state_lock:
-        registered_faces.setdefault(target_id, []).append(embedding)
+        embeddings = registered_faces.setdefault(target_id, [])
+        embeddings.append(embedding)
+        if len(embeddings) > MAX_FACE_EMBEDDINGS_PER_USER:
+            del embeddings[:-MAX_FACE_EMBEDDINGS_PER_USER]
         _face_cache_dirty = True
         snapshot = _face_db_snapshot()
     await asyncio.to_thread(save_faces_db, snapshot)
@@ -1039,7 +1042,7 @@ async def tracker_history_clear():
 
 @app.get("/v1/tracker/debug.jpg")
 async def tracker_debug_frame():
-    jpeg = _require_tracker().debug_jpeg()
+    jpeg = await _require_tracker().debug_jpeg()
     if jpeg is None:
         raise HTTPException(status_code=404, detail="No tracker debug frame is available yet.")
     return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
