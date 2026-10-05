@@ -19,7 +19,7 @@ jobs:
           ref: fix/runtime-hardening-and-tracker-recovery
 
       - name: Apply second-pass hardening
-        run: python3 tools/second_pass_hardening.py
+        run: python3 tools/second_pass_hardening_v2.py
 
       - name: Validate Python and contracts
         run: |
