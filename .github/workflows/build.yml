@@ -1,6 +1,6 @@
 name: Build and Push to GHCR
 
-# Runtime image includes adaptive PTZ controller revision 2.
+# Runtime image includes adaptive PTZ controller revision 3.
 on:
   push:
     branches: [ "main" ]
