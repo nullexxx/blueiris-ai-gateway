@@ -151,6 +151,18 @@ class ActivePtzCalibrationStore:
         continuous = camera.get("continuous")
         return isinstance(move, dict) and bool(move.get("samples")) and isinstance(continuous, dict) and bool(continuous.get("samples"))
 
+    def move_directly(self) -> dict:
+        value = self._camera().get("move_directly", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    def continuous(self) -> dict:
+        value = self._camera().get("continuous", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    def onvif_benchmark(self) -> Optional[dict]:
+        value = self._camera().get("onvif_benchmark")
+        return dict(value) if isinstance(value, dict) else None
+
     def age_days(self) -> Optional[float]:
         stamp = self._camera().get("calibrated_at_epoch")
         try:
