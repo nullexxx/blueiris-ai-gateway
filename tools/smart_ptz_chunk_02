@@ -1,0 +1,167 @@
+
+tracker = replace_once(
+    tracker,
+    '                dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag\n'
+    '            else:\n'
+    '                dist_norm = math.hypot(cx - px, cy - py) / diag\n',
+    '                dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag\n'
+    '                if motion_point is not None:\n'
+    '                    dist_norm = min(dist_norm, math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag)\n'
+    '            elif camera_recently_moved and motion_point is not None:\n'
+    '                dist_norm = math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag\n'
+    '            else:\n'
+    '                dist_norm = math.hypot(cx - px, cy - py) / diag\n',
+    'motion association',
+)
+
+# Dynamic deadzone.
+tracker = replace_once(
+    tracker,
+    '        outside_deadzone = (\n            abs(err_x) > self.cfg.move_deadzone_x\n            or abs(err_y) > self.cfg.move_deadzone_y\n        )\n',
+    '        deadzone_x, deadzone_y = self._effective_deadzone(target_span, frame_shape)\n'
+    '        outside_deadzone = abs(err_x) > deadzone_x or abs(err_y) > deadzone_y\n',
+    'deadzone',
+)
+
+# Per-zoom gain scaling + slow closed-loop learning.
+tracker = replace_once(
+    tracker,
+    '            active_move_gain = (\n'
+    '                max(self.cfg.move_gain, self.cfg.edge_rescue_gain)\n'
+    '                if edge_rescue_active\n'
+    '                else self.cfg.move_gain\n'
+    '            )\n\n            frame_cx = w / 2.0\n',
+    '            active_move_gain = (\n'
+    '                max(self.cfg.move_gain, self.cfg.edge_rescue_gain)\n'
+    '                if edge_rescue_active else self.cfg.move_gain\n'
+    '            )\n'
+    '            current_zoom_factor = self._current_zoom_factor()\n'
+    '            current_bucket = zoom_bucket(current_zoom_factor)\n'
+    '            pan_scale, tilt_scale = self._calibration.spatial_scales(current_bucket)\n'
+    '            zoom_gain = 1.0 / math.sqrt(current_zoom_factor)\n'
+    '            gain_x = max(0.20, min(0.95, active_move_gain * zoom_gain * pan_scale))\n'
+    '            gain_y = max(0.20, min(0.95, active_move_gain * zoom_gain * tilt_scale))\n\n'
+    '            frame_cx = w / 2.0\n',
+    'gain setup',
+)
+tracker = tracker.replace('(target_cx - frame_cx) * active_move_gain', '(target_cx - frame_cx) * gain_x', 1)
+tracker = tracker.replace('(target_cy - frame_cy) * active_move_gain', '(target_cy - frame_cy) * gain_y', 1)
+tracker = tracker.replace('(predicted_cx - frame_cx) * active_move_gain', '(predicted_cx - frame_cx) * gain_x', 1)
+tracker = tracker.replace('(predicted_cy - frame_cy) * active_move_gain', '(predicted_cy - frame_cy) * gain_y', 1)
+tracker = replace_once(
+    tracker,
+    '                self._association_motion_end_center = expected_post_move_center\n                self._begin_ptz_operation("move", seq, t1)\n',
+    '                self._association_motion_end_center = expected_post_move_center\n'
+    '                self._pending_move_quality = {"started_at": t1, "pre_x": err_x, "pre_y": err_y, "speed_norm": target_speed_norm, "bucket": current_bucket}\n'
+    '                self._begin_ptz_operation("move", seq, t1)\n',
+    'pending quality',
+)
+tracker = replace_once(
+    tracker,
+    '                    move_gain=round(active_move_gain, 3),\n',
+    '                    move_gain=round(active_move_gain, 3),\n'
+    '                    gain_x=round(gain_x, 3), gain_y=round(gain_y, 3),\n'
+    '                    zoom_factor=round(current_zoom_factor, 2), zoom_bucket=current_bucket,\n'
+    '                    deadzone=[round(deadzone_x, 3), round(deadzone_y, 3)],\n',
+    'quality event',
+)
+
+# Frigate-style history/trend/velocity zoom gate.
+tracker = replace_once(
+    tracker,
+    '        zoom_in_eligible = (\n'
+    '            target_span < self.cfg.zoom_target_min\n'
+    '            and self.target.confidence >= self.cfg.zoom_in_min_conf\n'
+    '            and abs(err_x) <= self.cfg.zoom_in_max_error\n'
+    '            and abs(err_y) <= self.cfg.zoom_in_max_error\n'
+    '        )\n',
+    '        zoom_metrics = self._smart_history.metrics(now, 1.0)\n'
+    '        smoothed_span = float(zoom_metrics.get("weighted_span") or target_span)\n'
+    '        predicted_span = float(zoom_metrics.get("predicted_span") or smoothed_span)\n'
+    '        speed_norm = math.hypot(self.target.vx, self.target.vy) / max(1.0, math.hypot(w, h)) if self.target.velocity_valid else 0.0\n'
+    '        zoom_in_eligible = (\n'
+    '            int(zoom_metrics.get("samples", 0)) >= 5\n'
+    '            and max(smoothed_span, predicted_span) < self.cfg.zoom_target_min\n'
+    '            and self.target.confidence >= self.cfg.zoom_in_min_conf\n'
+    '            and abs(err_x) <= self.cfg.zoom_in_max_error and abs(err_y) <= self.cfg.zoom_in_max_error\n'
+    '            and int(zoom_metrics.get("edge_touches", 0)) == 0\n'
+    '            and speed_norm <= 0.025\n'
+    '            and self._frame_sharpness_ok\n'
+    '        )\n',
+    'zoom metrics',
+)
+tracker = replace_once(tracker, '            and target_span < self.cfg.zoom_target_min\n', '            and max(smoothed_span, predicted_span) < self.cfg.zoom_target_min\n', 'zoom in trend')
+tracker = replace_once(
+    tracker,
+    '            target_span > self.cfg.zoom_target_max\n            and since_zoom >= self.cfg.zoom_out_cooldown\n',
+    '            (max(smoothed_span, predicted_span) > self.cfg.zoom_target_max or int(zoom_metrics.get("edge_touches", 0)) > 0 or speed_norm >= 0.08)\n'
+    '            and since_zoom >= self.cfg.zoom_out_cooldown\n',
+    'zoom out context',
+)
+
+# Exact ONVIF absolute zoom when supported, bounded CGI fallback otherwise.
+tracker = replace_once(
+    tracker,
+    '        self._zoom_operation_start_position = before\n'
+    '        t0 = time.monotonic()\n'
+    '        ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)\n'
+    '        t1 = time.monotonic()\n',
+    '        self._zoom_operation_start_position = before\n'
+    '        current_factor = max(1.0, before / self.cfg.zoom_wide_position)\n'
+    '        desired_factor = min(self.cfg.zoom_max_factor, current_factor + 0.25) if direction == "in" else max(self.cfg.zoom_min_factor, current_factor - 0.50)\n'
+    '        t0 = time.monotonic()\n'
+    '        zoom_control = "cgi_timed_fallback"\n'
+    '        ok = False\n'
+    '        if self._onvif_zoom.available:\n'
+    '            ok = await self._onvif_zoom.set_factor(desired_factor, self._camera_max_optical_zoom)\n'
+    '            if ok:\n'
+    '                zoom_control = "onvif_absolute"\n'
+    '        if not ok:\n'
+    '            ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)\n'
+    '        self._zoom_control_active = zoom_control\n'
+    '        t1 = time.monotonic()\n',
+    'exact zoom',
+)
+tracker = replace_once(
+    tracker,
+    '                direction=direction,\n                duration_ms=duration_ms,\n',
+    '                direction=direction,\n'
+    '                duration_ms=duration_ms,\n'
+    '                control=zoom_control, desired_factor=round(desired_factor, 2),\n'
+    '                smoothed_span=round(smoothed_span, 3), predicted_span=round(predicted_span, 3),\n'
+    '                target_speed_norm=round(speed_norm, 4),\n',
+    'zoom event',
+)
+
+# Debug rectangle should show the actual adaptive deadzone.
+tracker = replace_once(
+    tracker,
+    '            left = int(cx - self.cfg.move_deadzone_x * (w / 2.0))\n'
+    '            right = int(cx + self.cfg.move_deadzone_x * (w / 2.0))\n'
+    '            top = int(cy - self.cfg.move_deadzone_y * (h / 2.0))\n'
+    '            bottom = int(cy + self.cfg.move_deadzone_y * (h / 2.0))\n',
+    '            dzx, dzy = self._last_effective_deadzone\n'
+    '            left = int(cx - dzx * (w / 2.0))\n'
+    '            right = int(cx + dzx * (w / 2.0))\n'
+    '            top = int(cy - dzy * (h / 2.0))\n'
+    '            bottom = int(cy + dzy * (h / 2.0))\n',
+    'debug deadzone',
+)
+
+# Keep status compact while retaining raw timing samples on disk.
+helper = replace_once(
+    helper,
+    '    def public_dict(self) -> dict:\n'
+    '        camera = self._camera()\n'
+    '        return {\n'
+    '            "path": str(self.path),\n'
+    '            "loaded": bool(camera),\n'
+    '            "move_timing": camera.get("move_timing", {}),\n'
+    '            "spatial_response": camera.get("spatial_response", {}),\n'
+    '        }\n',
+    '    def public_dict(self) -> dict:\n'
+    '        camera = self._camera()\n'
+    '        timing = camera.get("move_timing", {}) if isinstance(camera, dict) else {}\n'
+    '        if not isinstance(timing, dict): timing = {}\n'
+    '        samples = timing.get("samples", [])\n'
+    '        return {"path": str(self.path), "loaded": bool(camera), "move_timi
