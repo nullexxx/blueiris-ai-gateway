@@ -1,0 +1,73 @@
+name: Fix runtime hardening patcher
+
+on:
+  push:
+    branches:
+      - fix/runtime-hardening-and-tracker-recovery
+    paths:
+      - .github/workflows/fix-runtime-patcher.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/runtime-hardening-and-tracker-recovery
+      - name: Make tracker crash patch structural
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('.github/workflows/apply-runtime-hardening.yml')
+          text = p.read_text()
+          start = text.find("          old_run_except = '''")
+          end_marker = '          tracker = replace_exact(tracker, old_run_except, new_run_except, "tracker crash stop state")\n'
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('could not locate old crash-patch section')
+          end += len(end_marker)
+          replacement = r'''          crash_pattern = re.compile(
+              r'(?ms)^(\s*)except asyncio\.CancelledError:\n'
+              r'\1    raise\n'
+              r'\1except Exception as exc:\n'
+              r'\1    self\.state = "TRACKER_ERROR"\n'
+              r'\1    try:\n'
+              r'\1        await self\._stop_hybrid_chase\("tracker_error", force=True\)\n'
+              r'\1    except Exception:\n'
+              r'\1        pass\n'
+              r'\1    self\.logger\.exception\("PTZ tracker loop crashed: %s", exc\)\n'
+          )
+          crash_match = crash_pattern.search(tracker)
+          if not crash_match:
+              raise SystemExit("missing expected tracker crash handler")
+          indent = crash_match.group(1)
+          crash_replacement = (
+              f'{indent}except asyncio.CancelledError:\n'
+              f'{indent}    raise\n'
+              f'{indent}except Exception as exc:\n'
+              f'{indent}    self.active = False\n'
+              f'{indent}    self.state = "TRACKER_ERROR"\n'
+              f'{indent}    self._last_task_error = str(exc)\n'
+              f'{indent}    self._stop_reason = f"Tracker task crashed: {{exc}}"\n'
+              f'{indent}    try:\n'
+              f'{indent}        await self._stop_hybrid_chase("tracker_error", force=True)\n'
+              f'{indent}    except Exception:\n'
+              f'{indent}        pass\n'
+              f'{indent}    self.logger.exception("PTZ tracker loop crashed: %s", exc)\n'
+          )
+          tracker = crash_pattern.sub(lambda _m: crash_replacement, tracker, count=1)
+'''
+          p.write_text(text[:start] + replacement + text[end:])
+          PY
+          rm .github/workflows/fix-runtime-patcher.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix runtime hardening patcher"
+          git push origin HEAD:fix/runtime-hardening-and-tracker-recovery
