@@ -17,6 +17,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile Python sources
-        run: python -m py_compile app.py tracker.py ptz_enhancements.py
+        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py
       - name: Run static contract tests
         run: python -m unittest discover -s tests -v
