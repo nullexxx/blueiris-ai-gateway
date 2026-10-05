@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir --no-deps facenet-pytorch
 # Pre-cache the VGGFace2 model weights into the container image
 RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1(pretrained='vggface2')"
 
+# Runtime modules: core API/tracker plus the optional smart-PTZ enhancement layers.
 COPY app.py /app/app.py
 COPY tracker.py /app/tracker.py
 COPY ptz_enhancements.py /app/ptz_enhancements.py
