@@ -6,6 +6,7 @@ on:
     paths:
       - "tools/finalize_active_ptz_calibration.py"
       - ".github/workflows/finalize-active-ptz-calibration.yml"
+  workflow_dispatch:
 
 permissions:
   contents: write
