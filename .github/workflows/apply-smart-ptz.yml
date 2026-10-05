@@ -1,0 +1,53 @@
+name: Apply Frigate-inspired PTZ hybrid
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - .github/workflows/apply-smart-ptz.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Assemble and apply smart PTZ patch
+        shell: bash
+        run: |
+          cat tools/smart_ptz_chunk_00 tools/smart_ptz_chunk_01 tools/smart_ptz_chunk_02 tools/smart_ptz_chunk_03 > /tmp/apply_smart_ptz.py
+          python3 -m py_compile /tmp/apply_smart_ptz.py
+          python3 /tmp/apply_smart_ptz.py
+
+      - name: Validate source and contracts
+        shell: bash
+        run: |
+          python3 -m py_compile app.py tracker.py ptz_enhancements.py
+          python3 -m unittest discover -s tests -v
+          git diff --check
+          grep -q 'onvif-zeep-async' Dockerfile
+          grep -q 'COPY ptz_enhancements.py' Dockerfile
+          grep -q 'cv2.calcOpticalFlowPyrLK' ptz_enhancements.py
+          grep -q 'cv2.findHomography' ptz_enhancements.py
+          grep -q 'self._onvif_zoom.set_factor' tracker.py
+          grep -q 'self._smart_history.metrics' tracker.py
+          grep -q 'self._effective_deadzone' tracker.py
+          grep -q 'self._calibration.set_timing' tracker.py
+          grep -q 'TRACKER_ZOOM_CONTROL_MODE: "auto"' docker-compose.example.yml
+          grep -q 'TRACKER_CALIBRATION_PATH' docker-compose.example.yml
+          grep -q 'FROM ultralytics/ultralytics:latest' Dockerfile
+
+      - name: Commit integrated controller
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracker.py ptz_enhancements.py Dockerfile docker-compose.example.yml
+          git diff --cached --check
+          git commit -m "Merge Frigate-inspired PTZ control refinements"
+          git push origin HEAD:main
