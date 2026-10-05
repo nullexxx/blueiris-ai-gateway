@@ -1,0 +1,70 @@
+name: Finalize PTZ phase 2 semantic contract
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/apply-ptz-phase2-v4.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Narrow ambiguous cleanup guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tools/apply_ptz_phase2.py')
+          s = p.read_text()
+          old = '''tracker = replace_once(\n    tracker,\n    ''' + "'''        self._zoom_operation_start_position = None\\n'''" + ''',\n    ''' + "'''        self._zoom_operation_start_position = None\\n        self._zoom_operation_target_normalized = None\\n        self._zoom_operation_target_factor = None\\n'''" + ''',\n    "clear zoom target calibration state",\n)'''
+          new = '''tracker = replace_once(\n    tracker,\n    ''' + "'''        self._pending_move_distance = None\\n        self._zoom_operation_start_position = None\\n'''" + ''',\n    ''' + "'''        self._pending_move_distance = None\\n        self._zoom_operation_start_position = None\\n        self._zoom_operation_target_normalized = None\\n        self._zoom_operation_target_factor = None\\n'''" + ''',\n    "clear zoom target calibration state",\n)'''
+          if old not in s:
+              raise SystemExit('target patch-script block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Apply guarded source patch
+        run: python tools/apply_ptz_phase2.py
+
+      - name: Update exact-zoom regression contract semantically
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_ptz_enhancements_contracts.py')
+          s = p.read_text()
+          old = '        self.assertIn("await self._onvif_zoom.set_factor", TRACKER)\n'
+          new = (
+              '        self.assertIn("self._onvif_zoom.set_normalized", TRACKER)\n'
+              '        self.assertIn("self._zoom_map.estimate_normalized", TRACKER)\n'
+              '        self.assertIn("asyncio.wait_for", TRACKER)\n'
+          )
+          if s.count(old) != 1:
+              raise SystemExit(f'legacy exact-zoom assertion count was {s.count(old)}, expected 1')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Compile all runtime Python
+        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Commit integrated controller
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py tracker.py ptz_enhancements.py ptz_phase2.py Dockerfile docker-compose.example.yml README.md .github/workflows/build.yml .github/workflows/test.yml tests/test_ptz_enhancements_contracts.py tests/test_ptz_phase2_contracts.py
+          git commit -m "Add Frigate-inspired PTZ phase 2 controls"
+          git push origin HEAD:main
