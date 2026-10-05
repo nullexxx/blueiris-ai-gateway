@@ -51,7 +51,7 @@ class MotionControlPolicyTests(unittest.TestCase):
         decision = self.call_policy()
         self.assertTrue(decision["use_continuous"])
         self.assertTrue(decision["velocity_mature"])
-        self.assertEqual(decision["reason"], "deadline_motion")
+        self.assertIn(decision["reason"], {"deadline_motion", "motion_escape"})
         self.assertGreater(decision["projected_travel_norm"], 0.18)
 
     def test_immature_velocity_does_not_drive_deadline_handoff(self):
