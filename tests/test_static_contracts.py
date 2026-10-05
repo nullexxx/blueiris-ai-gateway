@@ -59,6 +59,9 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("hybrid_chase_diverging", tracker)
         self.assertIn("moveDirectly failed", tracker)
         self.assertIn("CAP_PROP_READ_TIMEOUT_MSEC", tracker)
+        self.assertIn("async def _poll_ptz_operation(self, seq: int, now: float, generation: int)", tracker)
+        poll = tracker[tracker.index("async def _poll_ptz_operation"):tracker.index("def _ptz_action_ready")]
+        self.assertGreaterEqual(poll.count("if not self._session_valid(generation):"), 3)
         self.assertIn('TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.12"', compose)
 
     def test_face_and_debug_optimizations(self):

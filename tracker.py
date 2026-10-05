@@ -994,10 +994,6 @@ class DogTracker:
         self._hybrid_tilt_speed = 0
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = 0.0
-        self._hybrid_last_error = None
-        self._hybrid_divergence_count = 0
-        self._move_failure_count = 0
-        self._move_retry_after = 0.0
         self._hybrid_last_stopped_at = 0.0
 
         self._last_detection_count = 0
@@ -1803,7 +1799,9 @@ class DogTracker:
         self.state = "PTZ_ERROR"
         self._stop_reason = reason
 
-    async def _poll_ptz_operation(self, seq: int, now: float) -> None:
+    async def _poll_ptz_operation(self, seq: int, now: float, generation: int) -> None:
+        if not self._session_valid(generation):
+            return
         kind = self._ptz_operation
         if kind is None:
             return
@@ -1812,6 +1810,8 @@ class DogTracker:
             # Final status validation: never release a timed-out operation blindly.
             status = await asyncio.to_thread(self.ptz.get_status)
             checked_at = time.monotonic()
+            if not self._session_valid(generation):
+                return
             if not status:
                 await self._halt_tracking_for_ptz_failure(
                     f"PTZ status remained unavailable when '{kind}' exceeded its {self.cfg.ptz_operation_timeout:.2f}s timeout.",
@@ -1850,6 +1850,8 @@ class DogTracker:
 
         status = await asyncio.to_thread(self.ptz.get_status)
         polled_at = time.monotonic()
+        if not self._session_valid(generation):
+            return
         self._ptz_next_status_poll_at = polled_at + self.cfg.ptz_status_poll_interval
         if not status:
             return
@@ -1913,7 +1915,7 @@ class DogTracker:
                 # PTZ completion is independent of RTSP/GPU health. Keep polling
                 # the camera while an operation is active even if the next video
                 # frame is duplicate/stale or tracker inference gets skipped.
-                await self._poll_ptz_operation(seq, now)
+                await self._poll_ptz_operation(seq, now, generation)
                 now = time.monotonic()
 
                 # A fail-closed PTZ recovery may disable tracking during the poll.
