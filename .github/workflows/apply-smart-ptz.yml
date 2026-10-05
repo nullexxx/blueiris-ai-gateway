@@ -51,3 +51,5 @@ jobs:
           git diff --cached --check
           git commit -m "Merge Frigate-inspired PTZ control refinements"
           git push origin HEAD:main
+
+# rerun after tightening the timing-model patch anchor
