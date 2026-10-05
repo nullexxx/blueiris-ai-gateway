@@ -116,6 +116,10 @@ services:
       TRACKER_ZOOM_OUT_COOLDOWN: "0.75"
       TRACKER_ZOOM_NOOP_BACKOFF: "5.0"
       TRACKER_ZOOM_NOOP_EPSILON: "0.03"
+      TRACKER_ZOOM_CONTROL_MODE: "auto"
+      TRACKER_ONVIF_PORT: "80"
+      TRACKER_CAMERA_MAX_OPTICAL_ZOOM: "25.0"
+      TRACKER_CALIBRATION_PATH: "/app/models/tracker_calibration.json"
 
       # Target-loss / home behavior
       TRACKER_COAST_TIME: "0.20"

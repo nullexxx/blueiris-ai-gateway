@@ -392,12 +392,10 @@ class CalibrationStore:
 
     def public_dict(self) -> dict:
         camera = self._camera()
-        return {
-            "path": str(self.path),
-            "loaded": bool(camera),
-            "move_timing": camera.get("move_timing", {}),
-            "spatial_response": camera.get("spatial_response", {}),
-        }
+        timing = camera.get("move_timing", {}) if isinstance(camera, dict) else {}
+        if not isinstance(timing, dict): timing = {}
+        samples = timing.get("samples", [])
+        return {"path": str(self.path), "loaded": bool(camera), "move_timing": {"intercept": timing.get("intercept"), "slope": timing.get("slope"), "samples": len(samples) if isinstance(samples, list) else 0}, "spatial_response": camera.get("spatial_response", {})}
 
     def flush(self, force: bool = False) -> None:
         if not self.enabled or not self._dirty:

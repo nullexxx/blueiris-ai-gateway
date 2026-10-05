@@ -16,6 +16,11 @@ import numpy as np
 import requests
 from requests.auth import HTTPDigestAuth
 
+from ptz_enhancements import (
+    CalibrationStore, CameraMotionEstimator, OnvifAbsoluteZoom,
+    TargetHistory, frame_sharpness, zoom_bucket,
+)
+
 
 InferenceCallback = Callable[[np.ndarray, float, str, List[int]], Awaitable[Tuple[str, List[dict], int]]]
 
@@ -955,6 +960,36 @@ class DogTracker:
             read_timeout_s=cfg.rtsp_read_timeout,
         )
         self.ptz = AmcrestPTZ(cfg)
+        self._smart_history = TargetHistory(1.5)
+        self._smart_motion = CameraMotionEstimator(120, 12)
+        self._camera_motion = None
+        self._frame_sharpness: Optional[float] = None
+        self._sharpness_baseline: Optional[float] = None
+        self._frame_sharpness_ok = True
+        self._last_ptz_stopped_at = 0.0
+        self._sharpness_wait_logged = False
+        self._last_effective_deadzone = (cfg.move_deadzone_x, cfg.move_deadzone_y)
+        self._calibration = CalibrationStore(
+            os.getenv("TRACKER_CALIBRATION_PATH", "/app/models/tracker_calibration.json"),
+            cfg.camera_ip,
+            True,
+        )
+        self._onvif_zoom = OnvifAbsoluteZoom(
+            cfg.camera_ip,
+            _env_int("TRACKER_ONVIF_PORT", 80),
+            cfg.camera_user,
+            cfg.camera_password,
+            logger,
+            os.getenv("TRACKER_ZOOM_CONTROL_MODE", "auto"),
+        )
+        self._camera_max_optical_zoom = max(
+            cfg.zoom_max_factor, _env_float("TRACKER_CAMERA_MAX_OPTICAL_ZOOM", 25.0)
+        )
+        self._zoom_control_active = "cgi_timed_fallback"
+        self._pending_move_quality: Optional[dict] = None
+        self._quality_improvements: Deque[float] = deque(maxlen=50)
+        self._quality_overshoots = 0
+        self._quality_undershoots = 0
 
         self.active = False
         self.state = "OFF"
@@ -1003,6 +1038,21 @@ class DogTracker:
         self._move_eta_model_ready = False
         self._last_predicted_move_eta = self._move_eta_intercept
         self._pending_move_distance: Optional[float] = None
+        saved_timing = self._calibration.timing()
+        if isinstance(saved_timing, dict):
+            for sample in saved_timing.get("samples", []):
+                try:
+                    self._move_timing_samples.append((float(sample[0]), float(sample[1])))
+                except (TypeError, ValueError, IndexError):
+                    pass
+            if len(self._move_timing_samples) >= self.cfg.move_eta_min_samples:
+                try:
+                    self._move_eta_intercept = max(0.10, min(self.cfg.move_eta_max, float(saved_timing["intercept"])))
+                    self._move_eta_slope = max(0.0, min(2.0, float(saved_timing["slope"])))
+                    self._move_eta_model_ready = True
+                    self._last_predicted_move_eta = self._move_eta_intercept
+                except (KeyError, TypeError, ValueError):
+                    pass
 
         # Lightweight camera-motion compensation for association. moveDirectly
         # tells us the approximate image shift it intends to create, so detections
@@ -1088,6 +1138,17 @@ class DogTracker:
         if not self.cfg.camera_password:
             self.logger.warning("PTZ tracker camera password is empty.")
         self.capture.start()
+        if self.cfg.autozoom and os.getenv("TRACKER_ZOOM_CONTROL_MODE", "auto").strip().lower() != "cgi":
+            try:
+                onvif_ok = await asyncio.wait_for(self._onvif_zoom.initialize(), timeout=5.0)
+            except Exception as exc:
+                onvif_ok = False
+                self._onvif_zoom.last_error = str(exc)
+            self._zoom_control_active = "onvif_absolute" if onvif_ok else "cgi_timed_fallback"
+            if onvif_ok:
+                self.logger.info("PTZ tracker zoom: ONVIF AbsoluteMove enabled")
+            else:
+                self.logger.warning("ONVIF absolute zoom unavailable; CGI fallback remains active: %s", self._onvif_zoom.last_error)
         self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
         self.logger.info(
             "PTZ tracker initialized: camera=%s model=%s fps=%.1f mode=moveDirectly autozoom=%s autostart=%s",
@@ -1119,6 +1180,11 @@ class DogTracker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        try:
+            await self._onvif_zoom.close()
+        except Exception:
+            pass
+        self._calibration.flush(force=True)
         await asyncio.to_thread(self.capture.stop)
         self.ptz.close()
 
@@ -1158,6 +1224,15 @@ class DogTracker:
         self._hybrid_divergence_count = 0
         self._move_failure_count = 0
         self._move_retry_after = 0.0
+        self._smart_history.clear()
+        self._smart_motion.reset()
+        self._camera_motion = None
+        self._frame_sharpness = None
+        self._frame_sharpness_ok = True
+        self._last_ptz_stopped_at = 0.0
+        self._sharpness_wait_logged = False
+        self._last_effective_deadzone = (self.cfg.move_deadzone_x, self.cfg.move_deadzone_y)
+        self._pending_move_quality = None
 
     def _session_valid(self, generation: int) -> bool:
         return self.active and generation == self._session_generation and not self._shutdown
@@ -1367,6 +1442,21 @@ class DogTracker:
             "last_inference_outcome": self._last_inference_outcome,
             "last_inference_ms": self._last_inference_ms,
             "rolling_inference_fps": round(infer_fps, 2),
+            "smart_ptz": {
+                "zoom_control": self._onvif_zoom.public_dict(),
+                "frame_sharpness": None if self._frame_sharpness is None else round(self._frame_sharpness, 1),
+                "sharpness_baseline": None if self._sharpness_baseline is None else round(self._sharpness_baseline, 1),
+                "sharpness_ok": self._frame_sharpness_ok,
+                "camera_motion": None if self._camera_motion is None else self._camera_motion.public_dict(),
+                "camera_motion_failures": self._smart_motion.failures,
+                "effective_deadzone": [round(self._last_effective_deadzone[0], 3), round(self._last_effective_deadzone[1], 3)],
+                "target_history": self._smart_history.metrics(now, 1.0),
+                "move_quality_samples": len(self._quality_improvements),
+                "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
+                "overshoots": self._quality_overshoots,
+                "undershoots": self._quality_undershoots,
+                "calibration": self._calibration.public_dict(),
+            },
             "counters": {
                 "total_inferences": self.total_inferences,
                 "frames_skipped_gpu_busy": self.frames_skipped_gpu_busy,
@@ -1444,6 +1534,7 @@ class DogTracker:
         self._move_eta_intercept = max(0.10, min(self.cfg.move_eta_max, intercept))
         self._move_eta_slope = max(0.0, min(2.0, slope))
         self._move_eta_model_ready = True
+        self._calibration.set_timing(self._move_eta_intercept, self._move_eta_slope, list(self._move_timing_samples))
 
     @staticmethod
     def _point_segment_distance(
@@ -1506,17 +1597,84 @@ class DogTracker:
         self._trusted_velocity = (vx, vy)
         return True, None
 
+    def _current_zoom_factor(self) -> float:
+        if self._last_zoom_position is None or self.cfg.zoom_wide_position <= 0:
+            return 1.0
+        return max(1.0, min(self.cfg.zoom_max_factor, self._last_zoom_position / self.cfg.zoom_wide_position))
+
+    def _effective_deadzone(self, target_span: float, frame_shape: Tuple[int, ...]) -> Tuple[float, float]:
+        h, w = frame_shape[:2]
+        zoom_scale = math.sqrt(self._current_zoom_factor())
+        size_scale = max(0.75, min(1.35, math.sqrt(0.12 / max(0.03, target_span))))
+        speed_norm = 0.0
+        if self.target is not None and self.target.velocity_valid:
+            speed_norm = math.hypot(self.target.vx, self.target.vy) / max(1.0, math.hypot(w, h))
+        motion_scale = 0.85 if speed_norm >= self.cfg.hybrid_chase_motion_speed_norm else 1.0
+        scale = max(0.75, min(1.65, zoom_scale * size_scale * motion_scale))
+        result = (
+            max(0.04, min(0.45, self.cfg.move_deadzone_x * scale)),
+            max(0.05, min(0.50, self.cfg.move_deadzone_y * scale)),
+        )
+        self._last_effective_deadzone = result
+        return result
+
+    def _update_frame_quality(self, frame: np.ndarray, now: float) -> bool:
+        score = frame_sharpness(frame)
+        self._frame_sharpness = score
+        in_guard = self._last_ptz_stopped_at > 0 and (now - self._last_ptz_stopped_at) <= 0.60
+        if not in_guard and self._ptz_operation is None and score > 0:
+            self._sharpness_baseline = score if self._sharpness_baseline is None else 0.95 * self._sharpness_baseline + 0.05 * score
+        threshold = max(35.0, 0.45 * self._sharpness_baseline) if self._sharpness_baseline is not None else 35.0
+        self._frame_sharpness_ok = not in_guard or score >= threshold
+        return self._frame_sharpness_ok
+
+    def _complete_move_quality(self, frame_shape: Tuple[int, ...], now: float) -> None:
+        pending = self._pending_move_quality
+        if pending is None or self.target is None:
+            return
+        if now - float(pending.get("started_at", now)) > 4.0:
+            self._pending_move_quality = None
+            return
+        h, w = frame_shape[:2]
+        post_x = (self.target.center[0] - w / 2.0) / (w / 2.0)
+        post_y = (self.target.center[1] - h / 2.0) / (h / 2.0)
+        pre_x, pre_y = float(pending["pre_x"]), float(pending["pre_y"])
+        before, after = math.hypot(pre_x, pre_y), math.hypot(post_x, post_y)
+        improvement = 0.0 if before < 1e-6 else max(-2.0, min(1.0, (before - after) / before))
+        self._quality_improvements.append(improvement)
+        overshoot = (pre_x * post_x < 0 and abs(pre_x) > 0.10 and abs(post_x) > 0.04) or (pre_y * post_y < 0 and abs(pre_y) > 0.10 and abs(post_y) > 0.04)
+        undershoot = after > before * 0.55 and not overshoot
+        self._quality_overshoots += int(overshoot)
+        self._quality_undershoots += int(undershoot)
+        bucket = str(pending["bucket"])
+        pan_scale, tilt_scale = self._calibration.spatial_scales(bucket)
+        learned = False
+        if float(pending.get("speed_norm", 1.0)) <= 0.02 and self._frame_sharpness_ok and self.target.confidence >= self.cfg.lead_min_conf:
+            rate = 0.04
+            def tune(pre, post, scale):
+                if abs(pre) < 0.10:
+                    return scale
+                if pre * post < 0 and abs(post) > 0.04:
+                    return max(0.75, scale * (1.0 - rate))
+                if abs(post) / max(1e-6, abs(pre)) > 0.55:
+                    return min(1.25, scale * (1.0 + rate))
+                return scale
+            new_pan, new_tilt = tune(pre_x, post_x, pan_scale), tune(pre_y, post_y, tilt_scale)
+            if abs(new_pan - pan_scale) > 1e-6 or abs(new_tilt - tilt_scale) > 1e-6:
+                self._calibration.set_spatial_scales(bucket, new_pan, new_tilt)
+                pan_scale, tilt_scale, learned = new_pan, new_tilt, True
+        self._record_event("move_quality", pre_error=[round(pre_x, 3), round(pre_y, 3)], post_error=[round(post_x, 3), round(post_y, 3)], improvement=round(improvement, 3), overshoot=overshoot, undershoot=undershoot, learned=learned, zoom_bucket=bucket, pan_scale=round(pan_scale, 3), tilt_scale=round(tilt_scale, 3))
+        self._pending_move_quality = None
+
     def _hybrid_axis_speed(self, error: float) -> int:
         magnitude = abs(error)
         if magnitude <= self.cfg.hybrid_chase_exit_error:
             return 0
         span = max(0.01, self.cfg.hybrid_chase_full_speed_error - self.cfg.hybrid_chase_exit_error)
         ratio = max(0.0, min(1.0, (magnitude - self.cfg.hybrid_chase_exit_error) / span))
-        speed = int(round(
-            self.cfg.hybrid_chase_min_speed
-            + ratio * (self.cfg.hybrid_chase_max_speed - self.cfg.hybrid_chase_min_speed)
-        ))
-        speed = max(self.cfg.hybrid_chase_min_speed, min(self.cfg.hybrid_chase_max_speed, speed))
+        zoom_max = max(self.cfg.hybrid_chase_min_speed, int(round(self.cfg.hybrid_chase_max_speed / math.sqrt(self._current_zoom_factor()))))
+        speed = int(round(self.cfg.hybrid_chase_min_speed + ratio * (zoom_max - self.cfg.hybrid_chase_min_speed)))
+        speed = max(self.cfg.hybrid_chase_min_speed, min(zoom_max, speed))
         return speed if error > 0 else -speed
 
     async def _stop_hybrid_chase(
@@ -1816,6 +1974,8 @@ class DogTracker:
             "ptz_operation_timeout" if timed_out else "ptz_operation_complete",
             **event_fields,
         )
+        self._last_ptz_stopped_at = now
+        self._sharpness_wait_logged = False
 
         # PTZ movement itself must never count as target-loss time. Always restart
         # the loss clock when the camera finishes, even if YOLO briefly saw the
@@ -2073,6 +2233,11 @@ class DogTracker:
         # polls PTZ status before inference; tracking continues while the camera
         # moves, but no second PTZ command is allowed until it is truly idle.
         now = time.monotonic()
+        motion_active = self._ptz_operation is not None or self._hybrid_chase_active or seq < self._post_motion_release_seq
+        self._camera_motion = self._smart_motion.update(
+            frame, [d.bbox for d in detections], active=motion_active, use_homography=self._ptz_operation == "zoom"
+        )
+        self._update_frame_quality(frame, now)
 
         # Never acquire a new target while a home preset is still moving, or from
         # the first couple of frames that were already buffered before it settled.
@@ -2114,6 +2279,8 @@ class DogTracker:
                 last_seen=now,
                 acquire_hits=1,
             )
+            self._smart_history.clear()
+            self._smart_history.add(now, chosen.bbox, chosen.confidence, frame.shape)
             self.state = "ACQUIRE"
             self._record_event(
                 "acquire_candidate",
@@ -2148,12 +2315,14 @@ class DogTracker:
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and self._velocity_rebase_required
+                and self._frame_sharpness_ok
             )
             velocity_learning_allowed = (
                 self._ptz_operation is None
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
+                and self._frame_sharpness_ok
             )
             self.target.update(
                 matched,
@@ -2161,11 +2330,19 @@ class DogTracker:
                 update_velocity=velocity_learning_allowed,
                 min_velocity_sample_s=self.cfg.velocity_min_sample_ms / 1000.0,
             )
+            self._smart_history.add(now, matched.bbox, matched.confidence, frame.shape)
+            if self._ptz_operation is None and ptz_ready and not self._frame_sharpness_ok:
+                self.state = "PTZ_SETTLING"
+                if not self._sharpness_wait_logged:
+                    self._record_event("post_move_frame_blurry", sharpness=round(self._frame_sharpness or 0.0, 1))
+                    self._sharpness_wait_logged = True
+                return
 
             # Consume one post-move match as the stationary image-space reference.
             # Later bbox updates do not move this reference until the sample window
             # is mature, eliminating the noisy 30-60 ms velocity estimates.
             if rebasing_velocity:
+                self._complete_move_quality(frame.shape, now)
                 self.target.rebase_velocity(now)
                 self._velocity_rebase_required = False
                 self._association_motion_start_center = None
@@ -2337,6 +2514,7 @@ class DogTracker:
         )
         motion_start: Optional[Tuple[float, float]] = None
         motion_end: Optional[Tuple[float, float]] = None
+        motion_point = self._camera_motion.apply_point(self.target.center) if camera_recently_moved and self._camera_motion is not None else None
         if self._hybrid_chase_active:
             # During continuous rescue the whole frame is translating. Frigate
             # handles this with camera-motion estimation; our lightweight version
@@ -2368,6 +2546,10 @@ class DogTracker:
                 and motion_end is not None
             ):
                 dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag
+                if motion_point is not None:
+                    dist_norm = min(dist_norm, math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag)
+            elif camera_recently_moved and motion_point is not None:
+                dist_norm = math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag
             else:
                 dist_norm = math.hypot(cx - px, cy - py) / diag
             proximity_span = 0.75 if camera_recently_moved else 0.45
@@ -2411,10 +2593,8 @@ class DogTracker:
         if not self._ptz_action_ready(seq):
             return
 
-        outside_deadzone = (
-            abs(err_x) > self.cfg.move_deadzone_x
-            or abs(err_y) > self.cfg.move_deadzone_y
-        )
+        deadzone_x, deadzone_y = self._effective_deadzone(target_span, frame_shape)
+        outside_deadzone = abs(err_x) > deadzone_x or abs(err_y) > deadzone_y
 
         if outside_deadzone:
             if not self.cfg.move_directly_enabled:
@@ -2545,9 +2725,14 @@ class DogTracker:
                 edge_rescue_reason = "inward_motion_suppressed"
             active_move_gain = (
                 max(self.cfg.move_gain, self.cfg.edge_rescue_gain)
-                if edge_rescue_active
-                else self.cfg.move_gain
+                if edge_rescue_active else self.cfg.move_gain
             )
+            current_zoom_factor = self._current_zoom_factor()
+            current_bucket = zoom_bucket(current_zoom_factor)
+            pan_scale, tilt_scale = self._calibration.spatial_scales(current_bucket)
+            zoom_gain = 1.0 / math.sqrt(current_zoom_factor)
+            gain_x = max(0.20, min(0.95, active_move_gain * zoom_gain * pan_scale))
+            gain_y = max(0.20, min(0.95, active_move_gain * zoom_gain * tilt_scale))
 
             frame_cx = w / 2.0
             frame_cy = h / 2.0
@@ -2556,8 +2741,8 @@ class DogTracker:
             # camera's own completed-move history. Before enough samples exist,
             # TRACKER_LEAD_TIME remains the conservative known-good fallback.
             base_command_center = (
-                frame_cx + (target_cx - frame_cx) * active_move_gain,
-                frame_cy + (target_cy - frame_cy) * active_move_gain,
+                frame_cx + (target_cx - frame_cx) * gain_x,
+                frame_cy + (target_cy - frame_cy) * gain_y,
             )
             base_move_distance = self._move_distance_from_center(base_command_center, frame_shape)
             lead_horizon_s = self._predict_move_eta(base_move_distance)
@@ -2592,8 +2777,8 @@ class DogTracker:
             predicted_cy = max(h * 0.05, min(h * 0.95, target_cy + lead_dy))
 
             command_center = (
-                frame_cx + (predicted_cx - frame_cx) * active_move_gain,
-                frame_cy + (predicted_cy - frame_cy) * active_move_gain,
+                frame_cx + (predicted_cx - frame_cx) * gain_x,
+                frame_cy + (predicted_cy - frame_cy) * gain_y,
             )
             move_distance = self._move_distance_from_center(command_center, frame_shape)
 
@@ -2621,6 +2806,7 @@ class DogTracker:
                 self._pending_move_distance = move_distance
                 self._association_motion_start_center = (target_cx, target_cy)
                 self._association_motion_end_center = expected_post_move_center
+                self._pending_move_quality = {"started_at": t1, "pre_x": err_x, "pre_y": err_y, "speed_norm": target_speed_norm, "bucket": current_bucket}
                 self._begin_ptz_operation("move", seq, t1)
                 self.state = "PTZ_MOVING"
                 self._record_event(
@@ -2637,6 +2823,9 @@ class DogTracker:
                     edge_clipped=edge_clipped,
                     lead_px=[round(lead_dx, 1), round(lead_dy, 1)],
                     move_gain=round(active_move_gain, 3),
+                    gain_x=round(gain_x, 3), gain_y=round(gain_y, 3),
+                    zoom_factor=round(current_zoom_factor, 2), zoom_bucket=current_bucket,
+                    deadzone=[round(deadzone_x, 3), round(deadzone_y, 3)],
                     base_move_gain=round(self.cfg.move_gain, 3),
                     edge_rescue_active=edge_rescue_active,
                     edge_rescue_reason=edge_rescue_reason,
@@ -2683,11 +2872,18 @@ class DogTracker:
         if not self.cfg.autozoom:
             return
 
+        zoom_metrics = self._smart_history.metrics(now, 1.0)
+        smoothed_span = float(zoom_metrics.get("weighted_span") or target_span)
+        predicted_span = float(zoom_metrics.get("predicted_span") or smoothed_span)
+        speed_norm = math.hypot(self.target.vx, self.target.vy) / max(1.0, math.hypot(w, h)) if self.target.velocity_valid else 0.0
         zoom_in_eligible = (
-            target_span < self.cfg.zoom_target_min
+            int(zoom_metrics.get("samples", 0)) >= 5
+            and max(smoothed_span, predicted_span) < self.cfg.zoom_target_min
             and self.target.confidence >= self.cfg.zoom_in_min_conf
-            and abs(err_x) <= self.cfg.zoom_in_max_error
-            and abs(err_y) <= self.cfg.zoom_in_max_error
+            and abs(err_x) <= self.cfg.zoom_in_max_error and abs(err_y) <= self.cfg.zoom_in_max_error
+            and int(zoom_metrics.get("edge_touches", 0)) == 0
+            and speed_norm <= 0.025
+            and self._frame_sharpness_ok
         )
         if (now - self._zoom_in_candidate_last_at) > 0.20:
             self._zoom_in_candidate_frames = 0
@@ -2738,7 +2934,7 @@ class DogTracker:
             duration_ms = self.cfg.zoom_in_step_ms
         elif (
             self._zoom_in_candidate_frames >= self.cfg.zoom_in_confirm_frames
-            and target_span < self.cfg.zoom_target_min
+            and max(smoothed_span, predicted_span) < self.cfg.zoom_target_min
             and since_zoom >= self.cfg.zoom_cooldown
             and now >= self._zoom_suppressed_until
             and self._last_zoom_position < (self.cfg.zoom_max_position - zoom_in_guard)
@@ -2746,7 +2942,7 @@ class DogTracker:
             direction = "in"
             duration_ms = self.cfg.zoom_in_step_ms
         elif (
-            target_span > self.cfg.zoom_target_max
+            (max(smoothed_span, predicted_span) > self.cfg.zoom_target_max or int(zoom_metrics.get("edge_touches", 0)) > 0 or speed_norm >= 0.08)
             and since_zoom >= self.cfg.zoom_out_cooldown
             and self._last_zoom_position > (self.cfg.zoom_min_position + 0.25)
         ):
@@ -2761,8 +2957,18 @@ class DogTracker:
             self._zoom_in_candidate_frames = 0
             self._zoom_in_candidate_last_at = 0.0
         self._zoom_operation_start_position = before
+        current_factor = max(1.0, before / self.cfg.zoom_wide_position)
+        desired_factor = min(self.cfg.zoom_max_factor, current_factor + 0.25) if direction == "in" else max(self.cfg.zoom_min_factor, current_factor - 0.50)
         t0 = time.monotonic()
-        ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
+        zoom_control = "cgi_timed_fallback"
+        ok = False
+        if self._onvif_zoom.available:
+            ok = await self._onvif_zoom.set_factor(desired_factor, self._camera_max_optical_zoom)
+            if ok:
+                zoom_control = "onvif_absolute"
+        if not ok:
+            ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
+        self._zoom_control_active = zoom_control
         t1 = time.monotonic()
         if not self._session_valid(generation):
             return
@@ -2778,6 +2984,9 @@ class DogTracker:
                 label=self.target.label,
                 direction=direction,
                 duration_ms=duration_ms,
+                control=zoom_control, desired_factor=round(desired_factor, 2),
+                smoothed_span=round(smoothed_span, 3), predicted_span=round(predicted_span, 3),
+                target_speed_norm=round(speed_norm, 4),
                 target_span=round(target_span, 3),
                 confidence=round(self.target.confidence, 3),
                 zoom_before=round(before, 3),
@@ -2804,10 +3013,11 @@ class DogTracker:
         try:
             h, w = debug.shape[:2]
             cx, cy = w // 2, h // 2
-            left = int(cx - self.cfg.move_deadzone_x * (w / 2.0))
-            right = int(cx + self.cfg.move_deadzone_x * (w / 2.0))
-            top = int(cy - self.cfg.move_deadzone_y * (h / 2.0))
-            bottom = int(cy + self.cfg.move_deadzone_y * (h / 2.0))
+            dzx, dzy = self._last_effective_deadzone
+            left = int(cx - dzx * (w / 2.0))
+            right = int(cx + dzx * (w / 2.0))
+            top = int(cy - dzy * (h / 2.0))
+            bottom = int(cy + dzy * (h / 2.0))
             cv2.rectangle(debug, (left, top), (right, bottom), (160, 160, 160), 1)
             cv2.drawMarker(debug, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 18, 1)
 
