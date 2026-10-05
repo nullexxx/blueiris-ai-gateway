@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     paths:
       - "tools/apply_active_ptz_calibration.py"
+      - "tools/fix_active_ptz_patch_driver.py"
       - ".github/workflows/apply-active-ptz-calibration.yml"
 
 permissions:
@@ -21,7 +22,9 @@ jobs:
       - name: Install test dependencies
         run: pip install numpy opencv-python-headless
       - name: Apply guarded integration
-        run: python tools/apply_active_ptz_calibration.py
+        run: |
+          python tools/fix_active_ptz_patch_driver.py
+          python tools/apply_active_ptz_calibration.py
       - name: Compile Python sources
         run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py ptz_active_calibration.py
       - name: Run tests
