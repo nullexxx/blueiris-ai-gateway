@@ -87,6 +87,19 @@ block = one(
 )
 text = text[:s] + block + text[e:]
 
+# Hybrid chase entry must pass the new axis argument and use the calibrated
+# direction signs. The update-loop path already does this; this guard keeps the
+# initial entry path in lock-step so a target near the frame edge cannot crash
+# the tracker on first escape-chase activation.
+text = one(
+    text,
+    '''                pan_speed = self.cfg.hybrid_chase_pan_sign * self._hybrid_axis_speed(err_x)\n                tilt_speed = -self._hybrid_axis_speed(err_y)\n''',
+    '''                pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)\n                tilt_sign = self._active_calibration.continuous_sign("tilt", -1)\n                pan_speed = pan_sign * self._hybrid_axis_speed(err_x, "pan")\n                tilt_speed = tilt_sign * self._hybrid_axis_speed(err_y, "tilt")\n''',
+    "hybrid chase entry axis/sign",
+)
+if '_hybrid_axis_speed(err_x)' in text or '_hybrid_axis_speed(err_y)' in text:
+    raise RuntimeError("hybrid chase arity regression: one-argument call remains")
+
 # Let passive refinement preserve the slightly wider active-calibration range.
 old = '                    return min(1.25, scale * (1.0 + rate))\n'
 if text.count(old) != 1:
