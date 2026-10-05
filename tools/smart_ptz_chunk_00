@@ -1,0 +1,192 @@
+from pathlib import Path
+
+
+def replace_once(text, old, new, label):
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one match, got {count}")
+    return text.replace(old, new, 1)
+
+
+root = Path('.')
+tracker_path = root / 'tracker.py'
+dockerfile_path = root / 'Dockerfile'
+compose_path = root / 'docker-compose.example.yml'
+helper_path = root / 'ptz_enhancements.py'
+tracker = tracker_path.read_text()
+dockerfile = dockerfile_path.read_text()
+compose = compose_path.read_text()
+helper = helper_path.read_text()
+
+# Imports.
+tracker = replace_once(
+    tracker,
+    'from requests.auth import HTTPDigestAuth\n',
+    'from requests.auth import HTTPDigestAuth\n\n'
+    'from ptz_enhancements import (\n'
+    '    CalibrationStore, CameraMotionEstimator, OnvifAbsoluteZoom,\n'
+    '    TargetHistory, frame_sharpness, zoom_bucket,\n'
+    ')\n',
+    'imports',
+)
+
+# Runtime state. New tuning is intentionally internal/conservative; only camera-specific
+# transport values are exposed as env vars until real history justifies more knobs.
+tracker = replace_once(
+    tracker,
+    '        self.ptz = AmcrestPTZ(cfg)\n',
+    '        self.ptz = AmcrestPTZ(cfg)\n'
+    '        self._smart_history = TargetHistory(1.5)\n'
+    '        self._smart_motion = CameraMotionEstimator(120, 12)\n'
+    '        self._camera_motion = None\n'
+    '        self._frame_sharpness: Optional[float] = None\n'
+    '        self._sharpness_baseline: Optional[float] = None\n'
+    '        self._frame_sharpness_ok = True\n'
+    '        self._last_ptz_stopped_at = 0.0\n'
+    '        self._sharpness_wait_logged = False\n'
+    '        self._last_effective_deadzone = (cfg.move_deadzone_x, cfg.move_deadzone_y)\n'
+    '        self._calibration = CalibrationStore(\n'
+    '            os.getenv("TRACKER_CALIBRATION_PATH", "/app/models/tracker_calibration.json"),\n'
+    '            cfg.camera_ip,\n'
+    '            True,\n'
+    '        )\n'
+    '        self._onvif_zoom = OnvifAbsoluteZoom(\n'
+    '            cfg.camera_ip,\n'
+    '            _env_int("TRACKER_ONVIF_PORT", 80),\n'
+    '            cfg.camera_user,\n'
+    '            cfg.camera_password,\n'
+    '            logger,\n'
+    '            os.getenv("TRACKER_ZOOM_CONTROL_MODE", "auto"),\n'
+    '        )\n'
+    '        self._camera_max_optical_zoom = max(\n'
+    '            cfg.zoom_max_factor, _env_float("TRACKER_CAMERA_MAX_OPTICAL_ZOOM", 25.0)\n'
+    '        )\n'
+    '        self._zoom_control_active = "cgi_timed_fallback"\n'
+    '        self._pending_move_quality: Optional[dict] = None\n'
+    '        self._quality_improvements: Deque[float] = deque(maxlen=50)\n'
+    '        self._quality_overshoots = 0\n'
+    '        self._quality_undershoots = 0\n',
+    'runtime state',
+)
+
+# Restore persisted timing model after the normal defaults are created.
+tracker = replace_once(
+    tracker,
+    '        self._pending_move_distance: Optional[float] = None\n',
+    '        self._pending_move_distance: Optional[float] = None\n'
+    '        saved_timing = self._calibration.timing()\n'
+    '        if isinstance(saved_timing, dict):\n'
+    '            for sample in saved_timing.get("samples", []):\n'
+    '                try:\n'
+    '                    self._move_timing_samples.append((float(sample[0]), float(sample[1])))\n'
+    '                except (TypeError, ValueError, IndexError):\n'
+    '                    pass\n'
+    '            if len(self._move_timing_samples) >= self.cfg.move_eta_min_samples:\n'
+    '                try:\n'
+    '                    self._move_eta_intercept = max(0.10, min(self.cfg.move_eta_max, float(saved_timing["intercept"])))\n'
+    '                    self._move_eta_slope = max(0.0, min(2.0, float(saved_timing["slope"])))\n'
+    '                    self._move_eta_model_ready = True\n'
+    '                    self._last_predicted_move_eta = self._move_eta_intercept\n'
+    '                except (KeyError, TypeError, ValueError):\n'
+    '                    pass\n',
+    'restore timing',
+)
+
+# Probe exact ONVIF zoom, but never make startup depend on it.
+tracker = replace_once(
+    tracker,
+    '        self.capture.start()\n        self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")\n',
+    '        self.capture.start()\n'
+    '        if self.cfg.autozoom and os.getenv("TRACKER_ZOOM_CONTROL_MODE", "auto").strip().lower() != "cgi":\n'
+    '            try:\n'
+    '                onvif_ok = await asyncio.wait_for(self._onvif_zoom.initialize(), timeout=5.0)\n'
+    '            except Exception as exc:\n'
+    '                onvif_ok = False\n'
+    '                self._onvif_zoom.last_error = str(exc)\n'
+    '            self._zoom_control_active = "onvif_absolute" if onvif_ok else "cgi_timed_fallback"\n'
+    '            if onvif_ok:\n'
+    '                self.logger.info("PTZ tracker zoom: ONVIF AbsoluteMove enabled")\n'
+    '            else:\n'
+    '                self.logger.warning("ONVIF absolute zoom unavailable; CGI fallback remains active: %s", self._onvif_zoom.last_error)\n'
+    '        self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")\n',
+    'onvif init',
+)
+
+tracker = replace_once(
+    tracker,
+    '        await asyncio.to_thread(self.capture.stop)\n        self.ptz.close()\n',
+    '        try:\n'
+    '            await self._onvif_zoom.close()\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        self._calibration.flush(force=True)\n'
+    '        await asyncio.to_thread(self.capture.stop)\n'
+    '        self.ptz.close()\n',
+    'shutdown',
+)
+
+# Reset session-local perception without resetting camera calibration.
+tracker = replace_once(
+    tracker,
+    '        self._move_failure_count = 0\n'
+    '        self._move_retry_after = 0.0\n\n'
+    '    def _session_valid',
+    '        self._move_failure_count = 0\n'
+    '        self._move_retry_after = 0.0\n'
+    '        self._smart_history.clear()\n'
+    '        self._smart_motion.reset()\n'
+    '        self._camera_motion = None\n'
+    '        self._frame_sharpness = None\n'
+    '        self._frame_sharpness_ok = True\n'
+    '        self._last_ptz_stopped_at = 0.0\n'
+    '        self._sharpness_wait_logged = False\n'
+    '        self._last_effective_deadzone = (self.cfg.move_deadzone_x, self.cfg.move_deadzone_y)\n'
+    '        self._pending_move_quality = None\n\n'
+    '    def _session_valid',
+    'reset state',
+)
+
+# Compact smart-controller telemetry.
+tracker = replace_once(
+    tracker,
+    '            "counters": {\n',
+    '            "smart_ptz": {\n'
+    '                "zoom_control": self._onvif_zoom.public_dict(),\n'
+    '                "frame_sharpness": None if self._frame_sharpness is None else round(self._frame_sharpness, 1),\n'
+    '                "sharpness_baseline": None if self._sharpness_baseline is None else round(self._sharpness_baseline, 1),\n'
+    '                "sharpness_ok": self._frame_sharpness_ok,\n'
+    '                "camera_motion": None if self._camera_motion is None else self._camera_motion.public_dict(),\n'
+    '                "camera_motion_failures": self._smart_motion.failures,\n'
+    '                "effective_deadzone": [round(self._last_effective_deadzone[0], 3), round(self._last_effective_deadzone[1], 3)],\n'
+    '                "target_history": self._smart_history.metrics(now, 1.0),\n'
+    '                "move_quality_samples": len(self._quality_improvements),\n'
+    '                "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),\n'
+    '                "overshoots": self._quality_overshoots,\n'
+    '                "undershoots": self._quality_undershoots,\n'
+    '                "calibration": self._calibration.public_dict(),\n'
+    '            },\n'
+    '            "counters": {\n',
+    'status',
+)
+
+# Persist the already-existing robust timing fit.
+tracker = replace_once(
+    tracker,
+    '        self._move_eta_model_ready = True\n',
+    '        self._move_eta_model_ready = True\n'
+    '        self._calibration.set_timing(self._move_eta_intercept, self._move_eta_slope, list(self._move_timing_samples))\n',
+    'persist timing',
+)
+
+# Smart helper methods live in DogTracker so they can use its current target/config.
+methods = r'''    def _current_zoom_factor(self) -> float:
+        if self._last_zoom_position is None or self.cfg.zoom_wide_position <= 0:
+            return 1.0
+        return max(1.0, min(self.cfg.zoom_max_factor, self._last_zoom_position / self.cfg.zoom_wide_position))
+
+    def _effective_deadzone(self, target_span: float, frame_shape: Tuple[int, ...]) -> Tuple[float, float]:
+        h, w = frame_shape[:2]
+        zoom_scale = math.sqrt(self._current_zoom_factor())
+        size_scale = max(0.75, min(1.35, math.sqrt(0.12 / max(0.03, target_span))))
+        speed_norm = 0.0
+        if self.target is not None and se
