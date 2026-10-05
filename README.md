@@ -94,6 +94,7 @@ The health endpoint returns `503` if the GPU pipeline is degraded or tainted.
 
 - `GET /v1/tracker/status` — Tracker state, current target, PTZ operation, counters, and effective configuration.
 - `GET /v1/tracker/camera-status` — Raw camera PTZ status from the Dahua/Amcrest CGI.
+- `POST /v1/tracker/calibrate` — Manual bounded ONVIF zoom calibration; requires tracking to be stopped.
 - `GET /v1/tracker/debug.jpg` — Latest annotated tracking frame.
 - `GET /v1/tracker/history?limit=300` — Recent tracker event history.
 - `POST /v1/tracker/history/clear` — Clear tracker history.

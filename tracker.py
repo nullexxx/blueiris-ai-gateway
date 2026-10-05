@@ -20,6 +20,10 @@ from ptz_enhancements import (
     CalibrationStore, CameraMotionEstimator, OnvifAbsoluteZoom,
     TargetHistory, frame_sharpness, zoom_bucket,
 )
+from ptz_phase2 import (
+    AcquisitionZonePolicy, BBoxMotionValidator, MotionMaskPolicy,
+    OnvifRetryState, SceneStabilityGate, ZoomCalibrationMap,
+)
 
 
 InferenceCallback = Callable[[np.ndarray, float, str, List[int]], Awaitable[Tuple[str, List[dict], int]]]
@@ -962,6 +966,19 @@ class DogTracker:
         self.ptz = AmcrestPTZ(cfg)
         self._smart_history = TargetHistory(1.5)
         self._smart_motion = CameraMotionEstimator(120, 12)
+        self._acquisition_zones = AcquisitionZonePolicy(
+            os.getenv("TRACKER_ACQUIRE_ZONES_JSON", ""),
+            os.getenv("TRACKER_IGNORE_ZONES_JSON", ""),
+        )
+        self._motion_masks = MotionMaskPolicy(os.getenv("TRACKER_MOTION_MASKS_JSON", ""))
+        self._bbox_motion = BBoxMotionValidator()
+        self._scene_stability = SceneStabilityGate(
+            stable_frames=max(1, _env_int("TRACKER_SCENE_STABLE_FRAMES", 2)),
+            max_wait_s=_env_float("TRACKER_SCENE_STABLE_MAX_WAIT", 0.60),
+            flow_threshold_norm=_env_float("TRACKER_SCENE_STABLE_FLOW", 0.012),
+        )
+        self._scene_stable_ready = True
+        self._last_velocity_geometry = None
         self._camera_motion = None
         self._frame_sharpness: Optional[float] = None
         self._sharpness_baseline: Optional[float] = None
@@ -985,6 +1002,18 @@ class DogTracker:
         self._camera_max_optical_zoom = max(
             cfg.zoom_max_factor, _env_float("TRACKER_CAMERA_MAX_OPTICAL_ZOOM", 25.0)
         )
+        self._onvif_retry = OnvifRetryState(
+            _env_float("TRACKER_ONVIF_RETRY_BASE", 15.0),
+            _env_float("TRACKER_ONVIF_RETRY_MAX", 300.0),
+        )
+        self._onvif_recovery_task: Optional[asyncio.Task] = None
+        self._zoom_map = ZoomCalibrationMap(
+            os.getenv("TRACKER_ZOOM_CALIBRATION_PATH", "/app/models/tracker_zoom_calibration.json"),
+            cfg.camera_ip,
+        )
+        self._zoom_operation_target_normalized: Optional[float] = None
+        self._zoom_operation_target_factor: Optional[float] = None
+        self._calibrating = False
         self._zoom_control_active = "cgi_timed_fallback"
         self._pending_move_quality: Optional[dict] = None
         self._quality_improvements: Deque[float] = deque(maxlen=50)
@@ -1146,9 +1175,14 @@ class DogTracker:
                 self._onvif_zoom.last_error = str(exc)
             self._zoom_control_active = "onvif_absolute" if onvif_ok else "cgi_timed_fallback"
             if onvif_ok:
+                self._onvif_retry.success()
                 self.logger.info("PTZ tracker zoom: ONVIF AbsoluteMove enabled")
             else:
-                self.logger.warning("ONVIF absolute zoom unavailable; CGI fallback remains active: %s", self._onvif_zoom.last_error)
+                delay = self._onvif_retry.failure(time.monotonic(), self._onvif_zoom.last_error)
+                self.logger.warning(
+                    "ONVIF absolute zoom unavailable; CGI fallback remains active and re-probe is scheduled in %.1fs: %s",
+                    delay, self._onvif_zoom.last_error,
+                )
         self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
         self.logger.info(
             "PTZ tracker initialized: camera=%s model=%s fps=%.1f mode=moveDirectly autozoom=%s autostart=%s",
@@ -1180,6 +1214,13 @@ class DogTracker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._onvif_recovery_task is not None and not self._onvif_recovery_task.done():
+            self._onvif_recovery_task.cancel()
+            try:
+                await self._onvif_recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._onvif_recovery_task = None
         try:
             await self._onvif_zoom.close()
         except Exception:
@@ -1200,6 +1241,8 @@ class DogTracker:
         self._zoom_in_candidate_last_at = 0.0
         self._zoom_suppressed_until = 0.0
         self._zoom_operation_start_position = None
+        self._zoom_operation_target_normalized = None
+        self._zoom_operation_target_factor = None
         self._ptz_operation = None
         self._ptz_operation_started_at = 0.0
         self._ptz_operation_deadline = 0.0
@@ -1226,6 +1269,10 @@ class DogTracker:
         self._move_retry_after = 0.0
         self._smart_history.clear()
         self._smart_motion.reset()
+        self._bbox_motion.reset()
+        self._scene_stability.clear()
+        self._scene_stable_ready = True
+        self._last_velocity_geometry = None
         self._camera_motion = None
         self._frame_sharpness = None
         self._frame_sharpness_ok = True
@@ -1236,6 +1283,131 @@ class DogTracker:
 
     def _session_valid(self, generation: int) -> bool:
         return self.active and generation == self._session_generation and not self._shutdown
+
+    def _onvif_optional_enabled(self) -> bool:
+        return self.cfg.autozoom and os.getenv("TRACKER_ZOOM_CONTROL_MODE", "auto").strip().lower() != "cgi"
+
+    def _schedule_onvif_retry(self, error: Optional[str]) -> None:
+        if not self._onvif_optional_enabled():
+            return
+        # Quarantine the optional ONVIF path immediately. Native CGI remains
+        # available while the scheduled capability re-probe runs in background.
+        self._onvif_zoom.available = False
+        delay = self._onvif_retry.failure(time.monotonic(), error)
+        self._zoom_control_active = "cgi_timed_fallback"
+        self._record_event("onvif_zoom_retry_scheduled", retry_in_s=round(delay, 1), error=error)
+
+    async def _recover_onvif_once(self) -> bool:
+        if not self._onvif_optional_enabled():
+            return False
+        try:
+            await self._onvif_zoom.close()
+            ok = await asyncio.wait_for(self._onvif_zoom.initialize(), timeout=5.0)
+        except Exception as exc:
+            ok = False
+            self._onvif_zoom.last_error = str(exc)
+        if ok:
+            self._onvif_retry.success()
+            self._zoom_control_active = "onvif_absolute"
+            self._record_event("onvif_zoom_recovered")
+            self.logger.info("ONVIF absolute zoom recovered; exact zoom control restored")
+            return True
+        self._schedule_onvif_retry(self._onvif_zoom.last_error)
+        return False
+
+    async def _onvif_recovery_worker(self) -> None:
+        try:
+            await self._recover_onvif_once()
+        finally:
+            self._onvif_recovery_task = None
+
+    def _maybe_start_onvif_recovery(self, now: float) -> None:
+        if not self._onvif_optional_enabled() or self._onvif_zoom.available:
+            return
+        if self._onvif_recovery_task is not None and not self._onvif_recovery_task.done():
+            return
+        if self._onvif_retry.due(now):
+            self._onvif_recovery_task = asyncio.create_task(
+                self._onvif_recovery_worker(), name="ptz-onvif-recovery"
+            )
+
+    async def _wait_zoom_idle(self, timeout_s: float = 4.0) -> Optional[Tuple[float, float, float]]:
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        previous = None
+        stable_polls = 0
+        while time.monotonic() < deadline:
+            status = await asyncio.to_thread(self.ptz.get_status)
+            if status:
+                position = self.ptz.position_from_status(status)
+                idle = self.ptz.zoom_reported_idle(status)
+                stable = self._position_stable(previous, position, "zoom") if previous is not None else None
+                if position is not None:
+                    previous = position
+                if idle is True and stable is not False:
+                    stable_polls += 1
+                elif idle is None and stable is True:
+                    stable_polls += 1
+                else:
+                    stable_polls = 0
+                if stable_polls >= 2 and position is not None:
+                    return position
+            await asyncio.sleep(self.cfg.ptz_status_poll_interval)
+        return None
+
+    async def calibrate(self) -> dict:
+        """Manual, bounded zoom calibration. Pan/tilt response continues to learn passively."""
+        if self.active:
+            return {"success": False, "error": "Stop tracking before calibration."}
+        if self._calibrating:
+            return {"success": False, "error": "Calibration is already running."}
+        if not self.cfg.autozoom:
+            return {"success": False, "error": "Autozoom is disabled."}
+        self._calibrating = True
+        samples = []
+        try:
+            if not self._onvif_zoom.available and not await self._recover_onvif_once():
+                return {"success": False, "error": f"ONVIF absolute zoom unavailable: {self._onvif_zoom.last_error}"}
+            factors = [f for f in (1.0, 1.25, 1.5, 2.0, 2.5, 3.0) if self.cfg.zoom_min_factor <= f <= self.cfg.zoom_max_factor]
+            if self.cfg.zoom_min_factor not in factors:
+                factors.insert(0, self.cfg.zoom_min_factor)
+            if self.cfg.zoom_max_factor not in factors:
+                factors.append(self.cfg.zoom_max_factor)
+            for desired_factor in sorted(set(round(float(f), 3) for f in factors)):
+                normalized = self._zoom_map.estimate_normalized(desired_factor, self._camera_max_optical_zoom)
+                try:
+                    ok = await asyncio.wait_for(self._onvif_zoom.set_normalized(normalized), timeout=1.5)
+                except asyncio.TimeoutError:
+                    self._schedule_onvif_retry("ONVIF absolute zoom calibration command timed out")
+                    break
+                if not ok:
+                    self._schedule_onvif_retry(self._onvif_zoom.last_error)
+                    break
+                position = await self._wait_zoom_idle(self.cfg.ptz_operation_timeout)
+                if position is None:
+                    self._record_event("zoom_calibration_timeout", desired_factor=desired_factor, normalized=round(normalized, 6))
+                    continue
+                actual_factor = max(1.0, position[2] / max(0.001, self.cfg.zoom_wide_position))
+                self._zoom_map.record(actual_factor, normalized)
+                sample = {
+                    "desired_factor": desired_factor,
+                    "actual_factor": round(actual_factor, 3),
+                    "onvif_normalized": round(normalized, 6),
+                    "cgi_zoom_position": round(position[2], 3),
+                }
+                samples.append(sample)
+                self._record_event("zoom_calibration_sample", **sample)
+                await asyncio.sleep(0.15)
+            await self.home()
+            success = len(samples) >= 2
+            self._record_event("zoom_calibration_complete", success=success, samples=len(samples))
+            return {
+                "success": success,
+                "samples": samples,
+                "zoom_mapping": self._zoom_map.public_dict(),
+                "note": "Pan/tilt spatial response remains continuously self-calibrating during normal tracking.",
+            }
+        finally:
+            self._calibrating = False
 
     async def start(self) -> dict:
         self._session_generation += 1
@@ -1456,6 +1628,13 @@ class DogTracker:
                 "overshoots": self._quality_overshoots,
                 "undershoots": self._quality_undershoots,
                 "calibration": self._calibration.public_dict(),
+                "zoom_calibration": self._zoom_map.public_dict(),
+                "onvif_retry": self._onvif_retry.public_dict(now),
+                "acquisition_zones": self._acquisition_zones.public_dict(),
+                "motion_masks": self._motion_masks.public_dict(),
+                "scene_stability": self._scene_stability.public_dict(),
+                "velocity_geometry": self._last_velocity_geometry,
+                "calibrating": self._calibrating,
             },
             "counters": {
                 "total_inferences": self.total_inferences,
@@ -1963,6 +2142,18 @@ class DogTracker:
                 zoom_delta=None if zoom_delta is None else round(zoom_delta, 3),
                 zoom_noop=zoom_noop,
             )
+            if (
+                not zoom_noop
+                and zoom_after is not None
+                and self._zoom_operation_target_normalized is not None
+                and self._zoom_control_active == "onvif_absolute"
+            ):
+                actual_factor = max(1.0, zoom_after / max(0.001, self.cfg.zoom_wide_position))
+                self._zoom_map.record(actual_factor, self._zoom_operation_target_normalized)
+                event_fields.update(
+                    zoom_calibrated_factor=round(actual_factor, 3),
+                    onvif_normalized=round(self._zoom_operation_target_normalized, 6),
+                )
             if zoom_noop:
                 self._record_event(
                     "zoom_step_noop",
@@ -1976,6 +2167,8 @@ class DogTracker:
         )
         self._last_ptz_stopped_at = now
         self._sharpness_wait_logged = False
+        self._scene_stability.reset(now)
+        self._scene_stable_ready = False
 
         # PTZ movement itself must never count as target-loss time. Always restart
         # the loss clock when the camera finishes, even if YOLO briefly saw the
@@ -1999,6 +2192,8 @@ class DogTracker:
         self._loss_pause_logged = False
         self._pending_move_distance = None
         self._zoom_operation_start_position = None
+        self._zoom_operation_target_normalized = None
+        self._zoom_operation_target_factor = None
 
     async def _halt_tracking_for_ptz_failure(
         self,
@@ -2122,7 +2317,11 @@ class DogTracker:
             self._finish_ptz_operation(seq, polled_at, timed_out=False, status=status)
 
     def _ptz_action_ready(self, seq: int) -> bool:
-        return self._ptz_operation is None and seq >= self._post_motion_release_seq
+        return (
+            self._ptz_operation is None
+            and seq >= self._post_motion_release_seq
+            and self._scene_stable_ready
+        )
 
     async def _run(self) -> None:
         period = 1.0 / self.cfg.fps
@@ -2134,6 +2333,7 @@ class DogTracker:
                     await asyncio.sleep(next_tick - now)
                 next_tick = max(next_tick + period, time.monotonic())
 
+                self._maybe_start_onvif_recovery(time.monotonic())
                 if not self.active:
                     await asyncio.sleep(0.05)
                     continue
@@ -2233,11 +2433,29 @@ class DogTracker:
         # polls PTZ status before inference; tracking continues while the camera
         # moves, but no second PTZ command is allowed until it is truly idle.
         now = time.monotonic()
-        motion_active = self._ptz_operation is not None or self._hybrid_chase_active or seq < self._post_motion_release_seq
+        motion_active = (
+            self._ptz_operation is not None
+            or self._hybrid_chase_active
+            or seq < self._post_motion_release_seq
+            or not self._scene_stable_ready
+        )
+        motion_boxes = [d.bbox for d in detections] + self._motion_masks.boxes(frame.shape)
         self._camera_motion = self._smart_motion.update(
-            frame, [d.bbox for d in detections], active=motion_active, use_homography=self._ptz_operation == "zoom"
+            frame, motion_boxes, active=motion_active, use_homography=self._ptz_operation == "zoom"
         )
         self._update_frame_quality(frame, now)
+        if self._ptz_operation is None and not self._scene_stable_ready:
+            was_ready = self._scene_stable_ready
+            self._scene_stable_ready = self._scene_stability.observe(
+                now, self._camera_motion, self._frame_sharpness_ok, frame.shape
+            )
+            if self._scene_stable_ready and not was_ready:
+                self._record_event(
+                    "post_move_scene_stable",
+                    reason=self._scene_stability.last_reason,
+                    flow_norm=self._scene_stability.last_flow_norm,
+                    timed_out=self._scene_stability.timed_out,
+                )
 
         # Never acquire a new target while a home preset is still moving, or from
         # the first couple of frames that were already buffered before it settled.
@@ -2250,7 +2468,11 @@ class DogTracker:
             return
 
         if self.target is None:
-            candidates = [d for d in detections if d.confidence >= self.cfg.acquire_conf]
+            candidates = [
+                d for d in detections
+                if d.confidence >= self.cfg.acquire_conf
+                and self._acquisition_zones.allows(d.center, frame.shape)
+            ]
             if not candidates:
                 self.state = "HOME" if self._home_sent else "SEARCHING"
                 self._last_error_x = None
@@ -2279,6 +2501,8 @@ class DogTracker:
                 last_seen=now,
                 acquire_hits=1,
             )
+            self._bbox_motion.reset(chosen.bbox, now)
+            self._last_velocity_geometry = None
             self._smart_history.clear()
             self._smart_history.add(now, chosen.bbox, chosen.confidence, frame.shape)
             self.state = "ACQUIRE"
@@ -2317,12 +2541,33 @@ class DogTracker:
                 and self._velocity_rebase_required
                 and self._frame_sharpness_ok
             )
+            geometry_valid = True
+            if (
+                self._ptz_operation is None
+                and not self._hybrid_chase_active
+                and ptz_ready
+                and not self._velocity_rebase_required
+                and self._frame_sharpness_ok
+            ):
+                geometry = self._bbox_motion.validate(matched.bbox, now, frame.shape)
+                self._last_velocity_geometry = geometry.public_dict()
+                geometry_valid = geometry.valid
+                if not geometry_valid:
+                    self._record_event(
+                        "velocity_geometry_rejected",
+                        reason=geometry.reason,
+                        geometry=self._last_velocity_geometry,
+                    )
+            else:
+                self._bbox_motion.reset(matched.bbox, now)
+                self._last_velocity_geometry = None
             velocity_learning_allowed = (
                 self._ptz_operation is None
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
                 and self._frame_sharpness_ok
+                and geometry_valid
             )
             self.target.update(
                 matched,
@@ -2962,11 +3207,29 @@ class DogTracker:
         t0 = time.monotonic()
         zoom_control = "cgi_timed_fallback"
         ok = False
+        onvif_normalized = None
         if self._onvif_zoom.available:
-            ok = await self._onvif_zoom.set_factor(desired_factor, self._camera_max_optical_zoom)
+            onvif_normalized = self._zoom_map.estimate_normalized(
+                desired_factor, self._camera_max_optical_zoom
+            )
+            try:
+                ok = await asyncio.wait_for(
+                    self._onvif_zoom.set_normalized(onvif_normalized), timeout=1.5
+                )
+            except asyncio.TimeoutError:
+                self._schedule_onvif_retry("ONVIF absolute zoom command timed out")
+                self._record_event("zoom_step_deferred", direction=direction, reason="onvif_timeout")
+                return
             if ok:
                 zoom_control = "onvif_absolute"
+                self._onvif_retry.success()
+                self._zoom_operation_target_normalized = onvif_normalized
+                self._zoom_operation_target_factor = desired_factor
+            else:
+                self._schedule_onvif_retry(self._onvif_zoom.last_error)
         if not ok:
+            self._zoom_operation_target_normalized = None
+            self._zoom_operation_target_factor = None
             ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
         self._zoom_control_active = zoom_control
         t1 = time.monotonic()
@@ -2985,6 +3248,7 @@ class DogTracker:
                 direction=direction,
                 duration_ms=duration_ms,
                 control=zoom_control, desired_factor=round(desired_factor, 2),
+                onvif_normalized=None if onvif_normalized is None else round(onvif_normalized, 6),
                 smoothed_span=round(smoothed_span, 3), predicted_span=round(predicted_span, 3),
                 target_speed_norm=round(speed_norm, 4),
                 target_span=round(target_span, 3),

@@ -28,7 +28,9 @@ class SmartPtzIntegrationContracts(unittest.TestCase):
         self.assertIn('create_type("AbsoluteMove")', HELPER)
         self.assertIn("await self.ptz.AbsoluteMove(request)", HELPER)
         self.assertIn("if self._onvif_zoom.available", TRACKER)
-        self.assertIn("await self._onvif_zoom.set_factor", TRACKER)
+        self.assertIn("self._onvif_zoom.set_normalized", TRACKER)
+        self.assertIn("self._zoom_map.estimate_normalized", TRACKER)
+        self.assertIn("asyncio.wait_for", TRACKER)
         self.assertIn("await asyncio.to_thread(self.ptz.zoom_step", TRACKER)
 
     def test_zoom_uses_history_prediction_and_conservative_gates(self):

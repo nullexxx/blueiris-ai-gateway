@@ -120,6 +120,21 @@ services:
       TRACKER_ONVIF_PORT: "80"
       TRACKER_CAMERA_MAX_OPTICAL_ZOOM: "25.0"
       TRACKER_CALIBRATION_PATH: "/app/models/tracker_calibration.json"
+      TRACKER_ZOOM_CALIBRATION_PATH: "/app/models/tracker_zoom_calibration.json"
+      TRACKER_ONVIF_RETRY_BASE: "15.0"
+      TRACKER_ONVIF_RETRY_MAX: "300.0"
+
+      # Frigate-inspired acquisition/motion filtering. JSON polygon coordinates are normalized 0..1.
+      # Empty arrays preserve the existing behavior. These gates apply only to initial target acquisition.
+      TRACKER_ACQUIRE_ZONES_JSON: "[]"
+      TRACKER_IGNORE_ZONES_JSON: "[]"
+      TRACKER_MOTION_MASKS_JSON: "[]"
+
+      # Do not trust the first decoded frame just because the PTZ reports IDLE.
+      # Require sharp, low-global-motion frames, but release after a bounded timeout.
+      TRACKER_SCENE_STABLE_FRAMES: "2"
+      TRACKER_SCENE_STABLE_MAX_WAIT: "0.60"
+      TRACKER_SCENE_STABLE_FLOW: "0.012"
 
       # Target-loss / home behavior
       TRACKER_COAST_TIME: "0.20"

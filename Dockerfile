@@ -11,6 +11,7 @@ RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1
 COPY app.py /app/app.py
 COPY tracker.py /app/tracker.py
 COPY ptz_enhancements.py /app/ptz_enhancements.py
+COPY ptz_phase2.py /app/ptz_phase2.py
 
 EXPOSE 32168
 

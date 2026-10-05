@@ -492,15 +492,14 @@ class OnvifAbsoluteZoom:
                 pass
             return False
 
-    async def set_factor(self, factor: float, max_optical_zoom: float, speed: float = 1.0) -> bool:
+    async def set_normalized(self, normalized: float, speed: float = 1.0) -> bool:
+        """Move to an exact normalized point in the camera's advertised absolute zoom range."""
         if not self.available or self.ptz is None or self.profile_token is None:
             return False
         if self.zoom_min is None or self.zoom_max is None:
             return False
         try:
-            max_optical_zoom = max(1.01, float(max_optical_zoom))
-            factor = _bounded(float(factor), 1.0, max_optical_zoom)
-            normalized = (factor - 1.0) / (max_optical_zoom - 1.0)
+            normalized = _bounded(float(normalized), 0.0, 1.0)
             target = self.zoom_min + normalized * (self.zoom_max - self.zoom_min)
             request = self.ptz.create_type("AbsoluteMove")
             request.ProfileToken = self.profile_token
@@ -516,6 +515,12 @@ class OnvifAbsoluteZoom:
             if self.failures >= 2:
                 self.available = False
             return False
+
+    async def set_factor(self, factor: float, max_optical_zoom: float, speed: float = 1.0) -> bool:
+        max_optical_zoom = max(1.01, float(max_optical_zoom))
+        factor = _bounded(float(factor), 1.0, max_optical_zoom)
+        normalized = (factor - 1.0) / (max_optical_zoom - 1.0)
+        return await self.set_normalized(normalized, speed=speed)
 
     async def close(self) -> None:
         camera = self.camera

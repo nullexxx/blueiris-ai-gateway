@@ -1030,6 +1030,11 @@ async def tracker_camera_status():
     return await _require_tracker().camera_status()
 
 
+@app.post("/v1/tracker/calibrate")
+async def tracker_calibrate():
+    return await _require_tracker().calibrate()
+
+
 @app.get("/v1/tracker/history")
 async def tracker_history(limit: int = 200):
     return _require_tracker().history(limit=limit)
