@@ -9,6 +9,7 @@ on:
       - "tracker.py"
       - "ptz_enhancements.py"
       - "ptz_phase2.py"
+      - "ptz_active_calibration.py"
       - ".github/workflows/build.yml"
   workflow_dispatch: # Manual GHCR build from the GitHub web UI
   schedule:
