@@ -1,0 +1,24 @@
+ng": {"intercept": timing.get("intercept"), "slope": timing.get("slope"), "samples": len(samples) if isinstance(samples, list) else 0}, "spatial_response": camera.get("spatial_response", {})}\n',
+    'compact calibration',
+)
+
+# Runtime dependency and image contents.
+dockerfile = replace_once(dockerfile, 'RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt\n', 'RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt onvif-zeep-async\n', 'onvif dep')
+dockerfile = replace_once(dockerfile, 'COPY tracker.py /app/tracker.py\n', 'COPY tracker.py /app/tracker.py\nCOPY ptz_enhancements.py /app/ptz_enhancements.py\n', 'copy helper')
+
+# Only camera-specific transport/calibration values are exposed initially.
+compose = replace_once(
+    compose,
+    '      TRACKER_ZOOM_NOOP_EPSILON: "0.03"\n',
+    '      TRACKER_ZOOM_NOOP_EPSILON: "0.03"\n'
+    '      TRACKER_ZOOM_CONTROL_MODE: "auto"\n'
+    '      TRACKER_ONVIF_PORT: "80"\n'
+    '      TRACKER_CAMERA_MAX_OPTICAL_ZOOM: "25.0"\n'
+    '      TRACKER_CALIBRATION_PATH: "/app/models/tracker_calibration.json"\n',
+    'compose smart values',
+)
+
+tracker_path.write_text(tracker)
+dockerfile_path.write_text(dockerfile)
+compose_path.write_text(compose)
+helper_path.write_text(helper)
