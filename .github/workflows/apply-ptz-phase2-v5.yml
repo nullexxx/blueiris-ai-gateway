@@ -1,0 +1,107 @@
+name: Land validated PTZ phase 2 runtime
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/apply-ptz-phase2-v5.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Narrow ambiguous cleanup guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tools/apply_ptz_phase2.py')
+          s = p.read_text()
+          old = '''tracker = replace_once(\n    tracker,\n    ''' + "'''        self._zoom_operation_start_position = None\\n'''" + ''',\n    ''' + "'''        self._zoom_operation_start_position = None\\n        self._zoom_operation_target_normalized = None\\n        self._zoom_operation_target_factor = None\\n'''" + ''',\n    "clear zoom target calibration state",\n)'''
+          new = '''tracker = replace_once(\n    tracker,\n    ''' + "'''        self._pending_move_distance = None\\n        self._zoom_operation_start_position = None\\n'''" + ''',\n    ''' + "'''        self._pending_move_distance = None\\n        self._zoom_operation_start_position = None\\n        self._zoom_operation_target_normalized = None\\n        self._zoom_operation_target_factor = None\\n'''" + ''',\n    "clear zoom target calibration state",\n)'''
+          if old not in s:
+              raise SystemExit('target patch-script block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Apply guarded source patch
+        run: python tools/apply_ptz_phase2.py
+
+      - name: Apply final lifecycle hardening and semantic regression update
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('tracker.py')
+          s = p.read_text()
+
+          old = '''    def _schedule_onvif_retry(self, error: Optional[str]) -> None:\n        if not self._onvif_optional_enabled():\n            return\n        delay = self._onvif_retry.failure(time.monotonic(), error)\n'''
+          new = '''    def _schedule_onvif_retry(self, error: Optional[str]) -> None:\n        if not self._onvif_optional_enabled():\n            return\n        # Quarantine the optional ONVIF path immediately. Native CGI remains\n        # available while the scheduled capability re-probe runs in background.\n        self._onvif_zoom.available = False\n        delay = self._onvif_retry.failure(time.monotonic(), error)\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'ONVIF retry hardening marker count={s.count(old)}')
+          s = s.replace(old, new, 1)
+
+          old = '''        self._zoom_suppressed_until = 0.0\n        self._zoom_operation_start_position = None\n        self._ptz_operation = None\n'''
+          new = '''        self._zoom_suppressed_until = 0.0\n        self._zoom_operation_start_position = None\n        self._zoom_operation_target_normalized = None\n        self._zoom_operation_target_factor = None\n        self._ptz_operation = None\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'reset zoom target marker count={s.count(old)}')
+          s = s.replace(old, new, 1)
+
+          old = '''        try:\n            await self._onvif_zoom.close()\n        except Exception:\n            pass\n        self._calibration.flush(force=True)\n'''
+          new = '''        if self._onvif_recovery_task is not None and not self._onvif_recovery_task.done():\n            self._onvif_recovery_task.cancel()\n            try:\n                await self._onvif_recovery_task\n            except asyncio.CancelledError:\n                pass\n            self._onvif_recovery_task = None\n        try:\n            await self._onvif_zoom.close()\n        except Exception:\n            pass\n        self._calibration.flush(force=True)\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'shutdown recovery marker count={s.count(old)}')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('tests/test_ptz_enhancements_contracts.py')
+          s = p.read_text()
+          old = '        self.assertIn("await self._onvif_zoom.set_factor", TRACKER)\n'
+          new = (
+              '        self.assertIn("self._onvif_zoom.set_normalized", TRACKER)\n'
+              '        self.assertIn("self._zoom_map.estimate_normalized", TRACKER)\n'
+              '        self.assertIn("asyncio.wait_for", TRACKER)\n'
+          )
+          if s.count(old) != 1:
+              raise SystemExit(f'legacy exact-zoom assertion count={s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('tests/test_ptz_phase2_contracts.py')
+          s = p.read_text()
+          anchor = '        self.assertIn("cgi_timed_fallback", TRACKER)\n'
+          extra = (
+              '        self.assertIn("self._onvif_zoom.available = False", TRACKER)\n'
+              '        self.assertIn("self._onvif_recovery_task.cancel()", TRACKER)\n'
+          )
+          if s.count(anchor) != 1:
+              raise SystemExit(f'phase2 contract anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor, anchor + extra, 1))
+          PY
+
+      - name: Restore workflow files for permission-safe runtime commit
+        run: git checkout -- .github/workflows/build.yml .github/workflows/test.yml
+
+      - name: Compile all runtime Python
+        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Commit integrated runtime
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py tracker.py ptz_enhancements.py ptz_phase2.py Dockerfile docker-compose.example.yml README.md tests/test_ptz_enhancements_contracts.py tests/test_ptz_phase2_contracts.py
+          git commit -m "Add Frigate-inspired PTZ phase 2 controls"
+          git push origin HEAD:main
