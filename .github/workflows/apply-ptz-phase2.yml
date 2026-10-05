@@ -1,0 +1,41 @@
+name: Apply PTZ phase 2 integration
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "tools/apply_ptz_phase2.py"
+      - ".github/workflows/apply-ptz-phase2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply guarded source patch
+        run: python tools/apply_ptz_phase2.py
+      - name: Compile all runtime Python
+        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Commit integrated controller
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py tracker.py ptz_enhancements.py ptz_phase2.py Dockerfile docker-compose.example.yml README.md .github/workflows/build.yml .github/workflows/test.yml tests/test_ptz_phase2_contracts.py
+          git commit -m "Add Frigate-inspired PTZ phase 2 controls"
+          git push origin HEAD:main
