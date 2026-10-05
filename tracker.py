@@ -174,17 +174,25 @@ class TrackerConfig:
     ptz_operation_timeout: float = 4.0
     post_move_frames: int = 1
 
-    # Bounded, deliberately conservative auto-zoom. Camera reports 5.12 at
-    # full-wide and 128 at full-tele (25x). Default auto-tracking ceiling is 6x.
+    # Evidence-gated auto-zoom. Zoom-in is intentionally rare: the subject
+    # must be genuinely small, confidently detected, close to center, and remain
+    # eligible for several consecutive observations. Zoom-out is deliberately
+    # easier so the tracker can recover context quickly.
     autozoom: bool = True
     zoom_wide_position: float = 5.12
     zoom_min_factor: float = 1.0
-    zoom_max_factor: float = 6.0
-    zoom_target_min: float = 0.18
+    zoom_max_factor: float = 3.0
+    zoom_target_min: float = 0.12
     zoom_target_max: float = 0.42
+    zoom_in_min_conf: float = 0.65
+    zoom_in_confirm_frames: int = 8
+    zoom_in_max_error: float = 0.18
     zoom_in_step_ms: int = 90
     zoom_out_step_ms: int = 140
-    zoom_cooldown: float = 1.0
+    zoom_cooldown: float = 3.0
+    zoom_out_cooldown: float = 0.75
+    zoom_noop_backoff: float = 5.0
+    zoom_noop_epsilon: float = 0.03
 
     coast_time: float = 0.20
     reacquire_time: float = 1.25
@@ -275,12 +283,18 @@ class TrackerConfig:
             autozoom=_env_bool("TRACKER_AUTOZOOM", True),
             zoom_wide_position=_env_float("TRACKER_ZOOM_WIDE_POSITION", 5.12),
             zoom_min_factor=_env_float("TRACKER_ZOOM_MIN_FACTOR", 1.0),
-            zoom_max_factor=_env_float("TRACKER_ZOOM_MAX_FACTOR", 6.0),
-            zoom_target_min=_env_float("TRACKER_ZOOM_TARGET_MIN", 0.18),
+            zoom_max_factor=_env_float("TRACKER_ZOOM_MAX_FACTOR", 3.0),
+            zoom_target_min=_env_float("TRACKER_ZOOM_TARGET_MIN", 0.12),
             zoom_target_max=_env_float("TRACKER_ZOOM_TARGET_MAX", 0.42),
+            zoom_in_min_conf=_env_float("TRACKER_ZOOM_IN_MIN_CONF", 0.65),
+            zoom_in_confirm_frames=_env_int("TRACKER_ZOOM_IN_CONFIRM_FRAMES", 8),
+            zoom_in_max_error=_env_float("TRACKER_ZOOM_IN_MAX_ERROR", 0.18),
             zoom_in_step_ms=_env_int("TRACKER_ZOOM_IN_STEP_MS", 90),
             zoom_out_step_ms=_env_int("TRACKER_ZOOM_OUT_STEP_MS", 140),
-            zoom_cooldown=_env_float("TRACKER_ZOOM_COOLDOWN", 1.0),
+            zoom_cooldown=_env_float("TRACKER_ZOOM_COOLDOWN", 3.0),
+            zoom_out_cooldown=_env_float("TRACKER_ZOOM_OUT_COOLDOWN", 0.75),
+            zoom_noop_backoff=_env_float("TRACKER_ZOOM_NOOP_BACKOFF", 5.0),
+            zoom_noop_epsilon=_env_float("TRACKER_ZOOM_NOOP_EPSILON", 0.03),
             coast_time=_env_float("TRACKER_COAST_TIME", 0.20),
             reacquire_time=_env_float("TRACKER_REACQUIRE_TIME", 1.25),
             home_timeout=_env_float("TRACKER_HOME_TIMEOUT", 3.0),
@@ -351,9 +365,15 @@ class TrackerConfig:
         cfg.zoom_max_factor = max(cfg.zoom_min_factor, min(25.0, cfg.zoom_max_factor))
         cfg.zoom_target_min = max(0.03, min(0.80, cfg.zoom_target_min))
         cfg.zoom_target_max = max(cfg.zoom_target_min + 0.02, min(0.95, cfg.zoom_target_max))
+        cfg.zoom_in_min_conf = max(cfg.hold_conf, min(0.99, cfg.zoom_in_min_conf))
+        cfg.zoom_in_confirm_frames = max(1, min(60, cfg.zoom_in_confirm_frames))
+        cfg.zoom_in_max_error = max(0.02, min(0.50, cfg.zoom_in_max_error))
         cfg.zoom_in_step_ms = max(30, min(500, cfg.zoom_in_step_ms))
         cfg.zoom_out_step_ms = max(30, min(700, cfg.zoom_out_step_ms))
-        cfg.zoom_cooldown = max(0.25, min(10.0, cfg.zoom_cooldown))
+        cfg.zoom_cooldown = max(0.25, min(30.0, cfg.zoom_cooldown))
+        cfg.zoom_out_cooldown = max(0.10, min(10.0, cfg.zoom_out_cooldown))
+        cfg.zoom_noop_backoff = max(0.5, min(30.0, cfg.zoom_noop_backoff))
+        cfg.zoom_noop_epsilon = max(0.001, min(1.0, cfg.zoom_noop_epsilon))
 
         cfg.coast_time = max(0.0, min(2.0, cfg.coast_time))
         cfg.reacquire_time = max(cfg.coast_time, min(10.0, cfg.reacquire_time))
@@ -465,9 +485,15 @@ class TrackerConfig:
             "zoom_max_position": round(self.zoom_max_position, 3),
             "zoom_target_min": self.zoom_target_min,
             "zoom_target_max": self.zoom_target_max,
+            "zoom_in_min_conf": self.zoom_in_min_conf,
+            "zoom_in_confirm_frames": self.zoom_in_confirm_frames,
+            "zoom_in_max_error": self.zoom_in_max_error,
             "zoom_in_step_ms": self.zoom_in_step_ms,
             "zoom_out_step_ms": self.zoom_out_step_ms,
             "zoom_cooldown": self.zoom_cooldown,
+            "zoom_out_cooldown": self.zoom_out_cooldown,
+            "zoom_noop_backoff": self.zoom_noop_backoff,
+            "zoom_noop_epsilon": self.zoom_noop_epsilon,
             "coast_time": self.coast_time,
             "reacquire_time": self.reacquire_time,
             "home_timeout": self.home_timeout,
@@ -946,6 +972,10 @@ class DogTracker:
         self._last_target_span: Optional[float] = None
         self._last_zoom_position: Optional[float] = None
         self._last_zoom_command_at = 0.0
+        self._zoom_in_candidate_frames = 0
+        self._zoom_in_candidate_last_at = 0.0
+        self._zoom_suppressed_until = 0.0
+        self._zoom_operation_start_position: Optional[float] = None
 
         # One native camera operation may be in flight at a time.  We do not
         # guess when it is finished: getStatus is polled until the relevant
@@ -1100,6 +1130,10 @@ class DogTracker:
         self._last_move_point = None
         self._last_zoom_position = None
         self._last_zoom_command_at = 0.0
+        self._zoom_in_candidate_frames = 0
+        self._zoom_in_candidate_last_at = 0.0
+        self._zoom_suppressed_until = 0.0
+        self._zoom_operation_start_position = None
         self._ptz_operation = None
         self._ptz_operation_started_at = 0.0
         self._ptz_operation_deadline = 0.0
@@ -1688,6 +1722,10 @@ class DogTracker:
         self._post_motion_release_seq = max(self._post_motion_release_seq, seq + 1)
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        # Any physical camera action breaks the run of stationary observations
+        # required before another zoom-in is allowed.
+        self._zoom_in_candidate_frames = 0
+        self._zoom_in_candidate_last_at = 0.0
         if self.target is not None:
             self.target.clear_velocity()
 
@@ -1722,6 +1760,23 @@ class DogTracker:
 
         elapsed_ms = int(max(0.0, now - self._ptz_operation_started_at) * 1000)
         move_distance = self._pending_move_distance if kind == "move" else None
+        zoom_before = self._zoom_operation_start_position if kind == "zoom" else None
+        zoom_after = position[2] if kind == "zoom" and position is not None else None
+        zoom_delta = (
+            None
+            if zoom_before is None or zoom_after is None
+            else zoom_after - zoom_before
+        )
+        zoom_noop = bool(
+            kind == "zoom"
+            and zoom_delta is not None
+            and abs(zoom_delta) <= self.cfg.zoom_noop_epsilon
+        )
+        if zoom_noop:
+            self._zoom_suppressed_until = max(
+                self._zoom_suppressed_until,
+                now + self.cfg.zoom_noop_backoff,
+            )
         if kind == "move" and not timed_out and move_distance is not None:
             self._update_move_timing_model(move_distance, elapsed_ms / 1000.0)
 
@@ -1743,6 +1798,20 @@ class DogTracker:
                 move_eta_intercept_s=round(self._move_eta_intercept, 3),
                 move_eta_slope_s_per_norm=round(self._move_eta_slope, 3),
             )
+        elif kind == "zoom":
+            event_fields.update(
+                zoom_before=None if zoom_before is None else round(zoom_before, 3),
+                zoom_after=None if zoom_after is None else round(zoom_after, 3),
+                zoom_delta=None if zoom_delta is None else round(zoom_delta, 3),
+                zoom_noop=zoom_noop,
+            )
+            if zoom_noop:
+                self._record_event(
+                    "zoom_step_noop",
+                    zoom_before=round(zoom_before, 3),
+                    zoom_after=round(zoom_after, 3),
+                    backoff_ms=int(self.cfg.zoom_noop_backoff * 1000),
+                )
         self._record_event(
             "ptz_operation_timeout" if timed_out else "ptz_operation_complete",
             **event_fields,
@@ -1769,6 +1838,7 @@ class DogTracker:
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
         self._pending_move_distance = None
+        self._zoom_operation_start_position = None
 
     async def _halt_tracking_for_ptz_failure(
         self,
@@ -2607,12 +2677,26 @@ class DogTracker:
                     )
             return
 
-        # Zoom is intentionally secondary to pan/tilt and happens only while the
-        # subject is already centered and no camera operation is in flight.
+        # Zoom is subordinate to tracking. Zoom-in is evidence-gated so the lens
+        # only moves when the current framing is clearly wasting useful pixels.
+        # Zoom-out stays intentionally easier so the camera can regain context.
         if not self.cfg.autozoom:
             return
-        if (now - self._last_zoom_command_at) < self.cfg.zoom_cooldown:
-            return
+
+        zoom_in_eligible = (
+            target_span < self.cfg.zoom_target_min
+            and self.target.confidence >= self.cfg.zoom_in_min_conf
+            and abs(err_x) <= self.cfg.zoom_in_max_error
+            and abs(err_y) <= self.cfg.zoom_in_max_error
+        )
+        if (now - self._zoom_in_candidate_last_at) > 0.20:
+            self._zoom_in_candidate_frames = 0
+        if zoom_in_eligible:
+            self._zoom_in_candidate_frames += 1
+            self._zoom_in_candidate_last_at = now
+        else:
+            self._zoom_in_candidate_frames = 0
+            self._zoom_in_candidate_last_at = 0.0
 
         if self._last_zoom_position is None:
             status = await asyncio.to_thread(self.ptz.get_status)
@@ -2633,26 +2717,37 @@ class DogTracker:
         if self._last_zoom_position is None:
             return
 
+        since_zoom = now - self._last_zoom_command_at
         direction: Optional[str] = None
         duration_ms = 0
         zoom_in_guard = max(0.50, self.cfg.zoom_max_position * 0.05)
 
-        # If a timed zoom step ever lands beyond a configured bound, correct it
-        # before making any target-size-based decision.
-        if self._last_zoom_position > (self.cfg.zoom_max_position + 0.05):
+        # Bounds and context recovery take precedence over target-size zoom-in.
+        if (
+            self._last_zoom_position > (self.cfg.zoom_max_position + 0.05)
+            and since_zoom >= self.cfg.zoom_out_cooldown
+        ):
             direction = "out"
             duration_ms = self.cfg.zoom_out_step_ms
-        elif self._last_zoom_position < (self.cfg.zoom_min_position - 0.05):
+        elif (
+            self._last_zoom_position < (self.cfg.zoom_min_position - 0.05)
+            and since_zoom >= self.cfg.zoom_cooldown
+            and now >= self._zoom_suppressed_until
+        ):
             direction = "in"
             duration_ms = self.cfg.zoom_in_step_ms
         elif (
-            target_span < self.cfg.zoom_target_min
+            self._zoom_in_candidate_frames >= self.cfg.zoom_in_confirm_frames
+            and target_span < self.cfg.zoom_target_min
+            and since_zoom >= self.cfg.zoom_cooldown
+            and now >= self._zoom_suppressed_until
             and self._last_zoom_position < (self.cfg.zoom_max_position - zoom_in_guard)
         ):
             direction = "in"
             duration_ms = self.cfg.zoom_in_step_ms
         elif (
             target_span > self.cfg.zoom_target_max
+            and since_zoom >= self.cfg.zoom_out_cooldown
             and self._last_zoom_position > (self.cfg.zoom_min_position + 0.25)
         ):
             direction = "out"
@@ -2662,6 +2757,10 @@ class DogTracker:
             return
 
         before = self._last_zoom_position
+        if direction == "in":
+            self._zoom_in_candidate_frames = 0
+            self._zoom_in_candidate_last_at = 0.0
+        self._zoom_operation_start_position = before
         t0 = time.monotonic()
         ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
         t1 = time.monotonic()
@@ -2680,12 +2779,14 @@ class DogTracker:
                 direction=direction,
                 duration_ms=duration_ms,
                 target_span=round(target_span, 3),
+                confidence=round(self.target.confidence, 3),
                 zoom_before=round(before, 3),
                 min_position=round(self.cfg.zoom_min_position, 3),
                 max_position=round(self.cfg.zoom_max_position, 3),
                 http_ms=int((t1 - t0) * 1000),
             )
         else:
+            self._zoom_operation_start_position = None
             self._record_event("zoom_step_failed", direction=direction, error=self.ptz.last_error)
 
     def _render_debug_frame(

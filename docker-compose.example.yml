@@ -100,16 +100,22 @@ services:
       TRACKER_MOVE_FAILURE_BACKOFF_MAX: "1.0"
       TRACKER_MOVE_FAILURE_STOP_AFTER: "5"
 
-      # Conservative bounded auto-zoom
+      # Evidence-gated auto-zoom: prefer stable framing over lens activity.
       TRACKER_AUTOZOOM: "true"
       TRACKER_ZOOM_WIDE_POSITION: "5.12"
       TRACKER_ZOOM_MIN_FACTOR: "1.0"
-      TRACKER_ZOOM_MAX_FACTOR: "6.0"
-      TRACKER_ZOOM_TARGET_MIN: "0.18"
+      TRACKER_ZOOM_MAX_FACTOR: "3.0"
+      TRACKER_ZOOM_TARGET_MIN: "0.12"
       TRACKER_ZOOM_TARGET_MAX: "0.42"
+      TRACKER_ZOOM_IN_MIN_CONF: "0.65"
+      TRACKER_ZOOM_IN_CONFIRM_FRAMES: "8"
+      TRACKER_ZOOM_IN_MAX_ERROR: "0.18"
       TRACKER_ZOOM_IN_STEP_MS: "90"
       TRACKER_ZOOM_OUT_STEP_MS: "140"
-      TRACKER_ZOOM_COOLDOWN: "1.0"
+      TRACKER_ZOOM_COOLDOWN: "3.0"
+      TRACKER_ZOOM_OUT_COOLDOWN: "0.75"
+      TRACKER_ZOOM_NOOP_BACKOFF: "5.0"
+      TRACKER_ZOOM_NOOP_EPSILON: "0.03"
 
       # Target-loss / home behavior
       TRACKER_COAST_TIME: "0.20"

@@ -18,7 +18,7 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 - **Bounded predictive lead** based only on stationary-camera target motion.
 - **Adaptive `moveDirectly` lead** learned from completed camera moves, with bounded one-shot edge rescue.
 - **Hybrid escape chase** that uses continuous PTZ only when a fast target is in genuine danger of leaving the frame.
-- **Conservative auto-zoom** with configurable minimum/maximum optical zoom bounds.
+- **Evidence-gated conservative auto-zoom** that requires a small, confident, centered target across multiple observations before zooming in.
 - **GitHub Actions -> GHCR** builds on pushes to `main`.
 
 ## Container Image
@@ -223,7 +223,7 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TRACKER_PTZ_STATUS_POLL_INTERVAL` | `0.12` | Seconds between camera PTZ status polls. Example Compose uses `0.06`. |
+| `TRACKER_PTZ_STATUS_POLL_INTERVAL` | `0.12` | Seconds between camera PTZ status polls. |
 | `TRACKER_PTZ_OPERATION_TIMEOUT` | `4.0` | Hard timeout for the latest physical PTZ destination. |
 | `TRACKER_POST_MOVE_FRAMES` | `1` | Fresh frames required after PTZ completion before another action. |
 | `TRACKER_PTZ_HTTP_TIMEOUT` | `0.75` | HTTP timeout for camera CGI requests. |
@@ -235,12 +235,18 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 | `TRACKER_AUTOZOOM` | `true` | Enable bounded auto-zoom. |
 | `TRACKER_ZOOM_WIDE_POSITION` | `5.12` | Camera-reported full-wide zoom position used by the current calibration. |
 | `TRACKER_ZOOM_MIN_FACTOR` | `1.0` | Minimum tracking zoom factor. |
-| `TRACKER_ZOOM_MAX_FACTOR` | `6.0` | Maximum tracking zoom factor. |
-| `TRACKER_ZOOM_TARGET_MIN` | `0.18` | Zoom in when a centered target is smaller than this span. |
-| `TRACKER_ZOOM_TARGET_MAX` | `0.42` | Zoom out when a centered target is larger than this span. |
+| `TRACKER_ZOOM_MAX_FACTOR` | `3.0` | Maximum tracking zoom factor; deliberately capped to preserve context. |
+| `TRACKER_ZOOM_TARGET_MIN` | `0.12` | A target must be smaller than this span before zoom-in can even qualify. |
+| `TRACKER_ZOOM_TARGET_MAX` | `0.42` | Zoom out when the target is larger than this span. |
+| `TRACKER_ZOOM_IN_MIN_CONF` | `0.65` | Minimum confidence required for zoom-in. |
+| `TRACKER_ZOOM_IN_CONFIRM_FRAMES` | `8` | Consecutive qualifying observations required before zoom-in. |
+| `TRACKER_ZOOM_IN_MAX_ERROR` | `0.18` | Maximum normalized center error per axis allowed for zoom-in. |
 | `TRACKER_ZOOM_IN_STEP_MS` | `90` | Timed zoom-in pulse length. |
 | `TRACKER_ZOOM_OUT_STEP_MS` | `140` | Timed zoom-out pulse length. |
-| `TRACKER_ZOOM_COOLDOWN` | `1.0` | Minimum seconds between zoom commands. |
+| `TRACKER_ZOOM_COOLDOWN` | `3.0` | Minimum seconds between zoom-in commands. |
+| `TRACKER_ZOOM_OUT_COOLDOWN` | `0.75` | Faster cooldown for zoom-out/context recovery. |
+| `TRACKER_ZOOM_NOOP_BACKOFF` | `5.0` | Suppress further zoom-in after a completed zoom pulse that changed no reported zoom position. |
+| `TRACKER_ZOOM_NOOP_EPSILON` | `0.03` | Maximum reported zoom-position delta treated as a no-op. |
 | `TRACKER_COAST_TIME` | `0.20` | Short detector-miss coast interval. |
 | `TRACKER_REACQUIRE_TIME` | `1.25` | Reacquisition interval before target is considered lost. |
 | `TRACKER_HOME_TIMEOUT` | `3.0` | Lost duration before releasing target / returning home. |

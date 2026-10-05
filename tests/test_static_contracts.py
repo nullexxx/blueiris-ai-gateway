@@ -64,6 +64,21 @@ class StaticContracts(unittest.TestCase):
         self.assertGreaterEqual(poll.count("if not self._session_valid(generation):"), 3)
         self.assertIn('TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.12"', compose)
 
+    def test_conservative_zoom_policy(self):
+        tracker = (ROOT / "tracker.py").read_text()
+        compose = (ROOT / "docker-compose.example.yml").read_text()
+        self.assertIn('zoom_max_factor: float = 3.0', tracker)
+        self.assertIn('zoom_target_min: float = 0.12', tracker)
+        self.assertIn('TRACKER_ZOOM_IN_MIN_CONF', tracker)
+        self.assertIn('TRACKER_ZOOM_IN_CONFIRM_FRAMES', tracker)
+        self.assertIn('TRACKER_ZOOM_IN_MAX_ERROR', tracker)
+        self.assertIn('zoom_step_noop', tracker)
+        self.assertIn('_zoom_suppressed_until', tracker)
+        self.assertIn('TRACKER_ZOOM_MAX_FACTOR: "3.0"', compose)
+        self.assertIn('TRACKER_ZOOM_TARGET_MIN: "0.12"', compose)
+        self.assertIn('TRACKER_ZOOM_COOLDOWN: "3.0"', compose)
+        self.assertIn('TRACKER_ZOOM_NOOP_BACKOFF: "5.0"', compose)
+
     def test_face_and_debug_optimizations(self):
         app = (ROOT / "app.py").read_text()
         tracker = (ROOT / "tracker.py").read_text()
