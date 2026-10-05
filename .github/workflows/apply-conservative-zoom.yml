@@ -1,0 +1,36 @@
+name: Apply conservative zoom hardening
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - .github/workflows/apply-conservative-zoom.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Apply conservative zoom policy
+        run: python3 tools/apply_conservative_zoom.py
+
+      - name: Validate Python and contracts
+        run: |
+          python3 -m py_compile app.py tracker.py
+          python3 -m unittest discover -s tests -v
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tracker.py docker-compose.example.yml README.md tests/test_static_contracts.py
+          git diff --cached --check
+          git commit -m "Make PTZ auto-zoom evidence-gated"
+          git push origin HEAD:main
