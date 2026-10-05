@@ -16,7 +16,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install PTZ calibration test dependencies
+        run: pip install numpy opencv-python-headless
       - name: Compile Python sources
-        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py
+        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py ptz_active_calibration.py
       - name: Run static contract tests
         run: python -m unittest discover -s tests -v
