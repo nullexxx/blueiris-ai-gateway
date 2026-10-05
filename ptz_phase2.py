@@ -357,28 +357,67 @@ class ZoomCalibrationMap:
         ratio = (factor - a[0]) / (b[0] - a[0])
         return _clamp(a[1] + ratio * (b[1] - a[1]), 0.0, 1.0)
 
+    def replace_points(self, rows: Sequence[Tuple[float, float]]) -> None:
+        """Atomically replace the learned map with a compact monotonic calibration.
+
+        Cameras often expose plateaus where several ONVIF positions report the same
+        physical zoom factor. Collapse those plateaus to one representative point.
+        Wide angle is special: if a measured 1x plateau includes normalized 0.0, keep
+        that true optical minimum instead of allowing later 1x observations to walk
+        the anchor upward.
+        """
+        cleaned: List[Tuple[float, float]] = []
+        for factor, normalized in rows:
+            try:
+                factor = max(1.0, float(factor))
+                normalized = _clamp(float(normalized), 0.0, 1.0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(factor) and math.isfinite(normalized):
+                cleaned.append((factor, normalized))
+        cleaned.sort(key=lambda row: (row[0], row[1]))
+
+        groups: List[List[Tuple[float, float]]] = []
+        for row in cleaned:
+            if not groups or abs(row[0] - groups[-1][-1][0]) > 0.04:
+                groups.append([row])
+            else:
+                groups[-1].append(row)
+
+        compact: List[Tuple[float, float]] = []
+        for group in groups:
+            factors = sorted(row[0] for row in group)
+            positions = sorted(row[1] for row in group)
+            midpoint = len(group) // 2
+            factor = factors[midpoint]
+            normalized = positions[midpoint]
+            if min(factors) <= 1.04 and min(positions) <= 0.005:
+                factor = 1.0
+                normalized = 0.0
+            if compact and normalized + 0.003 < compact[-1][1]:
+                continue
+            compact.append((factor, normalized))
+
+        self._camera()["zoom_mapping"] = [
+            [round(f, 5), round(n, 7)] for f, n in compact[-48:]
+        ]
+        self._flush()
+
     def record(self, actual_factor: float, normalized: float) -> None:
         actual_factor = max(1.0, float(actual_factor))
         normalized = _clamp(normalized, 0.0, 1.0)
         rows = self.points()
-        replaced = False
-        for index, (factor, _) in enumerate(rows):
-            if abs(factor - actual_factor) <= 0.04:
-                rows[index] = (actual_factor, normalized)
-                replaced = True
-                break
-        if not replaced:
+
+        # Never let the physical 1x plateau move the wide-angle anchor away from
+        # the ONVIF minimum. This is exactly what a Dahua camera with a zoom
+        # deadband can otherwise do during repeated observations.
+        if actual_factor <= 1.04:
+            rows.append((1.0, normalized))
+            if normalized <= 0.005 or any(f <= 1.04 and n <= 0.005 for f, n in rows):
+                rows.append((1.0, 0.0))
+        else:
             rows.append((actual_factor, normalized))
-        rows.sort()
-        # Keep a compact monotonic map. If noisy samples invert the ONVIF position,
-        # preserve the lower-position sample and drop the contradictory point.
-        monotonic: List[Tuple[float, float]] = []
-        for row in rows:
-            if monotonic and row[1] + 0.005 < monotonic[-1][1]:
-                continue
-            monotonic.append(row)
-        self._camera()["zoom_mapping"] = [[round(f, 5), round(n, 7)] for f, n in monotonic[-32:]]
-        self._flush()
+        self.replace_points(rows)
 
     def _flush(self) -> None:
         try:

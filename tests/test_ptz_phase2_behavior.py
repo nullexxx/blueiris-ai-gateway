@@ -93,6 +93,37 @@ class PtzPhase2Behavior(unittest.TestCase):
             self.assertEqual(len(reloaded.points()), 3)
             self.assertAlmostEqual(reloaded.estimate_normalized(2.5, 25.0), 0.20, places=6)
 
+    def test_zoom_calibration_wide_anchor_survives_deadband_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zoom.json"
+            mapping = ZoomCalibrationMap(str(path), "camera-a")
+            mapping.record(1.0, 0.0)
+            mapping.record(1.0, 0.010417)
+            mapping.record(1.0, 0.020833)
+            mapping.record(1.0, 0.041667)
+            points = mapping.points()
+            self.assertEqual(points[0], (1.0, 0.0))
+            self.assertAlmostEqual(mapping.estimate_normalized(1.0, 25.0), 0.0, places=6)
+
+    def test_zoom_calibration_replace_collapses_plateaus_monotonically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping = ZoomCalibrationMap(str(Path(tmp) / "zoom.json"), "camera-a")
+            mapping.replace_points([
+                (1.0, 0.0),
+                (1.0, 0.02),
+                (1.0, 0.04),
+                (1.5, 0.0625),
+                (2.0, 0.085),
+                (2.5, 0.105),
+                (3.1, 0.125),
+            ])
+            points = mapping.points()
+            self.assertEqual(points[0], (1.0, 0.0))
+            self.assertGreaterEqual(len(points), 5)
+            self.assertTrue(all(a[1] <= b[1] for a, b in zip(points, points[1:])))
+            self.assertGreater(mapping.estimate_normalized(2.0, 25.0), 0.06)
+            self.assertLess(mapping.estimate_normalized(2.0, 25.0), 0.11)
+
     def test_zoom_calibration_fallback_is_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             mapping = ZoomCalibrationMap(str(Path(tmp) / "zoom.json"), "camera-a")

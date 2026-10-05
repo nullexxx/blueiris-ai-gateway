@@ -1355,56 +1355,187 @@ class DogTracker:
         return None
 
     async def calibrate(self) -> dict:
-        """Manual, bounded zoom calibration. Pan/tilt response continues to learn passively."""
+        """Manual bounded zoom calibration using independent ONVIF probes.
+
+        The calibration sweep deliberately does not consult the existing learned
+        map. Each requested optical factor is bracketed using the physical Dahua
+        zoom position returned by getStatus, then the complete map is replaced
+        only after the sweep succeeds. This prevents calibration from learning
+        from its own partially-written results.
+        """
         if self.active:
             return {"success": False, "error": "Stop tracking before calibration."}
         if self._calibrating:
             return {"success": False, "error": "Calibration is already running."}
         if not self.cfg.autozoom:
             return {"success": False, "error": "Autozoom is disabled."}
+
         self._calibrating = True
-        samples = []
+        chosen_samples = []
+        probe_rows = {}
+
+        async def probe(normalized: float):
+            normalized = max(0.0, min(1.0, float(normalized)))
+            key = round(normalized, 6)
+            if key in probe_rows:
+                return probe_rows[key]
+            try:
+                ok = await asyncio.wait_for(self._onvif_zoom.set_normalized(normalized), timeout=1.5)
+            except asyncio.TimeoutError:
+                self._schedule_onvif_retry("ONVIF absolute zoom calibration command timed out")
+                return None
+            if not ok:
+                self._schedule_onvif_retry(self._onvif_zoom.last_error)
+                return None
+            position = await self._wait_zoom_idle(self.cfg.ptz_operation_timeout)
+            if position is None:
+                self._record_event(
+                    "zoom_calibration_probe_timeout",
+                    onvif_normalized=round(normalized, 6),
+                )
+                return None
+            actual_factor = max(1.0, position[2] / max(0.001, self.cfg.zoom_wide_position))
+            row = {
+                "actual_factor": float(actual_factor),
+                "onvif_normalized": float(normalized),
+                "cgi_zoom_position": float(position[2]),
+            }
+            probe_rows[key] = row
+            self._record_event(
+                "zoom_calibration_probe",
+                actual_factor=round(actual_factor, 3),
+                onvif_normalized=round(normalized, 6),
+                cgi_zoom_position=round(position[2], 3),
+            )
+            await asyncio.sleep(0.10)
+            return row
+
         try:
             if not self._onvif_zoom.available and not await self._recover_onvif_once():
-                return {"success": False, "error": f"ONVIF absolute zoom unavailable: {self._onvif_zoom.last_error}"}
-            factors = [f for f in (1.0, 1.25, 1.5, 2.0, 2.5, 3.0) if self.cfg.zoom_min_factor <= f <= self.cfg.zoom_max_factor]
-            if self.cfg.zoom_min_factor not in factors:
-                factors.insert(0, self.cfg.zoom_min_factor)
-            if self.cfg.zoom_max_factor not in factors:
-                factors.append(self.cfg.zoom_max_factor)
-            for desired_factor in sorted(set(round(float(f), 3) for f in factors)):
-                normalized = self._zoom_map.estimate_normalized(desired_factor, self._camera_max_optical_zoom)
-                try:
-                    ok = await asyncio.wait_for(self._onvif_zoom.set_normalized(normalized), timeout=1.5)
-                except asyncio.TimeoutError:
-                    self._schedule_onvif_retry("ONVIF absolute zoom calibration command timed out")
-                    break
-                if not ok:
-                    self._schedule_onvif_retry(self._onvif_zoom.last_error)
-                    break
-                position = await self._wait_zoom_idle(self.cfg.ptz_operation_timeout)
-                if position is None:
-                    self._record_event("zoom_calibration_timeout", desired_factor=desired_factor, normalized=round(normalized, 6))
-                    continue
-                actual_factor = max(1.0, position[2] / max(0.001, self.cfg.zoom_wide_position))
-                self._zoom_map.record(actual_factor, normalized)
-                sample = {
-                    "desired_factor": desired_factor,
-                    "actual_factor": round(actual_factor, 3),
-                    "onvif_normalized": round(normalized, 6),
-                    "cgi_zoom_position": round(position[2], 3),
+                return {
+                    "success": False,
+                    "error": f"ONVIF absolute zoom unavailable: {self._onvif_zoom.last_error}",
                 }
-                samples.append(sample)
-                self._record_event("zoom_calibration_sample", **sample)
-                await asyncio.sleep(0.15)
+
+            wide = await probe(0.0)
+            if wide is None:
+                return {"success": False, "error": "Unable to establish the ONVIF wide-angle anchor."}
+
+            target_factors = [
+                f for f in (1.25, 1.5, 2.0, 2.5, 3.0)
+                if self.cfg.zoom_min_factor < f <= self.cfg.zoom_max_factor + 1e-6
+            ]
+            if self.cfg.zoom_max_factor > self.cfg.zoom_min_factor and not target_factors:
+                target_factors = [self.cfg.zoom_max_factor]
+
+            for desired_factor in target_factors:
+                desired_factor = float(desired_factor)
+
+                # Expand outward until a physical zoom sample brackets the desired
+                # factor. Reuse all prior probes so later targets need few moves.
+                for _ in range(10):
+                    ordered = sorted(probe_rows.values(), key=lambda row: row["onvif_normalized"])
+                    upper = next(
+                        (row for row in ordered if row["actual_factor"] >= desired_factor),
+                        None,
+                    )
+                    if upper is not None:
+                        break
+                    last_norm = ordered[-1]["onvif_normalized"]
+                    if last_norm >= 0.999:
+                        break
+                    next_norm = 0.015 if last_norm <= 0.0001 else min(1.0, last_norm * 1.55 + 0.010)
+                    if await probe(next_norm) is None:
+                        break
+
+                ordered = sorted(probe_rows.values(), key=lambda row: row["onvif_normalized"])
+                lower_candidates = [row for row in ordered if row["actual_factor"] < desired_factor]
+                upper_candidates = [row for row in ordered if row["actual_factor"] >= desired_factor]
+                if not upper_candidates:
+                    self._record_event(
+                        "zoom_calibration_unreachable",
+                        desired_factor=round(desired_factor, 3),
+                        highest_actual_factor=round(max(row["actual_factor"] for row in ordered), 3),
+                    )
+                    continue
+
+                low = lower_candidates[-1] if lower_candidates else ordered[0]
+                high = upper_candidates[0]
+                low_norm = float(low["onvif_normalized"])
+                high_norm = float(high["onvif_normalized"])
+
+                # Refine the transition without assuming zoom is linear. Five
+                # iterations give sub-0.5% normalized-position resolution even for
+                # a fairly wide initial bracket. Plateaus/quantized Dahua zoom are
+                # expected; the nearest physically observed factor wins.
+                for _ in range(5):
+                    if (high_norm - low_norm) <= 0.0015:
+                        break
+                    mid = (low_norm + high_norm) / 2.0
+                    row = await probe(mid)
+                    if row is None:
+                        break
+                    if row["actual_factor"] < desired_factor:
+                        low_norm = mid
+                    else:
+                        high_norm = mid
+
+                candidates = list(probe_rows.values())
+                best = min(
+                    candidates,
+                    key=lambda row: (
+                        abs(row["actual_factor"] - desired_factor),
+                        abs(row["onvif_normalized"] - ((low_norm + high_norm) / 2.0)),
+                    ),
+                )
+                chosen = {
+                    "desired_factor": round(desired_factor, 3),
+                    "actual_factor": round(best["actual_factor"], 3),
+                    "onvif_normalized": round(best["onvif_normalized"], 6),
+                    "cgi_zoom_position": round(best["cgi_zoom_position"], 3),
+                }
+                chosen_samples.append(chosen)
+                self._record_event("zoom_calibration_target", **chosen)
+
+            physical_points = [
+                (row["actual_factor"], row["onvif_normalized"])
+                for row in probe_rows.values()
+                if row["actual_factor"] <= (self.cfg.zoom_max_factor * 1.20 + 0.10)
+            ]
+            # Explicitly preserve the measured wide-angle minimum.
+            physical_points.append((1.0, 0.0))
+
+            # Require at least two distinct physical zoom factors before replacing
+            # an existing map. A failed/flat sweep must never destroy known data.
+            distinct = []
+            for factor, _ in sorted(physical_points):
+                if not distinct or abs(factor - distinct[-1]) > 0.04:
+                    distinct.append(factor)
+            success = len(distinct) >= 2
+            if success:
+                self._zoom_map.replace_points(physical_points)
+
             await self.home()
-            success = len(samples) >= 2
-            self._record_event("zoom_calibration_complete", success=success, samples=len(samples))
+            self._record_event(
+                "zoom_calibration_complete",
+                success=success,
+                targets=len(chosen_samples),
+                probes=len(probe_rows),
+            )
             return {
                 "success": success,
-                "samples": samples,
+                "samples": chosen_samples,
+                "probe_count": len(probe_rows),
+                "probes": [
+                    {
+                        "actual_factor": round(row["actual_factor"], 3),
+                        "onvif_normalized": round(row["onvif_normalized"], 6),
+                        "cgi_zoom_position": round(row["cgi_zoom_position"], 3),
+                    }
+                    for row in sorted(probe_rows.values(), key=lambda item: item["onvif_normalized"])
+                ],
                 "zoom_mapping": self._zoom_map.public_dict(),
-                "note": "Pan/tilt spatial response remains continuously self-calibrating during normal tracking.",
+                "note": "Calibration probes are independent of the existing map; pan/tilt response remains continuously self-calibrating during normal tracking.",
             }
         finally:
             self._calibrating = False
