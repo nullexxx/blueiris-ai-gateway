@@ -7,8 +7,9 @@ on:
       - "Dockerfile"
       - "app.py"
       - "tracker.py"
+      - "ptz_enhancements.py"
       - ".github/workflows/build.yml"
-  workflow_dispatch: # Manual GHCR build from the GitHub web UI (hybrid direction fix ready)
+  workflow_dispatch: # Manual GHCR build from the GitHub web UI
   schedule:
     - cron: '0 4 * * 0' # Rebuild every Sunday at 4:00 AM UTC
 
