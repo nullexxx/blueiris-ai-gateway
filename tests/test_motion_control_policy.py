@@ -43,26 +43,44 @@ class MotionControlPolicyTests(unittest.TestCase):
             motion_speed_norm=0.03,
             min_sample_ms=250,
             deadline_travel_norm=0.18,
+            stationary_speed_norm=0.012,
+            moving_error=0.35,
         )
         values.update(overrides)
         return load_motion_policy()(**values)
 
-    def test_mature_fast_target_uses_continuous_before_edge(self):
-        decision = self.call_policy()
+    def test_mature_moving_target_uses_continuous_before_edge(self):
+        decision = self.call_policy(err_x=0.40)
         self.assertTrue(decision["use_continuous"])
-        self.assertTrue(decision["velocity_mature"])
+        self.assertTrue(decision["moving_target"])
+        self.assertFalse(decision["precision_move_allowed"])
         self.assertIn(decision["reason"], {"deadline_motion", "motion_escape"})
-        self.assertGreater(decision["projected_travel_norm"], 0.18)
 
-    def test_immature_velocity_does_not_drive_deadline_handoff(self):
+    def test_moving_target_inside_entry_region_holds_instead_of_move_direct(self):
+        decision = self.call_policy(err_x=0.25, vx=35.0)
+        self.assertFalse(decision["use_continuous"])
+        self.assertTrue(decision["moving_target"])
+        self.assertFalse(decision["precision_move_allowed"])
+        self.assertEqual(decision["precision_hold_reason"], "moving_target")
+
+    def test_stationary_mature_target_allows_precision_move(self):
+        decision = self.call_policy(err_x=0.30, vx=2.0)
+        self.assertFalse(decision["use_continuous"])
+        self.assertFalse(decision["moving_target"])
+        self.assertTrue(decision["precision_move_allowed"])
+        self.assertIsNone(decision["precision_hold_reason"])
+
+    def test_immature_velocity_waits_before_precision_move(self):
         decision = self.call_policy(velocity_sample_ms=120)
         self.assertFalse(decision["velocity_mature"])
-        self.assertFalse(decision["use_continuous"])
+        self.assertFalse(decision["precision_move_allowed"])
+        self.assertEqual(decision["precision_hold_reason"], "velocity_sample")
 
     def test_inward_motion_does_not_start_continuous_chase(self):
         decision = self.call_policy(vx=-100.0)
         self.assertTrue(decision["moving_inward_dominant"])
         self.assertFalse(decision["use_continuous"])
+        self.assertFalse(decision["precision_move_allowed"])
 
     def test_hard_escape_can_chase_without_velocity(self):
         decision = self.call_policy(
@@ -74,9 +92,10 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertTrue(decision["use_continuous"])
         self.assertEqual(decision["reason"], "hard_escape")
 
-    def test_global_disable_is_authoritative(self):
-        decision = self.call_policy(hybrid_enabled=False)
+    def test_hybrid_disabled_preserves_move_direct_fallback(self):
+        decision = self.call_policy(hybrid_enabled=False, velocity_sample_ms=0)
         self.assertFalse(decision["use_continuous"])
+        self.assertTrue(decision["precision_move_allowed"])
 
     def test_live_target_quality_no_longer_mutates_spatial_calibration(self):
         start = TRACKER.index("    def _complete_move_quality")
@@ -85,17 +104,22 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertNotIn("set_spatial_scales", block)
         self.assertIn("Live-target telemetry is observational only", block)
 
-    def test_velocity_maturity_and_lead_are_bounded(self):
-        self.assertIn(
-            "max(self.cfg.velocity_min_sample_ms, self._motion_control_min_sample_ms)",
-            TRACKER,
-        )
-        self.assertIn(
-            "lead_horizon_s = min(predicted_move_eta_s, self._move_direct_lead_horizon_max)",
-            TRACKER,
-        )
-        self.assertIn("max_lead_x = w * self._move_direct_lead_max_fraction", TRACKER)
-        self.assertIn("controller_revision", TRACKER)
+    def test_rev3_precision_contracts_are_present(self):
+        self.assertIn('"controller_revision": 3', TRACKER)
+        self.assertIn('"continuous_moving_precision_stationary"', TRACKER)
+        self.assertIn('"adaptive_hybrid_current_center"', TRACKER)
+        self.assertIn("self._precision_hold_until", TRACKER)
+        self.assertIn("hybrid_chase_confidence_grace", TRACKER)
+        self.assertIn("scale = max(1.0", TRACKER)
+        self.assertIn("precision_move_deferred", TRACKER)
+
+    def test_continuous_exit_is_inside_old_escape_exit(self):
+        self.assertIn("TRACKER_MOTION_CONTROL_CONTINUOUS_EXIT_ERROR", TRACKER)
+        self.assertIn("self._motion_control_continuous_exit_error", TRACKER)
+        start = TRACKER.index("    async def _drive_hybrid_chase")
+        end = TRACKER.index("    def _begin_ptz_operation", start)
+        block = TRACKER[start:end]
+        self.assertIn("<= self._motion_control_continuous_exit_error", block)
 
 
 if __name__ == "__main__":
