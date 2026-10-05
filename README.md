@@ -148,6 +148,15 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | --- | --- | --- |
 | `TRACKER_ENABLED` | `false` | Enable tracker service. |
 | `TRACKER_AUTOSTART` | `false` | Start tracking automatically when the app starts. |
+| `TRACKER_CALIBRATE_ON_START` | `if_missing` | Startup calibration policy: `off`, `if_missing`, `if_stale`, or `always`. Full calibration moves the camera before autotracking begins. |
+| `TRACKER_CALIBRATION_SCOPE` | `all` | Startup/manual active calibration scope: `zoom`, `movedirectly`, `continuous`, `motion`, `onvif`, or `all`. |
+| `TRACKER_ACTIVE_CALIBRATION_PATH` | `/app/models/tracker_ptz_active_calibration.json` | Persistent native/ONVIF motion-response calibration. |
+| `TRACKER_CALIBRATION_MAX_AGE_DAYS` | `30` | Age threshold used by the `if_stale` startup policy. |
+| `TRACKER_CALIBRATION_ZOOM_LEVELS` | `1.0,1.75,2.25,3.0` | Optical zoom factors sampled by active pan/tilt calibration. |
+| `TRACKER_CALIBRATION_OFFSETS` | `0.18,0.35` | Normalized moveDirectly offsets used to learn response and timing. |
+| `TRACKER_CALIBRATION_CONTINUOUS_SPEEDS` | `1,3,6` | Native continuous PTZ speeds sampled during calibration. |
+| `TRACKER_CALIBRATION_CONTINUOUS_DURATION` | `0.22` | Seconds each bounded continuous test pulse runs. |
+| `TRACKER_CALIBRATION_ONVIF_BENCHMARK` | `true` | Probe ONVIF PTZ spaces and benchmark a tiny FOV-relative move when supported. |
 | `TRACKER_CAMERA_IP` | blank | PTZ camera IP or hostname. |
 | `TRACKER_CAMERA_USER` | `admin` | Camera username. |
 | `TRACKER_CAMERA_PASSWORD` | blank | Camera password. Prefer `.env`; do not commit it. |
@@ -298,3 +307,10 @@ GitHub Actions builds `latest` and a commit-SHA-tagged image on every push to `m
 ### Additional tracker reliability notes
 
 The RTSP reader uses OpenCV/FFmpeg open and read timeouts (`TRACKER_RTSP_OPEN_TIMEOUT` / `TRACKER_RTSP_READ_TIMEOUT`) so a stalled stream can reconnect instead of blocking forever. Debug JPEGs are rendered only when `/v1/tracker/debug.jpg` is requested. Tracker sessions use a generation token so results from inference or PTZ calls that complete after `/stop` or `/home` are discarded. Lost-target home commands are retried a bounded number of times (`TRACKER_HOME_RETRY_ATTEMPTS`, `TRACKER_HOME_RETRY_DELAY`). Hybrid chase disables itself for the remainder of the session if tracking error grows materially for several consecutive frames, then falls back to normal `moveDirectly`.
+
+
+### PTZ active calibration
+
+`POST /v1/tracker/calibrate?mode=all` now calibrates the optical zoom map, native Dahua `moveDirectly` response/timing, native continuous pan/tilt speed response, and ONVIF pan/tilt capabilities. The motion calibration always runs with tracking stopped, repeatedly returns to the configured home preset, uses settled video frames to measure actual scene displacement, and returns home before releasing the camera.
+
+With `TRACKER_AUTOSTART=true` and the default `TRACKER_CALIBRATE_ON_START=if_missing`, the API and health endpoint come up normally while a guarded startup calibration runs. Autotracking starts only after calibration completes. Persisted calibration prevents that full camera exercise from repeating on ordinary restarts. Use `if_stale` to refresh it after `TRACKER_CALIBRATION_MAX_AGE_DAYS`, `always` to recalibrate every startup, or `off` to disable startup calibration.

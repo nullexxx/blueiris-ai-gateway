@@ -13,6 +13,7 @@ COPY app.py /app/app.py
 COPY tracker.py /app/tracker.py
 COPY ptz_enhancements.py /app/ptz_enhancements.py
 COPY ptz_phase2.py /app/ptz_phase2.py
+COPY ptz_active_calibration.py /app/ptz_active_calibration.py
 
 EXPOSE 32168
 

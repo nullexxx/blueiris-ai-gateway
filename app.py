@@ -1031,8 +1031,8 @@ async def tracker_camera_status():
 
 
 @app.post("/v1/tracker/calibrate")
-async def tracker_calibrate():
-    return await _require_tracker().calibrate()
+async def tracker_calibrate(mode: str = "zoom"):
+    return await _require_tracker().calibrate(mode=mode)
 
 
 @app.get("/v1/tracker/history")
