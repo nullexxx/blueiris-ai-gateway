@@ -1,33 +1,30 @@
-# Continuous PTZ Chase Controller
+# Hybrid PTZ Escape-Chase Controller
 
-The PTZ tracker now uses Dahua/Amcrest `Continuously` pan/tilt motor control for active pursuit instead of `moveDirectly` positional moves.
+Normal tracking uses Dahua/Amcrest `moveDirectly` positional moves. Continuous pan/tilt is reserved for a bounded escape mode when a fast target is genuinely in danger of leaving the frame.
 
-This mode is intended for targets that can change direction quickly, such as dogs. The target's normalized image error is converted directly into signed pan/tilt motor speed. Pan and tilt are controlled independently.
-
-Recommended starting values:
+Current controls:
 
 ```env
-TRACKER_CONTINUOUS_CHASE_ENABLED=true
-TRACKER_FPS=15
-TRACKER_MOVE_DEADZONE_X=0.14
-TRACKER_MOVE_DEADZONE_Y=0.18
-TRACKER_CONTINUOUS_MIN_SPEED=5
-TRACKER_CONTINUOUS_MAX_SPEED=8
-TRACKER_CONTINUOUS_FULL_SPEED_ERROR=0.60
-TRACKER_CONTINUOUS_COMMAND_INTERVAL=0.15
-TRACKER_CONTINUOUS_KEEPALIVE=0.45
-TRACKER_CONTINUOUS_CAMERA_TIMEOUT=1
+TRACKER_HYBRID_CHASE_ENABLED=true
+TRACKER_HYBRID_CHASE_PAN_SIGN=-1
+TRACKER_HYBRID_CHASE_ENTRY_ERROR=0.82
+TRACKER_HYBRID_CHASE_EXIT_ERROR=0.50
+TRACKER_HYBRID_CHASE_MOTION_ERROR=0.55
+TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM=0.03
+TRACKER_HYBRID_CHASE_MISS_GRACE=0.15
+TRACKER_HYBRID_CHASE_MIN_SPEED=1
+TRACKER_HYBRID_CHASE_MAX_SPEED=6
+TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR=0.90
+TRACKER_HYBRID_CHASE_COMMAND_INTERVAL=0.18
+TRACKER_HYBRID_CHASE_KEEPALIVE=0.45
+TRACKER_HYBRID_CHASE_CAMERA_TIMEOUT=1
+TRACKER_HYBRID_CHASE_MAX_SECONDS=2.50
+TRACKER_HYBRID_CHASE_COOLDOWN=0.35
+TRACKER_HYBRID_CHASE_SETTLE_FRAMES=2
 ```
 
-The controller stops continuous motion when the target enters the deadzone, when the target is lost, when frames become stale/unavailable, on inference errors, and when tracking is stopped, shut down, or sent home. The camera-side timeout is an additional fail-safe.
+Edge rescue remains a positional `moveDirectly` correction and is configured separately with `TRACKER_EDGE_RESCUE_ENABLED`, `TRACKER_EDGE_RESCUE_ERROR`, and `TRACKER_EDGE_RESCUE_GAIN`.
 
-Home preset and bounded optical auto-zoom remain discrete/status-driven operations. Auto-zoom runs only while continuous pan/tilt is stopped and the target is centered.
+Chase can start from a hard edge/error condition or from sufficiently fast outward target motion. It stops before center, on direction reversal, low confidence, target loss beyond the blur grace period, stale/unavailable frames, inference errors, maximum chase duration, tracker stop/shutdown, or home commands. Camera-side timeout is an additional fail-safe.
 
-Target acquisition now requires every confirmation frame to meet `TRACKER_ACQUIRE_CONF`; the lower hold threshold applies only after a target is fully acquired.
-
-Useful diagnostics:
-
-- `control_mode` should report `continuous`.
-- `continuous_active` shows whether the motors are currently being driven.
-- `continuous_speed` reports current signed `[pan, tilt]` speeds.
-- History records `continuous_move` and `continuous_stop` events with errors, speeds, confidence, and CGI latency.
+Useful diagnostics are `control_mode=hybrid`, `hybrid_chase_active`, `hybrid_chase_speed`, and the `hybrid_chase_*` history events.

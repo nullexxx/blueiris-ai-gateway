@@ -1,7 +1,9 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import hashlib
 import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -45,6 +47,7 @@ PRELOAD_MODELS_ENV = os.getenv("PRELOAD_MODELS", "").strip()
 ALLOW_LAZY_LOAD = os.getenv("ALLOW_LAZY_LOAD", "false").lower() in ("true", "1")
 HALF_PRECISION = os.getenv("HALF_PRECISION", "true").lower() in ("true", "1")
 INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "8.0"))
+MODEL_LOAD_TIMEOUT = float(os.getenv("MODEL_LOAD_TIMEOUT", "180.0"))
 RECOVERY_GRACE_PERIOD = float(os.getenv("RECOVERY_GRACE_PERIOD", "4.0"))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
@@ -67,6 +70,7 @@ cache_lock = asyncio.Lock()
 face_detector: Optional[MTCNN] = None
 face_recognizer: Optional[InceptionResnetV1] = None
 registered_faces: Dict[str, List[torch.Tensor]] = {}
+face_state_lock = asyncio.Lock()
 
 # Flattened (all users' embeddings stacked into one matrix) cache used for
 # fast batched matching, so we don't rebuild + re-loop per detected face.
@@ -106,30 +110,88 @@ def discover_models() -> Dict[str, Path]:
     return found
 
 
-def ensure_tensorrt_engine(stem: str):
-    """Auto-compiles a TensorRT .engine from a .pt file if missing or if runtime environment changes."""
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tensorrt_manifest(pt_path: Path) -> dict:
+    props = torch.cuda.get_device_properties(0)
+    return {
+        "source_sha256": _sha256_file(pt_path),
+        "source_size": pt_path.stat().st_size,
+        "tensorrt": str(tensorrt.__version__),
+        "cuda": str(torch.version.cuda),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "compute_capability": f"{props.major}.{props.minor}",
+        "imgsz": 640,
+        "precision": "fp16" if HALF_PRECISION else "fp32",
+    }
+
+
+def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
+    """Build a TensorRT engine when its source/runtime manifest is stale."""
     engine_path = MODELS_DIR / f"{stem}.engine"
     pt_path = MODELS_DIR / f"{stem}.pt"
-    stamp_path = MODELS_DIR / f"{stem}.trt_version"
+    manifest_path = MODELS_DIR / f"{stem}.trt_manifest.json"
+    legacy_stamp_path = MODELS_DIR / f"{stem}.trt_version"
 
-    current_version = f"TRT_{tensorrt.__version__}_CUDA_{torch.version.cuda}"
-    needs_rebuild = False
+    if not pt_path.exists():
+        return engine_path.exists()
 
-    if not engine_path.exists() and pt_path.exists():
-        needs_rebuild = True
-    elif stamp_path.exists() and stamp_path.read_text().strip() != current_version:
-        logger.warning(f"TensorRT/CUDA environment changed for '{stem}'. Rebuilding engine...")
-        needs_rebuild = True
-
-    if needs_rebuild and pt_path.exists():
-        logger.info(f"Compiling optimized TensorRT engine for '{stem}' on RTX 5060 Ti (Takes ~60-90s)...")
+    expected = _tensorrt_manifest(pt_path)
+    current = None
+    if manifest_path.exists():
         try:
-            model = YOLO(str(pt_path))
-            model.export(format="engine", device=0, quantize=(16 if HALF_PRECISION else 32), imgsz=640, dynamic=False)
-            stamp_path.write_text(current_version)
-            logger.info(f"Successfully compiled and cached: {engine_path.name}")
-        except Exception as e:
-            logger.error(f"Failed to auto-compile engine for '{stem}': {e}")
+            current = json.loads(manifest_path.read_text())
+        except Exception as exc:
+            logger.warning("Invalid TensorRT manifest for '%s': %s", stem, exc)
+
+    needs_rebuild = force or not engine_path.exists() or current != expected
+    if not needs_rebuild:
+        return True
+
+    if engine_path.exists():
+        logger.warning("Rebuilding stale TensorRT engine for '%s'.", stem)
+        try:
+            engine_path.unlink()
+        except OSError as exc:
+            logger.error("Could not remove stale engine %s: %s", engine_path, exc)
+            return False
+    manifest_path.unlink(missing_ok=True)
+
+    logger.info(
+        "Compiling TensorRT engine for '%s' on %s (%s)...",
+        stem,
+        expected["gpu_name"],
+        expected["precision"],
+    )
+    try:
+        model = YOLO(str(pt_path))
+        model.export(
+            format="engine",
+            device=0,
+            quantize=(16 if HALF_PRECISION else 32),
+            imgsz=640,
+            dynamic=False,
+        )
+        if not engine_path.exists():
+            raise RuntimeError(f"Ultralytics export did not create {engine_path}")
+
+        temp_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
+        temp_manifest.write_text(json.dumps(expected, sort_keys=True, indent=2) + "\n")
+        os.replace(temp_manifest, manifest_path)
+        legacy_stamp_path.unlink(missing_ok=True)
+        logger.info("Successfully compiled and cached: %s", engine_path.name)
+        return True
+    except Exception as exc:
+        logger.error("Failed to auto-compile engine for '%s': %s", stem, exc, exc_info=True)
+        engine_path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        return False
 
 
 def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
@@ -187,13 +249,50 @@ def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
     return model, is_pt, format_name
 
 
-def save_faces_db():
-    """Persists registered face embeddings atomically to prevent file corruption."""
+def load_and_warmup_with_recovery_sync(path: Path) -> Tuple[YOLO, bool, str]:
+    """Load a model, rebuilding a broken preferred TensorRT engine once."""
+    try:
+        return load_and_warmup_sync(path)
+    except Exception as first_exc:
+        if path.suffix.lower() != ".engine":
+            raise
+
+        stem = path.stem
+        pt_path = MODELS_DIR / f"{stem}.pt"
+        if not pt_path.exists():
+            raise
+
+        logger.warning(
+            "TensorRT engine '%s' failed to load (%s); rebuilding once from %s.",
+            path.name,
+            first_exc,
+            pt_path.name,
+        )
+        path.unlink(missing_ok=True)
+        (MODELS_DIR / f"{stem}.trt_manifest.json").unlink(missing_ok=True)
+        rebuilt = ensure_tensorrt_engine(stem, force=True)
+        if rebuilt and path.exists():
+            try:
+                return load_and_warmup_sync(path)
+            except Exception as second_exc:
+                logger.error(
+                    "Rebuilt TensorRT engine '%s' still failed (%s); falling back to PyTorch.",
+                    path.name,
+                    second_exc,
+                )
+        else:
+            logger.error("TensorRT rebuild failed for '%s'; falling back to PyTorch.", stem)
+        return load_and_warmup_sync(pt_path)
+
+
+def save_faces_db(snapshot: Optional[Dict[str, List[torch.Tensor]]] = None):
+    """Persist a stable CPU snapshot of enrolled face embeddings atomically."""
+    data = registered_faces if snapshot is None else snapshot
     try:
         temp_path = FACES_DB_PATH.with_suffix(".tmp")
-        torch.save(registered_faces, temp_path)
+        torch.save(data, temp_path)
         os.replace(temp_path, FACES_DB_PATH)  # Atomic on POSIX/Linux
-        logger.info(f"Faces database saved atomically ({len(registered_faces)} people enrolled).")
+        logger.info("Faces database saved atomically (%d people enrolled).", len(data))
     except Exception as e:
         logger.error(f"Failed to persist face database: {e}")
 
@@ -203,7 +302,7 @@ def load_faces_db():
     global registered_faces, _face_cache_dirty
     if FACES_DB_PATH.exists():
         try:
-            registered_faces = torch.load(FACES_DB_PATH, map_location="cpu", weights_only=False)
+            registered_faces = torch.load(FACES_DB_PATH, map_location="cpu", weights_only=True)
             logger.info(f"Loaded {len(registered_faces)} enrolled people from {FACES_DB_PATH}")
         except Exception as e:
             logger.error(f"Error loading {FACES_DB_PATH}: {e}")
@@ -231,29 +330,21 @@ def _rebuild_face_matrix():
     _face_cache_dirty = False
 
 
-def sync_face_register(img: Image.Image, user_id: str) -> bool:
-    """Extracts face embedding via MTCNN + InceptionResnetV1 and registers it."""
-    global _face_cache_dirty
+def sync_face_register_embedding(img: Image.Image) -> Optional[torch.Tensor]:
+    """Extract and return one normalized face embedding without mutating shared state."""
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
     if boxes is None or len(boxes) == 0:
-        return False
+        return None
 
     faces = face_detector(img)
     if faces is None or len(faces) == 0:
-        return False
+        return None
 
     face_tensor = faces[0].unsqueeze(0).to("cuda:0")
     with torch.no_grad():
         emb = face_recognizer(face_tensor)
-        emb = F.normalize(emb, p=2, dim=1).cpu()
-
-    if user_id not in registered_faces:
-        registered_faces[user_id] = []
-    registered_faces[user_id].append(emb)
-    _face_cache_dirty = True
-    save_faces_db()
-    return True
+        return F.normalize(emb, p=2, dim=1).cpu()
 
 
 def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
@@ -362,6 +453,119 @@ def on_grace_period_expired(generation: int):
         trigger_self_termination(f"CUDA operation failed to exit within {RECOVERY_GRACE_PERIOD}s grace window.")
 
 
+class GpuBusyError(RuntimeError):
+    pass
+
+
+class GpuUnavailableError(RuntimeError):
+    pass
+
+
+class GpuJobTimeoutError(TimeoutError):
+    pass
+
+
+def _taint_gpu_for_orphan(worker_future: asyncio.Future, reason: str) -> int:
+    """Block all new CUDA work until an orphaned worker exits or the process restarts."""
+    global gpu_tainted, gpu_taint_generation, recovery_timer_handle
+    gpu_tainted = True
+    gpu_taint_generation += 1
+    generation = gpu_taint_generation
+    logger.error("GPU pipeline tainted (gen %d): %s", generation, reason)
+
+    if recovery_timer_handle and not recovery_timer_handle.cancelled():
+        recovery_timer_handle.cancel()
+    worker_future.add_done_callback(
+        lambda fut, gen=generation: on_orphaned_worker_done(fut, gen)
+    )
+    loop = asyncio.get_running_loop()
+    recovery_timer_handle = loop.call_later(
+        RECOVERY_GRACE_PERIOD,
+        lambda gen=generation: on_grace_period_expired(gen),
+    )
+    return generation
+
+
+async def run_gpu_job(
+    func,
+    *args,
+    label: str,
+    timeout: float = INFERENCE_TIMEOUT,
+    enqueue: bool = True,
+    acquire_timeout: Optional[float] = None,
+    yield_to_queue: bool = False,
+):
+    """The only runtime path allowed to launch CUDA executor work.
+
+    Timed-out or cancelled requests leave their executor thread running. Such a
+    worker taints the pipeline so releasing the asyncio lock cannot permit a
+    second CUDA job to collide with the orphaned worker.
+    """
+    global queue_depth, active_inferences
+
+    if not is_healthy:
+        raise GpuUnavailableError(f"Gateway shutting down: {health_failure_reason}")
+    if gpu_tainted:
+        raise GpuUnavailableError("GPU execution is in the recovery grace window.")
+
+    queued = False
+    acquired = False
+    active = False
+    worker_future: Optional[asyncio.Future] = None
+
+    if enqueue:
+        queue_depth += 1
+        queued = True
+
+    try:
+        try:
+            if acquire_timeout is None:
+                await gpu_lock.acquire()
+            else:
+                await asyncio.wait_for(gpu_lock.acquire(), timeout=acquire_timeout)
+        except asyncio.TimeoutError as exc:
+            raise GpuBusyError("GPU execution gate is busy.") from exc
+
+        acquired = True
+        if queued:
+            queue_depth -= 1
+            queued = False
+
+        if yield_to_queue and queue_depth > 0:
+            raise GpuBusyError("Queued gateway work has priority over tracker inference.")
+        if not is_healthy:
+            raise GpuUnavailableError(f"Gateway shutting down: {health_failure_reason}")
+        if gpu_tainted:
+            raise GpuUnavailableError("GPU execution is in the recovery grace window.")
+
+        active_inferences += 1
+        active = True
+        loop = asyncio.get_running_loop()
+        worker_future = loop.run_in_executor(None, func, *args)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(worker_future), timeout=max(0.1, float(timeout))
+            )
+        except asyncio.TimeoutError as exc:
+            msg = f"{label} timed out after {timeout:.1f}s."
+            _taint_gpu_for_orphan(worker_future, msg)
+            raise GpuJobTimeoutError(msg) from exc
+        except asyncio.CancelledError:
+            if worker_future is not None and not worker_future.done():
+                _taint_gpu_for_orphan(
+                    worker_future,
+                    f"{label} request was cancelled while its CUDA worker was still running.",
+                )
+            raise
+    finally:
+        if active:
+            active_inferences -= 1
+        if acquired:
+            gpu_lock.release()
+        if queued:
+            queue_depth -= 1
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global is_healthy, health_failure_reason, face_detector, face_recognizer, tracker_service
@@ -400,7 +604,7 @@ async def lifespan(app: FastAPI):
     for stem in target_stems:
         model_path = discovered[stem] if stem in discovered else MODELS_DIR / f"{stem}.pt"
         try:
-            model, is_pt, fmt = await asyncio.to_thread(load_and_warmup_sync, model_path)
+            model, is_pt, fmt = await asyncio.to_thread(load_and_warmup_with_recovery_sync, model_path)
             loaded_models[stem] = ModelEntry(model=model, is_pt=is_pt, format_name=fmt)
         except Exception as e:
             failed_models[stem] = str(e)
@@ -445,7 +649,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Blue Iris YOLO & Face Gateway", lifespan=lifespan)
 
 
-async def get_model_entry(requested_name: str) -> Optional[ModelEntry]:
+async def get_model_entry(requested_name: str, allow_lazy: bool = True) -> Optional[ModelEntry]:
     if gpu_tainted:
         return None
 
@@ -453,7 +657,7 @@ async def get_model_entry(requested_name: str) -> Optional[ModelEntry]:
     if stem in loaded_models:
         return loaded_models[stem]
 
-    if not ALLOW_LAZY_LOAD:
+    if not ALLOW_LAZY_LOAD or not allow_lazy:
         return None
 
     async with cache_lock:
@@ -467,86 +671,68 @@ async def get_model_entry(requested_name: str) -> Optional[ModelEntry]:
             return None
 
         target_path = discovered[stem]
-        logger.info(f"Lazy loading model: {target_path.name}")
+        logger.info("Lazy loading model: %s", target_path.name)
         try:
-            model, is_pt, fmt = await asyncio.to_thread(load_and_warmup_sync, target_path)
+            model, is_pt, fmt = await run_gpu_job(
+                load_and_warmup_with_recovery_sync,
+                target_path,
+                label=f"Lazy model load '{stem}'",
+                timeout=MODEL_LOAD_TIMEOUT,
+                enqueue=True,
+            )
             entry = ModelEntry(model=model, is_pt=is_pt, format_name=fmt)
             loaded_models[stem] = entry
+            failed_models.pop(stem, None)
             return entry
-        except Exception as e:
-            logger.error(f"Failed to lazy load {target_path.name}: {e}")
-            failed_models[stem] = str(e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Failed to lazy load %s: %s", target_path.name, exc)
+            failed_models[stem] = str(exc)
             return None
 
 
 async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: str, target_class_ids: List[int]):
-    """
-    Opportunistic tracker inference. Blue Iris/FaceNet work gets priority: if the
-    shared GPU gate is busy or a normal inference is queued, the tracker drops
-    this frame instead of adding latency to the gateway.
-    """
-    global gpu_tainted, gpu_taint_generation, recovery_timer_handle, active_inferences
-
+    """Opportunistic tracker inference that always yields to gateway work."""
     if not is_healthy or gpu_tainted:
         return "unavailable", [], 0
-
     if queue_depth > 0 or gpu_lock.locked():
         return "busy", [], 0
 
-    entry = await get_model_entry(model_name)
+    entry = await get_model_entry(model_name, allow_lazy=False)
     if entry is None:
         return "model_unavailable", [], 0
 
-    try:
-        await asyncio.wait_for(gpu_lock.acquire(), timeout=0.002)
-    except asyncio.TimeoutError:
-        return "busy", [], 0
-
-    if queue_depth > 0:
-        gpu_lock.release()
-        return "busy", [], 0
-
-    active_inferences += 1
-    loop = asyncio.get_running_loop()
     t_infer_start = time.perf_counter()
     try:
-        if gpu_tainted:
-            return "unavailable", [], 0
-
-        worker_future = loop.run_in_executor(
-            None, sync_tracker_predict, entry, frame, min_conf, target_class_ids
+        predictions = await run_gpu_job(
+            sync_tracker_predict,
+            entry,
+            frame,
+            min_conf,
+            target_class_ids,
+            label=f"Tracker inference on '{model_name}'",
+            timeout=INFERENCE_TIMEOUT,
+            enqueue=False,
+            acquire_timeout=0.002,
+            yield_to_queue=True,
         )
-        try:
-            predictions = await asyncio.wait_for(
-                asyncio.shield(worker_future), timeout=INFERENCE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            gpu_tainted = True
-            gpu_taint_generation += 1
-            current_gen = gpu_taint_generation
-            msg = f"Tracker inference timed out after {INFERENCE_TIMEOUT}s on '{model_name}'."
-            logger.error(msg)
-            worker_future.add_done_callback(
-                lambda fut, gen=current_gen: on_orphaned_worker_done(fut, gen)
-            )
-            recovery_timer_handle = loop.call_later(
-                RECOVERY_GRACE_PERIOD,
-                lambda gen=current_gen: on_grace_period_expired(gen),
-            )
-            return "timeout", [], int((time.perf_counter() - t_infer_start) * 1000)
-        except Exception as e:
-            logger.error(f"Tracker inference error on '{model_name}': {e}", exc_info=True)
-            return "error", [], int((time.perf_counter() - t_infer_start) * 1000)
-
         return "ok", predictions, int((time.perf_counter() - t_infer_start) * 1000)
-    finally:
-        active_inferences -= 1
-        gpu_lock.release()
+    except GpuBusyError:
+        return "busy", [], 0
+    except GpuUnavailableError:
+        return "unavailable", [], 0
+    except GpuJobTimeoutError as exc:
+        logger.error("%s", exc)
+        return "timeout", [], int((time.perf_counter() - t_infer_start) * 1000)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Tracker inference error on '%s': %s", model_name, exc, exc_info=True)
+        return "error", [], int((time.perf_counter() - t_infer_start) * 1000)
 
 
 async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_start: float):
-    global gpu_tainted, gpu_taint_generation, recovery_timer_handle, queue_depth, active_inferences
-
     if not is_healthy:
         return {"success": False, "error": f"Gateway shutting down: {health_failure_reason}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
     if gpu_tainted:
@@ -557,49 +743,37 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
         if entry is None:
             return {"success": False, "error": f"Model '{model_name}' is not loaded or available on server.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
         img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    except Exception as e:
-        return {"success": False, "error": f"Bad request/corrupt image: {e}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
-
-    queue_depth += 1
-    try:
-        async with gpu_lock:
-            queue_depth -= 1
-            active_inferences += 1
-            try:
-                if gpu_tainted:
-                    return {"success": False, "error": "GPU frozen.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
-
-                loop = asyncio.get_running_loop()
-                t_infer_start = time.perf_counter()
-                worker_future = loop.run_in_executor(None, sync_predict, entry.model, img, min_conf, entry.is_pt)
-
-                try:
-                    results = await asyncio.wait_for(asyncio.shield(worker_future), timeout=INFERENCE_TIMEOUT)
-                    t_infer_end = time.perf_counter()
-                except asyncio.TimeoutError:
-                    gpu_tainted = True
-                    gpu_taint_generation += 1
-                    current_gen = gpu_taint_generation
-                    msg = f"Inference timed out after {INFERENCE_TIMEOUT}s on '{model_name}'."
-                    logger.error(msg)
-                    worker_future.add_done_callback(lambda fut, gen=current_gen: on_orphaned_worker_done(fut, gen))
-                    recovery_timer_handle = loop.call_later(RECOVERY_GRACE_PERIOD, lambda gen=current_gen: on_grace_period_expired(gen))
-                    return {"success": False, "error": msg, "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
-                except Exception as e:
-                    logger.error(f"Inference error on '{model_name}': {e}", exc_info=True)
-                    return {"success": False, "error": str(e), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
-            finally:
-                active_inferences -= 1
     except asyncio.CancelledError:
-        queue_depth -= 1
         raise
+    except Exception as exc:
+        return {"success": False, "error": f"Bad request/corrupt image: {exc}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
-    infer_ms = int((t_infer_end - t_infer_start) * 1000)
-    process_ms = int((time.perf_counter() - t_start) * 1000)
+    t_infer_start = time.perf_counter()
+    try:
+        results = await run_gpu_job(
+            sync_predict,
+            entry.model,
+            img,
+            min_conf,
+            entry.is_pt,
+            label=f"Inference on '{model_name}'",
+            timeout=INFERENCE_TIMEOUT,
+            enqueue=True,
+        )
+    except GpuJobTimeoutError as exc:
+        return {"success": False, "error": str(exc), "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
+    except GpuUnavailableError as exc:
+        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Inference error on '%s': %s", model_name, exc, exc_info=True)
+        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
+    t_infer_end = time.perf_counter()
     predictions = []
-    for r in results:
-        for box in r.boxes:
+    for result in results:
+        for box in result.boxes:
             coords = box.xyxy[0].tolist()
             predictions.append({
                 "confidence": round(float(box.conf[0]), 2),
@@ -617,8 +791,8 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
         "moduleName": f"YOLO Gateway ({entry.format_name})",
         "executionProvider": "CUDA",
         "canUseGPU": True,
-        "inferenceMs": infer_ms,
-        "processMs": process_ms,
+        "inferenceMs": int((t_infer_end - t_infer_start) * 1000),
+        "processMs": int((time.perf_counter() - t_start) * 1000),
     }
 
 
@@ -626,9 +800,18 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
 # FACE RECOGNITION ENDPOINTS
 # ============================================================================
 
+def _face_db_snapshot() -> Dict[str, List[torch.Tensor]]:
+    return {
+        user: [embedding.detach().cpu().clone() for embedding in embeddings]
+        for user, embeddings in registered_faces.items()
+    }
+
+
 @app.api_route("/v1/vision/face/list", methods=["GET", "POST"])
 async def face_list():
-    return {"success": True, "faces": sorted(list(registered_faces.keys()))}
+    async with face_state_lock:
+        faces = sorted(registered_faces.keys())
+    return {"success": True, "faces": faces}
 
 
 @app.post("/v1/vision/face/register")
@@ -637,23 +820,44 @@ async def face_register(
     userid: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
 ):
+    global _face_cache_dirty
     target_id = (userid or name or "").strip()
     if not target_id:
         return {"success": False, "error": "Missing user ID or name."}
+    if face_detector is None or face_recognizer is None:
+        return {"success": False, "error": "Face recognition is unavailable."}
 
     contents = await image.read()
     try:
         img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
-    except Exception as e:
-        return {"success": False, "error": f"Invalid image: {e}"}
+    except Exception as exc:
+        return {"success": False, "error": f"Invalid image: {exc}"}
 
-    async with gpu_lock:
-        loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(None, sync_face_register, img, target_id)
+    try:
+        embedding = await run_gpu_job(
+            sync_face_register_embedding,
+            img,
+            label=f"Face registration for '{target_id}'",
+            timeout=INFERENCE_TIMEOUT,
+            enqueue=True,
+        )
+    except (GpuJobTimeoutError, GpuUnavailableError) as exc:
+        return {"success": False, "error": str(exc)}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Face registration failed: %s", exc, exc_info=True)
+        return {"success": False, "error": str(exc)}
 
-    if success:
-        return {"success": True, "message": f"Face registered for {target_id}"}
-    return {"success": False, "error": "No face detected in provided image."}
+    if embedding is None:
+        return {"success": False, "error": "No face detected in provided image."}
+
+    async with face_state_lock:
+        registered_faces.setdefault(target_id, []).append(embedding)
+        _face_cache_dirty = True
+        snapshot = _face_db_snapshot()
+    await asyncio.to_thread(save_faces_db, snapshot)
+    return {"success": True, "message": f"Face registered for {target_id}"}
 
 
 @app.post("/v1/vision/face/delete")
@@ -663,16 +867,13 @@ async def face_delete(
 ):
     global _face_cache_dirty
     target_id = (userid or name or "").strip()
-
-    # Route through gpu_lock so this can't race with _rebuild_face_matrix()
-    # iterating registered_faces inside a recognize() call's worker thread.
-    async with gpu_lock:
+    async with face_state_lock:
         if target_id not in registered_faces:
             return {"success": False, "error": f"User '{target_id}' not found."}
         del registered_faces[target_id]
         _face_cache_dirty = True
-        await asyncio.to_thread(save_faces_db)
-
+        snapshot = _face_db_snapshot()
+    await asyncio.to_thread(save_faces_db, snapshot)
     return {"success": True, "message": f"Face deleted for {target_id}"}
 
 
@@ -682,19 +883,36 @@ async def face_recognize(
     min_confidence: float = Form(0.60),
 ):
     t_start = time.perf_counter()
-    contents = await image.read()
+    if face_detector is None or face_recognizer is None:
+        return {"success": False, "error": "Face recognition is unavailable.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
+    contents = await image.read()
     try:
         img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
-    except Exception as e:
-        return {"success": False, "error": f"Invalid image: {e}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+    except Exception as exc:
+        return {"success": False, "error": f"Invalid image: {exc}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
-    async with gpu_lock:
-        loop = asyncio.get_running_loop()
-        t_infer_start = time.perf_counter()
-        predictions = await loop.run_in_executor(None, sync_face_recognize, img, min_confidence)
-        t_infer_end = time.perf_counter()
+    t_infer_start = time.perf_counter()
+    try:
+        # Freeze face mutations while the worker may rebuild the flattened GPU matrix.
+        async with face_state_lock:
+            predictions = await run_gpu_job(
+                sync_face_recognize,
+                img,
+                min_confidence,
+                label="Face recognition",
+                timeout=INFERENCE_TIMEOUT,
+                enqueue=True,
+            )
+    except (GpuJobTimeoutError, GpuUnavailableError) as exc:
+        return {"success": False, "error": str(exc), "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Face recognition failed: %s", exc, exc_info=True)
+        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
+    t_infer_end = time.perf_counter()
     return {
         "success": True,
         "message": f"{len(predictions)} face(s) detected",

@@ -955,6 +955,8 @@ class DogTracker:
         self._history: Deque[dict] = deque(maxlen=self.cfg.history_size)
         self._session_started_wall: Optional[str] = None
         self._session_started_mono: Optional[float] = None
+        self._stop_reason: Optional[str] = None
+        self._last_task_error: Optional[str] = None
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -1069,6 +1071,11 @@ class DogTracker:
         self._history.clear()
         self._session_started_wall = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._session_started_mono = time.monotonic()
+        self._stop_reason = None
+        self._last_task_error = None
+        self._shutdown = False
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
         self.active = True
         self.state = "SEARCHING"
         self._home_sent = False
@@ -1081,11 +1088,12 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (3D moveDirectly + status-driven settle)")
+        self.logger.info("PTZ tracker STARTED (hybrid moveDirectly + escape chase)")
         return self.status()
 
     async def stop(self) -> dict:
         self._record_event("tracker_stopping")
+        self._stop_reason = None
         self.active = False
         self.state = "OFF"
         await self._stop_hybrid_chase("tracker_stop", force=True)
@@ -1154,6 +1162,9 @@ class DogTracker:
             "enabled": self.cfg.enabled,
             "active": self.active,
             "session_started": self._session_started_wall,
+            "stop_reason": self._stop_reason,
+            "tracker_task_running": bool(self._task is not None and not self._task.done()),
+            "tracker_task_error": self._last_task_error,
             "history_events": len(self._history),
             "state": self.state,
             "control_mode": "hybrid",
@@ -1611,14 +1622,77 @@ class DogTracker:
         self._loss_pause_logged = False
         self._pending_move_distance = None
 
+    async def _halt_tracking_for_ptz_failure(
+        self,
+        reason: str,
+        *,
+        operation: Optional[str],
+        status: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Fail closed when PTZ state can no longer be established safely."""
+        try:
+            await self._stop_hybrid_chase("ptz_failure", force=True)
+        except Exception:
+            pass
+        self.active = False
+        self.state = "PTZ_ERROR"
+        self._stop_reason = reason
+        self._record_event(
+            "tracking_stopped_ptz_error",
+            reason=reason,
+            operation=operation,
+            status_available=bool(status),
+            move_status=status.get("status.MoveStatus") if status else None,
+            pan_tilt_status=status.get("status.PanTiltStatus") if status else None,
+            zoom_status=status.get("status.ZoomStatus") if status else None,
+        )
+        self.logger.error("PTZ tracking stopped: %s", reason)
+        self._reset_tracking_state()
+        self.state = "PTZ_ERROR"
+        self._stop_reason = reason
+
     async def _poll_ptz_operation(self, seq: int, now: float) -> None:
         kind = self._ptz_operation
         if kind is None:
             return
 
         if now >= self._ptz_operation_deadline:
-            self._finish_ptz_operation(seq, now, timed_out=True)
+            # Final status validation: never release a timed-out operation blindly.
+            status = await asyncio.to_thread(self.ptz.get_status)
+            checked_at = time.monotonic()
+            if not status:
+                await self._halt_tracking_for_ptz_failure(
+                    f"PTZ status remained unavailable when '{kind}' exceeded its {self.cfg.ptz_operation_timeout:.2f}s timeout.",
+                    operation=kind,
+                )
+                return
+
+            self._last_camera_status = status
+            self._last_camera_status_at = checked_at
+            position = self.ptz.position_from_status(status)
+            if position is not None:
+                self._last_camera_position = position
+                self._last_zoom_position = position[2]
+
+            stable = self._position_stable(self._ptz_last_poll_position, position, kind)
+            reported_idle = (
+                self.ptz.zoom_reported_idle(status)
+                if kind == "zoom"
+                else self.ptz.pan_tilt_reported_idle(status)
+            )
+            status_ok = reported_idle is True or (reported_idle is None and stable is True)
+            stable_ok = stable is not False
+            if status_ok and stable_ok:
+                self._finish_ptz_operation(seq, checked_at, timed_out=True, status=status)
+                return
+
+            await self._halt_tracking_for_ptz_failure(
+                f"PTZ operation '{kind}' exceeded its {self.cfg.ptz_operation_timeout:.2f}s timeout and the camera did not report a safe idle state.",
+                operation=kind,
+                status=status,
+            )
             return
+
         if now < self._ptz_next_status_poll_at:
             return
 
@@ -1626,8 +1700,6 @@ class DogTracker:
         polled_at = time.monotonic()
         self._ptz_next_status_poll_at = polled_at + self.cfg.ptz_status_poll_interval
         if not status:
-            if polled_at >= self._ptz_operation_deadline:
-                self._finish_ptz_operation(seq, polled_at, timed_out=True)
             return
 
         self._last_camera_status = status
@@ -1650,10 +1722,6 @@ class DogTracker:
 
         self._ptz_last_poll_position = position
 
-        # Avoid accepting an immediate stale Idle response directly after a command.
-        # If real movement has already been observed, one subsequent idle/stable
-        # poll is enough. If movement was never observed, retain the conservative
-        # two-poll confirmation to protect against a stale immediate Idle response.
         if (polled_at - self._ptz_operation_started_at) < 0.20:
             self._ptz_idle_polls = 0
             return
@@ -1748,7 +1816,10 @@ class DogTracker:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self.active = False
             self.state = "TRACKER_ERROR"
+            self._last_task_error = str(exc)
+            self._stop_reason = f"Tracker task crashed: {exc}"
             try:
                 await self._stop_hybrid_chase("tracker_error", force=True)
             except Exception:
