@@ -87,6 +87,8 @@ class TrackerConfig:
     rtsp_channel: int = 1
     rtsp_subtype: int = 1
     rtsp_url: str = ""
+    rtsp_open_timeout: float = 5.0
+    rtsp_read_timeout: float = 5.0
 
     model_name: str = "yolo11l"
     target_classes: List[str] = field(default_factory=lambda: ["person", "dog", "cat", "bird", "bear"])
@@ -163,6 +165,8 @@ class TrackerConfig:
     hybrid_chase_max_seconds: float = 2.50
     hybrid_chase_cooldown: float = 0.35
     hybrid_chase_settle_frames: int = 2
+    hybrid_divergence_frames: int = 3
+    hybrid_divergence_growth: float = 0.05
 
     # Native PTZ operation tracking. Instead of guessing how long a 3D move takes,
     # poll getStatus until the camera reports idle and its reported position is stable.
@@ -190,6 +194,11 @@ class TrackerConfig:
     return_home_on_lost: bool = True
 
     ptz_http_timeout: float = 0.75
+    move_failure_backoff_base: float = 0.25
+    move_failure_backoff_max: float = 1.0
+    move_failure_stop_after: int = 5
+    home_retry_attempts: int = 3
+    home_retry_delay: float = 0.75
     frame_stale_timeout: float = 1.0
     history_size: int = 300
 
@@ -205,6 +214,8 @@ class TrackerConfig:
             rtsp_channel=_env_int("TRACKER_RTSP_CHANNEL", 1),
             rtsp_subtype=_env_int("TRACKER_RTSP_SUBTYPE", 1),
             rtsp_url=os.getenv("TRACKER_RTSP_URL", "").strip(),
+            rtsp_open_timeout=max(1.0, _env_float("TRACKER_RTSP_OPEN_TIMEOUT", 5.0)),
+            rtsp_read_timeout=max(1.0, _env_float("TRACKER_RTSP_READ_TIMEOUT", 5.0)),
             model_name=os.getenv("TRACKER_MODEL", os.getenv("DEFAULT_MODEL", "yolo11l")).strip(),
             target_classes=_parse_class_list(
                 os.getenv("TRACKER_TARGET_CLASSES", "person,dog,cat,bird,bear"),
@@ -256,6 +267,8 @@ class TrackerConfig:
             hybrid_chase_max_seconds=_env_float("TRACKER_HYBRID_CHASE_MAX_SECONDS", 2.50),
             hybrid_chase_cooldown=_env_float("TRACKER_HYBRID_CHASE_COOLDOWN", 0.35),
             hybrid_chase_settle_frames=_env_int("TRACKER_HYBRID_CHASE_SETTLE_FRAMES", 2),
+            hybrid_divergence_frames=max(2, _env_int("TRACKER_HYBRID_DIVERGENCE_FRAMES", 3)),
+            hybrid_divergence_growth=max(0.01, _env_float("TRACKER_HYBRID_DIVERGENCE_GROWTH", 0.05)),
             ptz_status_poll_interval=_env_float("TRACKER_PTZ_STATUS_POLL_INTERVAL", 0.12),
             ptz_operation_timeout=_env_float("TRACKER_PTZ_OPERATION_TIMEOUT", 4.0),
             post_move_frames=_env_int("TRACKER_POST_MOVE_FRAMES", 1),
@@ -275,6 +288,11 @@ class TrackerConfig:
             goto_home_on_start=_env_bool("TRACKER_GOTO_HOME_ON_START", True),
             return_home_on_lost=_env_bool("TRACKER_RETURN_HOME_ON_LOST", True),
             ptz_http_timeout=_env_float("TRACKER_PTZ_HTTP_TIMEOUT", 0.75),
+            move_failure_backoff_base=max(0.05, _env_float("TRACKER_MOVE_FAILURE_BACKOFF_BASE", 0.25)),
+            move_failure_backoff_max=max(0.10, _env_float("TRACKER_MOVE_FAILURE_BACKOFF_MAX", 1.0)),
+            move_failure_stop_after=max(1, _env_int("TRACKER_MOVE_FAILURE_STOP_AFTER", 5)),
+            home_retry_attempts=max(1, _env_int("TRACKER_HOME_RETRY_ATTEMPTS", 3)),
+            home_retry_delay=max(0.10, _env_float("TRACKER_HOME_RETRY_DELAY", 0.75)),
             frame_stale_timeout=_env_float("TRACKER_FRAME_STALE_TIMEOUT", 1.0),
             history_size=_env_int("TRACKER_HISTORY_SIZE", 300),
         )
@@ -386,6 +404,8 @@ class TrackerConfig:
             "camera_channel": self.camera_channel,
             "rtsp_channel": self.rtsp_channel,
             "rtsp_subtype": self.rtsp_subtype,
+            "rtsp_open_timeout": self.rtsp_open_timeout,
+            "rtsp_read_timeout": self.rtsp_read_timeout,
             "model": self.model_name,
             "target_classes": list(self.target_classes),
             "target_class_ids": list(self.target_class_ids),
@@ -432,6 +452,8 @@ class TrackerConfig:
             "hybrid_chase_max_seconds": self.hybrid_chase_max_seconds,
             "hybrid_chase_cooldown": self.hybrid_chase_cooldown,
             "hybrid_chase_settle_frames": self.hybrid_chase_settle_frames,
+            "hybrid_divergence_frames": self.hybrid_divergence_frames,
+            "hybrid_divergence_growth": self.hybrid_divergence_growth,
             "ptz_status_poll_interval": self.ptz_status_poll_interval,
             "ptz_operation_timeout": self.ptz_operation_timeout,
             "post_move_frames": self.post_move_frames,
@@ -453,6 +475,11 @@ class TrackerConfig:
             "goto_home_on_start": self.goto_home_on_start,
             "return_home_on_lost": self.return_home_on_lost,
             "ptz_http_timeout": self.ptz_http_timeout,
+            "move_failure_backoff_base": self.move_failure_backoff_base,
+            "move_failure_backoff_max": self.move_failure_backoff_max,
+            "move_failure_stop_after": self.move_failure_stop_after,
+            "home_retry_attempts": self.home_retry_attempts,
+            "home_retry_delay": self.home_retry_delay,
             "frame_stale_timeout": self.frame_stale_timeout,
             "history_size": self.history_size,
         }
@@ -461,8 +488,10 @@ class TrackerConfig:
 class LatestFrameCapture:
     """Continuously drains RTSP and retains only the newest decoded frame."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, open_timeout_s: float = 5.0, read_timeout_s: float = 5.0):
         self.url = url
+        self.open_timeout_s = max(1.0, float(open_timeout_s))
+        self.read_timeout_s = max(1.0, float(read_timeout_s))
         self._frame: Optional[np.ndarray] = None
         self._seq = 0
         self._frame_time = 0.0
@@ -489,11 +518,26 @@ class LatestFrameCapture:
         with self._lock:
             return self._frame, self._seq, self._frame_time
 
+    def _open_capture(self):
+        params = []
+        open_prop = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+        read_prop = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+        if open_prop is not None:
+            params.extend([open_prop, int(self.open_timeout_s * 1000)])
+        if read_prop is not None:
+            params.extend([read_prop, int(self.read_timeout_s * 1000)])
+        if params:
+            try:
+                return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
+            except TypeError:
+                pass
+        return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             cap = None
             try:
-                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                cap = self._open_capture()
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 if not cap.isOpened():
                     raise RuntimeError("OpenCV/FFmpeg could not open RTSP stream")
@@ -549,7 +593,7 @@ class AmcrestPTZ:
             response.raise_for_status()
             self.last_http_ms = int((time.perf_counter() - start) * 1000)
             text = response.text.strip()
-            if text and "ERROR" in text.upper():
+            if text and text.lstrip().lower().startswith("error"):
                 raise RuntimeError(text)
             self.last_error = None
             return text
@@ -879,7 +923,11 @@ class DogTracker:
         self.cfg = cfg
         self.inference_cb = inference_cb
         self.logger = logger
-        self.capture = LatestFrameCapture(cfg.resolved_rtsp_url())
+        self.capture = LatestFrameCapture(
+            cfg.resolved_rtsp_url(),
+            open_timeout_s=cfg.rtsp_open_timeout,
+            read_timeout_s=cfg.rtsp_read_timeout,
+        )
         self.ptz = AmcrestPTZ(cfg)
 
         self.active = False
@@ -889,7 +937,7 @@ class DogTracker:
         self._shutdown = False
         self._last_processed_seq = -1
         self._last_frame_shape: Optional[Tuple[int, int]] = None
-        self._debug_jpeg: Optional[bytes] = None
+        self._last_debug_detections: List[Detection] = []
 
         self._home_sent = False
         self._last_move_point: Optional[Tuple[int, int]] = None
@@ -955,6 +1003,14 @@ class DogTracker:
         self._history: Deque[dict] = deque(maxlen=self.cfg.history_size)
         self._session_started_wall: Optional[str] = None
         self._session_started_mono: Optional[float] = None
+        self._stop_reason: Optional[str] = None
+        self._last_task_error: Optional[str] = None
+        self._session_generation = 0
+        self._move_failure_count = 0
+        self._move_retry_after = 0.0
+        self._hybrid_disabled_for_session = False
+        self._hybrid_last_error: Optional[float] = None
+        self._hybrid_divergence_count = 0
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -1064,11 +1120,25 @@ class DogTracker:
         self._hybrid_tilt_speed = 0
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = 0.0
+        self._hybrid_last_error = None
+        self._hybrid_divergence_count = 0
+        self._move_failure_count = 0
+        self._move_retry_after = 0.0
+
+    def _session_valid(self, generation: int) -> bool:
+        return self.active and generation == self._session_generation and not self._shutdown
 
     async def start(self) -> dict:
+        self._session_generation += 1
         self._history.clear()
         self._session_started_wall = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._session_started_mono = time.monotonic()
+        self._stop_reason = None
+        self._last_task_error = None
+        self._hybrid_disabled_for_session = False
+        self._shutdown = False
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
         self.active = True
         self.state = "SEARCHING"
         self._home_sent = False
@@ -1081,11 +1151,13 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (3D moveDirectly + status-driven settle)")
+        self.logger.info("PTZ tracker STARTED (hybrid moveDirectly + escape chase)")
         return self.status()
 
     async def stop(self) -> dict:
+        self._session_generation += 1
         self._record_event("tracker_stopping")
+        self._stop_reason = None
         self.active = False
         self.state = "OFF"
         await self._stop_hybrid_chase("tracker_stop", force=True)
@@ -1094,24 +1166,75 @@ class DogTracker:
         self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
+    async def _goto_home_with_retry(self, reason: str, generation: int) -> bool:
+        attempts = max(1, self.cfg.home_retry_attempts)
+        for attempt in range(1, attempts + 1):
+            ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
+            if generation != self._session_generation or self._shutdown:
+                return False
+            if ok:
+                if attempt > 1:
+                    self._record_event("home_retry_recovered", reason=reason, attempt=attempt)
+                return True
+            self._record_event(
+                "home_command_failed",
+                reason=reason,
+                attempt=attempt,
+                attempts=attempts,
+                error=self.ptz.last_error,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(self.cfg.home_retry_delay)
+                if generation != self._session_generation or self._shutdown:
+                    return False
+        return False
+
     async def home(self) -> dict:
+        self._session_generation += 1
+        generation = self._session_generation
         await self._stop_hybrid_chase("home", force=True)
         self._reset_tracking_state()
         self._home_sent = True
         self.state = "HOME" if self.active else "OFF"
-        ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
+        ok = await self._goto_home_with_retry("manual_home", generation)
         now = time.monotonic()
         _, seq, _ = self.capture.latest()
         self._last_zoom_position = None
         if ok:
             self.home_returns += 1
-            if self.active:
+            if self.active and generation == self._session_generation:
                 self._begin_ptz_operation("home", seq, now)
         self._record_event("home_command", preset=self.cfg.home_preset, success=bool(ok))
         return self.status()
 
-    def debug_jpeg(self) -> Optional[bytes]:
-        return self._debug_jpeg
+    async def debug_jpeg(self) -> Optional[bytes]:
+        frame, _, _ = self.capture.latest()
+        if frame is None:
+            return None
+        detections = [
+            Detection(d.class_id, d.label, d.confidence, tuple(d.bbox))
+            for d in self._last_debug_detections
+        ]
+        target = None
+        if self.target is not None:
+            target = Detection(
+                self.target.class_id,
+                self.target.label,
+                self.target.confidence,
+                tuple(self.target.bbox),
+            )
+        return await asyncio.to_thread(
+            self._render_debug_frame,
+            frame.copy(),
+            detections,
+            target,
+            self.state,
+            self._last_error_x,
+            self._last_error_y,
+            self._last_zoom_position,
+            self._ptz_operation,
+            self._last_inference_ms,
+        )
 
     def status(self) -> dict:
         now = time.monotonic()
@@ -1154,6 +1277,12 @@ class DogTracker:
             "enabled": self.cfg.enabled,
             "active": self.active,
             "session_started": self._session_started_wall,
+            "stop_reason": self._stop_reason,
+            "tracker_task_running": bool(self._task is not None and not self._task.done()),
+            "tracker_task_error": self._last_task_error,
+            "session_generation": self._session_generation,
+            "hybrid_chase_disabled_for_session": self._hybrid_disabled_for_session,
+            "move_failure_count": self._move_failure_count,
             "history_events": len(self._history),
             "state": self.state,
             "control_mode": "hybrid",
@@ -1379,6 +1508,8 @@ class DogTracker:
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = t1
         self._hybrid_last_stopped_at = t1
+        self._hybrid_last_error = None
+        self._hybrid_divergence_count = 0
         if ok and was_active:
             self.ptz_commands += 1
             self.hybrid_chase_stops += 1
@@ -1436,6 +1567,7 @@ class DogTracker:
         if self._hybrid_chase_active and not same_speed and elapsed < self.cfg.hybrid_chase_command_interval:
             return True
 
+        generation = self._session_generation
         t0 = time.monotonic()
         ok = await asyncio.to_thread(
             self.ptz.continuous_move,
@@ -1444,6 +1576,10 @@ class DogTracker:
             self.cfg.hybrid_chase_camera_timeout,
         )
         t1 = time.monotonic()
+        if not self._session_valid(generation):
+            if ok:
+                await asyncio.to_thread(self.ptz.continuous_stop)
+            return False
         if not ok:
             self._record_event(
                 "hybrid_chase_move_failed",
@@ -1458,6 +1594,8 @@ class DogTracker:
         entering = not self._hybrid_chase_active
         if entering:
             self._hybrid_started_at = t1
+            self._hybrid_last_error = max(abs(error_x), abs(error_y))
+            self._hybrid_divergence_count = 0
             self.hybrid_chase_entries += 1
         self._hybrid_chase_active = True
         self._hybrid_pan_speed = pan_speed
@@ -1497,6 +1635,27 @@ class DogTracker:
     ) -> None:
         if not self._hybrid_chase_active:
             return
+        dominant_error = max(abs(err_x), abs(err_y))
+        if self._hybrid_last_error is not None:
+            if dominant_error > (self._hybrid_last_error + self.cfg.hybrid_divergence_growth):
+                self._hybrid_divergence_count += 1
+            elif dominant_error < self._hybrid_last_error:
+                self._hybrid_divergence_count = 0
+            self._hybrid_last_error = dominant_error
+            if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
+                count = self._hybrid_divergence_count
+                self._hybrid_disabled_for_session = True
+                self._record_event(
+                    "hybrid_chase_diverging",
+                    error=round(dominant_error, 3),
+                    consecutive_growth_frames=count,
+                    pan_sign=self.cfg.hybrid_chase_pan_sign,
+                )
+                await self._stop_hybrid_chase("diverging", seq=seq, force=True)
+                return
+        else:
+            self._hybrid_last_error = dominant_error
+
         if (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds:
             await self._stop_hybrid_chase("max_duration", seq=seq)
             return
@@ -1611,23 +1770,90 @@ class DogTracker:
         self._loss_pause_logged = False
         self._pending_move_distance = None
 
-    async def _poll_ptz_operation(self, seq: int, now: float) -> None:
+    async def _halt_tracking_for_ptz_failure(
+        self,
+        reason: str,
+        *,
+        operation: Optional[str],
+        status: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Fail closed when PTZ state can no longer be established safely."""
+        try:
+            await self._stop_hybrid_chase("ptz_failure", force=True)
+        except Exception:
+            pass
+        self.active = False
+        self.state = "PTZ_ERROR"
+        self._stop_reason = reason
+        self._record_event(
+            "tracking_stopped_ptz_error",
+            reason=reason,
+            operation=operation,
+            status_available=bool(status),
+            move_status=status.get("status.MoveStatus") if status else None,
+            pan_tilt_status=status.get("status.PanTiltStatus") if status else None,
+            zoom_status=status.get("status.ZoomStatus") if status else None,
+        )
+        self.logger.error("PTZ tracking stopped: %s", reason)
+        self._reset_tracking_state()
+        self.state = "PTZ_ERROR"
+        self._stop_reason = reason
+
+    async def _poll_ptz_operation(self, seq: int, now: float, generation: int) -> None:
+        if not self._session_valid(generation):
+            return
         kind = self._ptz_operation
         if kind is None:
             return
 
         if now >= self._ptz_operation_deadline:
-            self._finish_ptz_operation(seq, now, timed_out=True)
+            # Final status validation: never release a timed-out operation blindly.
+            status = await asyncio.to_thread(self.ptz.get_status)
+            checked_at = time.monotonic()
+            if not self._session_valid(generation):
+                return
+            if not status:
+                await self._halt_tracking_for_ptz_failure(
+                    f"PTZ status remained unavailable when '{kind}' exceeded its {self.cfg.ptz_operation_timeout:.2f}s timeout.",
+                    operation=kind,
+                )
+                return
+
+            self._last_camera_status = status
+            self._last_camera_status_at = checked_at
+            position = self.ptz.position_from_status(status)
+            if position is not None:
+                self._last_camera_position = position
+                self._last_zoom_position = position[2]
+
+            stable = self._position_stable(self._ptz_last_poll_position, position, kind)
+            reported_idle = (
+                self.ptz.zoom_reported_idle(status)
+                if kind == "zoom"
+                else self.ptz.pan_tilt_reported_idle(status)
+            )
+            status_ok = reported_idle is True or (reported_idle is None and stable is True)
+            stable_ok = stable is not False
+            if status_ok and stable_ok:
+                self._finish_ptz_operation(seq, checked_at, timed_out=True, status=status)
+                return
+
+            await self._halt_tracking_for_ptz_failure(
+                f"PTZ operation '{kind}' exceeded its {self.cfg.ptz_operation_timeout:.2f}s timeout and the camera did not report a safe idle state.",
+                operation=kind,
+                status=status,
+            )
             return
+
         if now < self._ptz_next_status_poll_at:
             return
 
         status = await asyncio.to_thread(self.ptz.get_status)
         polled_at = time.monotonic()
+        if not self._session_valid(generation):
+            return
         self._ptz_next_status_poll_at = polled_at + self.cfg.ptz_status_poll_interval
         if not status:
-            if polled_at >= self._ptz_operation_deadline:
-                self._finish_ptz_operation(seq, polled_at, timed_out=True)
             return
 
         self._last_camera_status = status
@@ -1650,10 +1876,6 @@ class DogTracker:
 
         self._ptz_last_poll_position = position
 
-        # Avoid accepting an immediate stale Idle response directly after a command.
-        # If real movement has already been observed, one subsequent idle/stable
-        # poll is enough. If movement was never observed, retain the conservative
-        # two-poll confirmation to protect against a stale immediate Idle response.
         if (polled_at - self._ptz_operation_started_at) < 0.20:
             self._ptz_idle_polls = 0
             return
@@ -1686,14 +1908,21 @@ class DogTracker:
                     await asyncio.sleep(0.05)
                     continue
 
+                generation = self._session_generation
                 frame, seq, frame_time = self.capture.latest()
                 now = time.monotonic()
 
                 # PTZ completion is independent of RTSP/GPU health. Keep polling
                 # the camera while an operation is active even if the next video
                 # frame is duplicate/stale or tracker inference gets skipped.
-                await self._poll_ptz_operation(seq, now)
+                await self._poll_ptz_operation(seq, now, generation)
                 now = time.monotonic()
+
+                # A fail-closed PTZ recovery may disable tracking during the poll.
+                # Do not let the remainder of this iteration overwrite PTZ_ERROR or
+                # acquire/process another target after tracking has been stopped.
+                if not self._session_valid(generation):
+                    continue
 
                 if frame is None or frame_time <= 0:
                     if self._hybrid_chase_active:
@@ -1718,6 +1947,8 @@ class DogTracker:
                     self.cfg.model_name,
                     self.cfg.target_class_ids,
                 )
+                if not self._session_valid(generation):
+                    continue
                 self._last_inference_outcome = outcome
                 self._last_inference_ms = infer_ms
 
@@ -1743,12 +1974,15 @@ class DogTracker:
                     if float(d.get("confidence", 0.0)) >= self.cfg.hold_conf
                 ]
                 self._last_detection_count = len(detections)
-                await self._process_observation(frame, seq, detections, time.monotonic())
-                self._make_debug_frame(frame, detections)
+                self._last_debug_detections = detections
+                await self._process_observation(frame, seq, detections, time.monotonic(), generation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self.active = False
             self.state = "TRACKER_ERROR"
+            self._last_task_error = str(exc)
+            self._stop_reason = f"Tracker task crashed: {exc}"
             try:
                 await self._stop_hybrid_chase("tracker_error", force=True)
             except Exception:
@@ -1761,7 +1995,10 @@ class DogTracker:
         seq: int,
         detections: List[Detection],
         now: float,
+        generation: int,
     ) -> None:
+        if not self._session_valid(generation):
+            return
         # Native 3D positioning is asynchronous inside the camera. The run loop
         # polls PTZ status before inference; tracking continues while the camera
         # moves, but no second PTZ command is allowed until it is truly idle.
@@ -1916,7 +2153,7 @@ class DogTracker:
                 self.state = "VELOCITY_SAMPLE"
                 return
 
-            await self._drive_to_target(frame.shape, seq, now)
+            await self._drive_to_target(frame.shape, seq, now, generation)
             return
 
         if self.target.acquire_hits < self.cfg.acquire_frames:
@@ -1994,8 +2231,10 @@ class DogTracker:
 
         returned_home = False
         if self.cfg.return_home_on_lost and not self._home_sent:
-            ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
+            ok = await self._goto_home_with_retry("target_lost", generation)
             now2 = time.monotonic()
+            if not self._session_valid(generation):
+                return
             if ok:
                 self.home_returns += 1
                 self._home_sent = True
@@ -2045,9 +2284,9 @@ class DogTracker:
             px, py = self.target.predicted_center(now)
         old_area = max(1.0, (self.target.bbox[2] - self.target.bbox[0]) * (self.target.bbox[3] - self.target.bbox[1]))
 
+        max_dist = self.cfg.association_moving_distance if camera_recently_moved else self.cfg.association_idle_distance
         best: Optional[Detection] = None
         best_score = -1.0
-        best_dist_norm = 999.0
         for det in detections:
             if det.class_id != self.target.class_id:
                 continue
@@ -2064,20 +2303,20 @@ class DogTracker:
             proximity_span = 0.75 if camera_recently_moved else 0.45
             proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
             overlap = _iou(self.target.bbox, det.bbox)
+            if dist_norm > max_dist and overlap < 0.30:
+                continue
             size_similarity = min(old_area, det.area) / max(old_area, det.area)
             score = 0.35 * overlap + 0.45 * proximity + 0.10 * size_similarity + 0.10 * det.confidence
             if score > best_score:
                 best_score = score
                 best = det
-                best_dist_norm = dist_norm
 
-        max_dist = self.cfg.association_moving_distance if camera_recently_moved else self.cfg.association_idle_distance
-        if best is not None and (best_score >= 0.20 or best_dist_norm <= max_dist):
+        if best is not None and best_score >= 0.20:
             return best
         return None
 
-    async def _drive_to_target(self, frame_shape: Tuple[int, ...], seq: int, now: float) -> None:
-        if self.target is None:
+    async def _drive_to_target(self, frame_shape: Tuple[int, ...], seq: int, now: float, generation: int) -> None:
+        if self.target is None or not self._session_valid(generation):
             return
 
         h, w = frame_shape[:2]
@@ -2109,6 +2348,9 @@ class DogTracker:
 
         if outside_deadzone:
             if not self.cfg.move_directly_enabled:
+                return
+            if now < self._move_retry_after:
+                self.state = "PTZ_BACKOFF"
                 return
 
             x1, y1, x2, y2 = self.target.bbox
@@ -2154,6 +2396,7 @@ class DogTracker:
             )
             hybrid_entry = (
                 self.cfg.hybrid_chase_enabled
+                and not self._hybrid_disabled_for_session
                 and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
                 and (
                     (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error and not moving_inward_dominant)
@@ -2293,10 +2536,15 @@ class DogTracker:
             )
             scaled = self.ptz._scale_point(command_center, frame_shape)
 
+            generation = self._session_generation
             t0 = time.monotonic()
             ok = await asyncio.to_thread(self.ptz.move_directly_point, command_center, frame_shape)
             t1 = time.monotonic()
+            if not self._session_valid(generation):
+                return
             if ok:
+                self._move_failure_count = 0
+                self._move_retry_after = 0.0
                 self.ptz_commands += 1
                 self.move_direct_commands += 1
                 self._last_move_point = scaled
@@ -2340,7 +2588,23 @@ class DogTracker:
                     operation_timeout_ms=int(self.cfg.ptz_operation_timeout * 1000),
                 )
             else:
-                self._record_event("move_directly_failed", error=self.ptz.last_error)
+                self._move_failure_count += 1
+                backoff = min(
+                    self.cfg.move_failure_backoff_max,
+                    self.cfg.move_failure_backoff_base * (2 ** max(0, self._move_failure_count - 1)),
+                )
+                self._move_retry_after = t1 + backoff
+                self._record_event(
+                    "move_directly_failed",
+                    error=self.ptz.last_error,
+                    consecutive_failures=self._move_failure_count,
+                    retry_after_ms=int(backoff * 1000),
+                )
+                if self._move_failure_count >= self.cfg.move_failure_stop_after:
+                    await self._halt_tracking_for_ptz_failure(
+                        f"moveDirectly failed {self._move_failure_count} consecutive times; last error: {self.ptz.last_error}",
+                        operation="move",
+                    )
             return
 
         # Zoom is intentionally secondary to pan/tilt and happens only while the
@@ -2353,6 +2617,8 @@ class DogTracker:
         if self._last_zoom_position is None:
             status = await asyncio.to_thread(self.ptz.get_status)
             checked_at = time.monotonic()
+            if not self._session_valid(generation):
+                return
             if not status:
                 return
             self._last_camera_status = status
@@ -2399,6 +2665,8 @@ class DogTracker:
         t0 = time.monotonic()
         ok = await asyncio.to_thread(self.ptz.zoom_step, direction, duration_ms)
         t1 = time.monotonic()
+        if not self._session_valid(generation):
+            return
         self._last_zoom_command_at = t1
         if ok:
             self.ptz_commands += 1
@@ -2420,12 +2688,21 @@ class DogTracker:
         else:
             self._record_event("zoom_step_failed", direction=direction, error=self.ptz.last_error)
 
-    def _make_debug_frame(self, frame: np.ndarray, detections: List[Detection]) -> None:
+    def _render_debug_frame(
+        self,
+        debug: np.ndarray,
+        detections: List[Detection],
+        target: Optional[Detection],
+        state: str,
+        error_x: Optional[float],
+        error_y: Optional[float],
+        zoom_position: Optional[float],
+        ptz_operation: Optional[str],
+        inference_ms: int,
+    ) -> Optional[bytes]:
         try:
-            debug = frame.copy()
             h, w = debug.shape[:2]
             cx, cy = w // 2, h // 2
-
             left = int(cx - self.cfg.move_deadzone_x * (w / 2.0))
             right = int(cx + self.cfg.move_deadzone_x * (w / 2.0))
             top = int(cy - self.cfg.move_deadzone_y * (h / 2.0))
@@ -2436,41 +2713,26 @@ class DogTracker:
             for det in detections:
                 x1, y1, x2, y2 = [int(v) for v in det.bbox]
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 190, 255), 1)
-                cv2.putText(
-                    debug,
-                    f"{det.label} {det.confidence:.2f}",
-                    (x1, max(15, y1 - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 190, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                cv2.putText(debug, f"{det.label} {det.confidence:.2f}", (x1, max(15, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 190, 255), 1, cv2.LINE_AA)
 
-            if self.target is not None:
-                x1, y1, x2, y2 = [int(v) for v in self.target.bbox]
-                tx, ty = [int(v) for v in self.target.center]
+            if target is not None:
+                x1, y1, x2, y2 = [int(v) for v in target.bbox]
+                tx, ty = [int(v) for v in target.center]
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.line(debug, (cx, cy), (tx, ty), (0, 255, 0), 1)
                 cv2.circle(debug, (tx, ty), 4, (0, 255, 0), -1)
 
-            target_text = ""
-            if self.target is not None:
-                target_text = f" {self.target.label} {self.target.confidence:.2f}"
-            zoom_text = "?"
-            if self._last_zoom_position is not None:
-                zoom_text = f"{self._last_zoom_position / self.cfg.zoom_wide_position:.1f}x"
-            op_text = self._ptz_operation or "idle"
+            target_text = "" if target is None else f" {target.label} {target.confidence:.2f}"
+            zoom_text = "?" if zoom_position is None else f"{zoom_position / self.cfg.zoom_wide_position:.1f}x"
+            op_text = ptz_operation or "idle"
             text = (
-                f"{self.state}{target_text} mode=3D op={op_text} "
-                f"err={self._last_error_x if self._last_error_x is not None else 0:+.2f},"
-                f"{self._last_error_y if self._last_error_y is not None else 0:+.2f} "
-                f"zoom={zoom_text} infer={self._last_inference_ms}ms"
+                f"{state}{target_text} mode=3D op={op_text} "
+                f"err={error_x if error_x is not None else 0:+.2f},"
+                f"{error_y if error_y is not None else 0:+.2f} "
+                f"zoom={zoom_text} infer={inference_ms}ms"
             )
             cv2.putText(debug, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
             ok, encoded = cv2.imencode(".jpg", debug, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-            if ok:
-                self._debug_jpeg = encoded.tobytes()
+            return encoded.tobytes() if ok else None
         except Exception:
-            pass
+            return None

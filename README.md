@@ -16,8 +16,8 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 - **Latest-frame-only RTSP capture** for tracking, avoiding a backlog of stale frames.
 - **Native Dahua/Amcrest 3D positioning** using `moveDirectly`, with status-driven PTZ settling rather than fixed movement sleeps.
 - **Bounded predictive lead** based only on stationary-camera target motion.
-- **Bounded in-flight retargeting** so a slow native `moveDirectly` slew can have its destination replaced when the target reverses or is escaping toward a frame edge.
-- **Escape-zone gain** for stronger corrections near frame edges while retaining the normal conservative gain near center.
+- **Adaptive `moveDirectly` lead** learned from completed camera moves, with bounded one-shot edge rescue.
+- **Hybrid escape chase** that uses continuous PTZ only when a fast target is in genuine danger of leaving the frame.
 - **Conservative auto-zoom** with configurable minimum/maximum optical zoom bounds.
 - **GitHub Actions -> GHCR** builds on pushes to `main`.
 
@@ -65,7 +65,7 @@ in that directory. On startup, the gateway prefers models in this order:
 .engine -> .onnx -> .pt
 ```
 
-If a `.pt` model exists without a matching TensorRT engine, the gateway can build the `.engine` automatically for the current TensorRT/CUDA environment.
+If a `.pt` model exists without a matching TensorRT engine, the gateway can build the `.engine` automatically. A per-model manifest records the source-weight SHA-256, TensorRT/CUDA versions, GPU identity/compute capability, image size, and precision. A source/runtime change invalidates the cached engine, and an engine load failure triggers one rebuild attempt before falling back to the `.pt` model.
 
 ## API Endpoints
 
@@ -111,19 +111,17 @@ curl -s 'http://HOST:32169/v1/tracker/history?limit=300' | python3 -m json.tool
 
 ## PTZ Tracker Design
 
-The tracker uses the camera RTSP substream continuously and retains only the newest decoded frame. Tracker inference is opportunistic: regular gateway work keeps priority, and the tracker skips a frame rather than waiting behind normal Blue Iris inference.
+The tracker continuously drains the camera RTSP substream and retains only the newest decoded frame. Tracker inference is opportunistic: regular Blue Iris and FaceNet work has priority, so the tracker drops a frame instead of waiting behind queued gateway inference.
 
-For pan/tilt, the tracker uses Dahua/Amcrest `moveDirectly` 3D positioning. The camera's native positional move can take substantially longer than a manual joystick/continuous movement on some models, so the tracker does not assume a fixed travel time. It polls camera status and position until the camera reports idle and stable.
+Normal pan/tilt tracking uses Dahua/Amcrest `moveDirectly` 3D positioning. The tracker polls camera status and position until the camera reports idle and stable rather than sleeping for a guessed movement duration. Completed moves feed a small timing model that estimates future `moveDirectly` duration for bounded predictive lead.
 
-While a normal positional move is underway, detections continue. The tracker can issue a **bounded in-flight retarget** when the target clearly reverses direction, is escaping near a frame edge, or the tracking error grows sharply. This replaces the current destination without waiting for the old destination to finish. Retargeting is rate-limited and capped per movement chain so the camera is not flooded with commands.
+Predictive target velocity is learned only while the camera is stationary. It is suppressed for immature/noisy velocity samples, low-confidence or tiny detections, and edge-clipped detections. A one-shot **edge rescue** can use a stronger positional gain when the target is already near escape.
 
-Predictive velocity is **never learned from moving-camera frames**. In-flight retargets therefore use the target's current observed center only, not predictive lead. After the camera becomes stationary, one clean velocity baseline is taken and a minimum stationary-camera sample window must mature before predictive lead is trusted again.
+For fast outward motion, the tracker can enter an **escape-only hybrid chase**. Continuous PTZ is used only until the target returns to a safe inner region, then it stops and hands control back to `moveDirectly`. Continuous chase is bounded by speed, keepalive, maximum duration, cooldown, and camera-side timeout controls.
 
-Normal stationary-camera predictive lead is deliberately conservative. It is suppressed when the velocity sample is not mature, confidence is too low, the target is too small, or the detection touches the configured frame-edge margin. In those cases the camera still follows the target's current position; only the predictive lead is disabled.
+PTZ completion is fail-closed. At the operation deadline the tracker performs a final status read. If status remains unavailable, or the camera still cannot be established as safely idle, tracking stops with `state=PTZ_ERROR` rather than issuing another movement command. A later `/v1/tracker/start` can resume tracking; if the tracker task itself crashed, `start` recreates it.
 
-An **escape zone** is entered when the target approaches a frame edge or the normalized error is very large. In that state, pan/tilt uses a stronger configurable gain (`TRACKER_ESCAPE_GAIN`) to reduce the chance that a fast target leaves the frame.
-
-Target loss is paused while the camera is moving so global image motion does not look like the subject disappeared. When PTZ movement completes, the target-loss clock is restarted before normal coast/reacquisition timing resumes.
+Target-loss timing is paused while the camera is moving so global image motion is not mistaken for subject loss. After movement completes, the velocity estimator is rebased from a fresh stationary-camera frame.
 
 The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, including an Amcrest IP2M-863EW-AI. Other cameras may require changes to the PTZ transport or coordinate behavior.
 
@@ -135,8 +133,10 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `PRELOAD_MODELS` | blank | Comma-separated model stems to preload, or `all`. If blank, the default model is loaded. |
 | `ALLOW_LAZY_LOAD` | `false` | Allow requested models to load on demand. |
 | `HALF_PRECISION` | `true` | Use FP16 where supported. |
-| `INFERENCE_TIMEOUT` | `8.0` | GPU inference timeout in seconds. |
+| `INFERENCE_TIMEOUT` | `8.0` | Runtime CUDA job timeout in seconds. Applies to YOLO and FaceNet. |
+| `MODEL_LOAD_TIMEOUT` | `180.0` | Timeout for an optional lazy model load/warmup. |
 | `RECOVERY_GRACE_PERIOD` | `4.0` | Grace period for an orphaned CUDA worker before the container self-terminates. |
+| `MAX_FACE_EMBEDDINGS_PER_USER` | `20` | Maximum saved FaceNet embeddings per enrolled identity; oldest samples are discarded first. |
 | `ALERT_WEBHOOK_URL` | blank | Optional crash-alert webhook. |
 
 ## Tracker Environment Variables
@@ -174,30 +174,50 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TRACKER_MOVE_DIRECTLY_ENABLED` | `true` | Use Dahua/Amcrest 3D `moveDirectly`. |
+| `TRACKER_MOVE_DIRECTLY_ENABLED` | `true` | Use Dahua/Amcrest 3D `moveDirectly` for normal tracking. |
 | `TRACKER_MOVE_DEADZONE_X` | `0.14` | Horizontal normalized deadzone. |
 | `TRACKER_MOVE_DEADZONE_Y` | `0.18` | Vertical normalized deadzone. |
-| `TRACKER_MOVE_GAIN` | `0.60` | Fraction of projected frame error applied to a normal 3D move. |
-| `TRACKER_LEAD_TIME` | `0.75` | Seconds of target-velocity lead before clamping. |
-| `TRACKER_VELOCITY_MIN_SAMPLE_MS` | `100` | Minimum stationary-camera observation window before velocity is trusted. |
+| `TRACKER_MOVE_GAIN` | `0.60` | Fraction of projected frame error applied to a normal positional move. |
+| `TRACKER_LEAD_TIME` | `0.75` | Fallback lead horizon before enough move timing samples exist. |
+| `TRACKER_VELOCITY_MIN_SAMPLE_MS` | `100` | Minimum stationary-camera sample window before velocity is trusted. |
 | `TRACKER_LEAD_MIN_CONF` | `0.50` | Suppress predictive lead below this confidence. |
 | `TRACKER_LEAD_MIN_SPAN` | `0.08` | Suppress predictive lead for very small targets. |
-| `TRACKER_LEAD_EDGE_MARGIN` | `0.02` | Suppress predictive lead when the bbox touches this fraction of a frame edge. |
+| `TRACKER_LEAD_EDGE_MARGIN` | `0.02` | Suppress predictive lead when the bbox touches this frame margin. |
+| `TRACKER_ADAPTIVE_LEAD` | `true` | Learn move duration from completed `moveDirectly` operations. |
+| `TRACKER_MOVE_ETA_MIN_SAMPLES` | `3` | Completed moves required before the learned timing model is trusted. |
+| `TRACKER_MOVE_ETA_HISTORY` | `24` | Maximum completed move samples retained. |
+| `TRACKER_MOVE_ETA_MIN` | `0.50` | Minimum learned/fallback lead horizon. |
+| `TRACKER_MOVE_ETA_MAX` | `2.00` | Maximum learned lead horizon. |
+| `TRACKER_VELOCITY_CONSISTENCY_COSINE` | `0.25` | Reject abrupt direction changes from predictive lead. |
+| `TRACKER_VELOCITY_JUMP_RATIO` | `4.0` | Reject implausible velocity magnitude jumps. |
 
-Predictive lead is additionally hard-clamped to 20% of frame width/height per axis in code.
+Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 
-### In-Flight Retargeting / Escape Zone
+### Edge Rescue / Hybrid Escape Chase
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TRACKER_INFLIGHT_RETARGET_ENABLED` | `true` | Allow a small number of destination replacements while `moveDirectly` is still moving. |
-| `TRACKER_INFLIGHT_RETARGET_INTERVAL` | `0.30` | Minimum seconds between in-flight retarget commands. |
-| `TRACKER_INFLIGHT_RETARGET_MAX` | `2` | Maximum retargets during one physical move chain. |
-| `TRACKER_INFLIGHT_REVERSAL_ERROR` | `0.22` | Minimum normalized opposite-side error required to treat a crossing as a reversal. |
-| `TRACKER_ESCAPE_ERROR` | `0.72` | Normalized error that enters escape mode even if the bbox is not yet near the edge. |
-| `TRACKER_ESCAPE_GAIN` | `0.85` | Stronger pan/tilt gain used in escape mode. |
-
-In-flight retargets deliberately use the current target center with **no predictive lead**, because bbox motion while the PTZ is slewing contains global camera motion. The tracker may retarget for `reversal`, `escape`, or `error_growth`, and history records the reason.
+| `TRACKER_EDGE_RESCUE_ENABLED` | `true` | Permit a stronger one-shot positional correction near an edge. |
+| `TRACKER_EDGE_RESCUE_ERROR` | `0.75` | Normalized error that can request edge rescue. |
+| `TRACKER_EDGE_RESCUE_GAIN` | `0.85` | Positional gain used by edge rescue. |
+| `TRACKER_HYBRID_CHASE_ENABLED` | `true` | Allow continuous PTZ only for genuine escape conditions. |
+| `TRACKER_HYBRID_CHASE_PAN_SIGN` | `-1` | Camera-specific horizontal continuous-move direction sign. |
+| `TRACKER_HYBRID_CHASE_ENTRY_ERROR` | `0.82` | Hard normalized error threshold for chase entry. |
+| `TRACKER_HYBRID_CHASE_EXIT_ERROR` | `0.50` | Stop chase after the target returns inside this error. |
+| `TRACKER_HYBRID_CHASE_MOTION_ERROR` | `0.55` | Lower error threshold used for fast outward-motion entry. |
+| `TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM` | `0.03` | Minimum normalized target speed for motion-based entry. |
+| `TRACKER_HYBRID_CHASE_MISS_GRACE` | `0.15` | Brief detector-miss grace during motion blur. |
+| `TRACKER_HYBRID_CHASE_MIN_SPEED` | `1` | Minimum continuous PTZ speed. |
+| `TRACKER_HYBRID_CHASE_MAX_SPEED` | `6` | Maximum continuous PTZ speed. |
+| `TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR` | `0.90` | Error at which maximum continuous speed is reached. |
+| `TRACKER_HYBRID_CHASE_COMMAND_INTERVAL` | `0.18` | Minimum interval between changed chase commands. |
+| `TRACKER_HYBRID_CHASE_KEEPALIVE` | `0.45` | Keepalive interval when chase speed is unchanged. |
+| `TRACKER_HYBRID_CHASE_CAMERA_TIMEOUT` | `1` | Camera-side continuous movement timeout. |
+| `TRACKER_HYBRID_CHASE_MAX_SECONDS` | `2.50` | Maximum duration of one escape chase. |
+| `TRACKER_HYBRID_CHASE_COOLDOWN` | `0.35` | Cooldown before re-entering chase. |
+| `TRACKER_HYBRID_CHASE_SETTLE_FRAMES` | `2` | Fresh frames required after chase stops. |
+| `TRACKER_HYBRID_DIVERGENCE_FRAMES` | `3` | Consecutive materially-worsening chase frames before the chase is aborted. |
+| `TRACKER_HYBRID_DIVERGENCE_GROWTH` | `0.05` | Minimum normalized error growth that counts toward divergence. |
 
 ### PTZ Operation Settling
 
@@ -230,31 +250,33 @@ In-flight retargets deliberately use the current target center with **no predict
 
 ## Recommended Tracker Tuning
 
-The included example Compose reflects the current tested tuning:
+The included example Compose reflects the current hybrid controller:
 
 ```text
 TRACKER_FPS=15
 TRACKER_MOVE_GAIN=0.60
 TRACKER_LEAD_TIME=0.75
-TRACKER_VELOCITY_MIN_SAMPLE_MS=100
-TRACKER_LEAD_MIN_CONF=0.50
-TRACKER_LEAD_MIN_SPAN=0.08
-TRACKER_LEAD_EDGE_MARGIN=0.02
-TRACKER_INFLIGHT_RETARGET_ENABLED=true
-TRACKER_INFLIGHT_RETARGET_INTERVAL=0.30
-TRACKER_INFLIGHT_RETARGET_MAX=2
-TRACKER_INFLIGHT_REVERSAL_ERROR=0.22
-TRACKER_ESCAPE_ERROR=0.72
-TRACKER_ESCAPE_GAIN=0.85
+TRACKER_ADAPTIVE_LEAD=true
+TRACKER_EDGE_RESCUE_ENABLED=true
+TRACKER_EDGE_RESCUE_ERROR=0.75
+TRACKER_EDGE_RESCUE_GAIN=0.85
+TRACKER_HYBRID_CHASE_ENABLED=true
+TRACKER_HYBRID_CHASE_PAN_SIGN=-1
+TRACKER_HYBRID_CHASE_ENTRY_ERROR=0.82
+TRACKER_HYBRID_CHASE_EXIT_ERROR=0.50
+TRACKER_HYBRID_CHASE_MOTION_ERROR=0.55
+TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM=0.03
+TRACKER_HYBRID_CHASE_MIN_SPEED=1
+TRACKER_HYBRID_CHASE_MAX_SPEED=6
 TRACKER_PTZ_STATUS_POLL_INTERVAL=0.06
 TRACKER_PTZ_OPERATION_TIMEOUT=4.0
 TRACKER_POST_MOVE_FRAMES=1
 TRACKER_ZOOM_MAX_FACTOR=6.0
 ```
 
-When tuning, use `/v1/tracker/history` rather than guessing from visual behavior alone. Normal `move_directly` history events include the target center, predicted center, command center, velocity sample duration, predictive-lead validity/suppression reason, lead pixels, effective gain, HTTP duration, and target confidence.
+When tuning, use `/v1/tracker/history`. `move_directly` events include target/predicted/command centers, velocity quality, lead suppression, effective gain, move distance, predicted ETA, confidence, and CGI latency. Hybrid chase history records entry reason, signed speed, frame error, outward-motion state, stops, and failures. `ptz_operation_complete`, `ptz_operation_timeout`, and `tracking_stopped_ptz_error` show whether camera motion settled safely.
 
-In-flight destination changes are logged as `move_directly_retarget`, including the retarget reason, index, current target center, command center, gain, current normalized error, total move-chain elapsed time, and HTTP duration. The final `ptz_operation_complete` event includes both the time since the latest destination and the total `chain_elapsed_ms`, plus the number of retargets used.
+`/v1/tracker/status` also exposes `stop_reason`, `tracker_task_running`, and `tracker_task_error`. If the tracker loop itself crashes, a subsequent `/v1/tracker/start` recreates the task instead of requiring a container restart.
 
 ## Updating
 
@@ -264,3 +286,8 @@ docker compose up -d --force-recreate blueiris-ai
 ```
 
 GitHub Actions builds `latest` and a commit-SHA-tagged image on every push to `main`.
+
+
+### Additional tracker reliability notes
+
+The RTSP reader uses OpenCV/FFmpeg open and read timeouts (`TRACKER_RTSP_OPEN_TIMEOUT` / `TRACKER_RTSP_READ_TIMEOUT`) so a stalled stream can reconnect instead of blocking forever. Debug JPEGs are rendered only when `/v1/tracker/debug.jpg` is requested. Tracker sessions use a generation token so results from inference or PTZ calls that complete after `/stop` or `/home` are discarded. Lost-target home commands are retried a bounded number of times (`TRACKER_HOME_RETRY_ATTEMPTS`, `TRACKER_HOME_RETRY_DELAY`). Hybrid chase disables itself for the remainder of the session if tracking error grows materially for several consecutive frames, then falls back to normal `moveDirectly`.
