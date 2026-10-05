@@ -4,8 +4,7 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "tools/apply_active_ptz_calibration.py"
-      - "tools/fix_active_ptz_patch_driver.py"
+      - "tools/harden_active_ptz_calibration.py"
       - ".github/workflows/apply-active-ptz-calibration.yml"
 
 permissions:
@@ -21,22 +20,20 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: pip install numpy opencv-python-headless
-      - name: Apply guarded integration
-        run: |
-          python tools/fix_active_ptz_patch_driver.py
-          python tools/apply_active_ptz_calibration.py
+      - name: Apply calibration hardening
+        run: python tools/harden_active_ptz_calibration.py
       - name: Compile Python sources
         run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py ptz_active_calibration.py
       - name: Run tests
         run: python -m unittest discover -s tests -v
-      - name: Commit validated runtime integration
+      - name: Commit validated hardening
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tracker.py app.py Dockerfile docker-compose.example.yml README.md tests/test_active_ptz_contracts.py
+          git add tracker.py ptz_enhancements.py
           if git diff --cached --quiet; then
             echo "No runtime changes to commit"
             exit 0
           fi
-          git commit -m "Add active PTZ motion calibration"
+          git commit -m "Harden active PTZ calibration results"
           git push
