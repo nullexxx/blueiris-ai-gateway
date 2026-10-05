@@ -377,15 +377,15 @@ class CalibrationStore:
         if not isinstance(row, dict):
             return 1.0, 1.0
         return (
-            _bounded(float(row.get("pan_scale", 1.0)), 0.75, 1.25),
-            _bounded(float(row.get("tilt_scale", 1.0)), 0.75, 1.25),
+            _bounded(float(row.get("pan_scale", 1.0)), 0.75, 1.35),
+            _bounded(float(row.get("tilt_scale", 1.0)), 0.75, 1.35),
         )
 
     def set_spatial_scales(self, bucket: str, pan_scale: float, tilt_scale: float) -> None:
         spatial = self._camera().setdefault("spatial_response", {})
         spatial[bucket] = {
-            "pan_scale": _bounded(pan_scale, 0.75, 1.25),
-            "tilt_scale": _bounded(tilt_scale, 0.75, 1.25),
+            "pan_scale": _bounded(pan_scale, 0.75, 1.35),
+            "tilt_scale": _bounded(tilt_scale, 0.75, 1.35),
         }
         self._dirty = True
         self.flush()

@@ -980,6 +980,107 @@ def _iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, flo
     return inter / max(1.0, area_a + area_b - inter)
 
 
+
+def _motion_control_decision(
+    *,
+    err_x,
+    err_y,
+    vx,
+    vy,
+    velocity_valid,
+    velocity_sample_ms,
+    frame_shape,
+    move_eta_s,
+    hybrid_enabled,
+    hybrid_disabled,
+    cooldown_ready,
+    edge_clipped,
+    exit_error,
+    entry_error,
+    motion_error,
+    motion_speed_norm,
+    min_sample_ms,
+    deadline_travel_norm,
+):
+    # Choose continuous PTZ only when a positional move is likely to become stale.
+    h, w = frame_shape[:2]
+    half_w = max(1.0, float(w) / 2.0)
+    half_h = max(1.0, float(h) / 2.0)
+    frame_diag = max(1.0, math.hypot(w, h))
+    dominant_error = max(abs(err_x), abs(err_y))
+    target_speed_norm = math.hypot(vx, vy) / frame_diag if velocity_valid else 0.0
+    velocity_mature = bool(velocity_valid and velocity_sample_ms >= min_sample_ms)
+
+    if abs(err_x) >= abs(err_y):
+        dominant_axis_error = err_x
+        dominant_axis_velocity = vx
+    else:
+        dominant_axis_error = err_y
+        dominant_axis_velocity = vy
+
+    moving_inward_dominant = velocity_mature and (
+        abs(dominant_axis_error) >= exit_error
+        and dominant_axis_error * dominant_axis_velocity < 0.0
+        and abs(dominant_axis_velocity) / frame_diag >= motion_speed_norm
+    )
+    moving_outward = velocity_mature and (
+        (abs(err_x) >= motion_error and err_x * vx > 0.0)
+        or (abs(err_y) >= motion_error and err_y * vy > 0.0)
+    )
+
+    projected_travel_norm = 0.0
+    if velocity_mature:
+        projected_travel_norm = max(
+            abs(vx) * max(0.0, move_eta_s) / half_w,
+            abs(vy) * max(0.0, move_eta_s) / half_h,
+        )
+
+    motion_escape = (
+        velocity_mature
+        and dominant_error >= motion_error
+        and target_speed_norm >= motion_speed_norm
+        and moving_outward
+    )
+    deadline_escape = (
+        velocity_mature
+        and dominant_error >= motion_error
+        and projected_travel_norm >= deadline_travel_norm
+        and not moving_inward_dominant
+    )
+    hard_escape_error = max(0.90, entry_error + 0.08)
+    edge_escape = edge_clipped and dominant_error >= entry_error and not moving_inward_dominant
+    hard_escape = dominant_error >= hard_escape_error and not moving_inward_dominant
+
+    use_continuous = bool(
+        hybrid_enabled
+        and not hybrid_disabled
+        and cooldown_ready
+        and (edge_escape or hard_escape or motion_escape or deadline_escape)
+    )
+    reason = None
+    if use_continuous:
+        if motion_escape:
+            reason = "motion_escape"
+        elif deadline_escape:
+            reason = "deadline_motion"
+        elif edge_escape:
+            reason = "edge_clipped"
+        else:
+            reason = "hard_escape"
+
+    return {
+        "use_continuous": use_continuous,
+        "reason": reason,
+        "velocity_mature": velocity_mature,
+        "target_speed_norm": target_speed_norm,
+        "projected_travel_norm": projected_travel_norm,
+        "moving_outward": moving_outward,
+        "moving_inward_dominant": moving_inward_dominant,
+        "motion_escape": motion_escape,
+        "deadline_escape": deadline_escape,
+    }
+
+
 class DogTracker:
     """Multi-class YOLO tracker using Dahua 3D moveDirectly + bounded autozoom."""
 
@@ -1073,6 +1174,18 @@ class DogTracker:
         self._quality_improvements: Deque[float] = deque(maxlen=50)
         self._quality_overshoots = 0
         self._quality_undershoots = 0
+        self._motion_control_min_sample_ms = max(
+            200, min(1000, _env_int("TRACKER_MOTION_CONTROL_MIN_SAMPLE_MS", 250))
+        )
+        self._motion_control_deadline_travel = max(
+            0.05, min(0.75, _env_float("TRACKER_MOTION_CONTROL_DEADLINE_TRAVEL", 0.18))
+        )
+        self._move_direct_lead_horizon_max = max(
+            0.25, min(1.50, _env_float("TRACKER_MOVE_DIRECT_LEAD_HORIZON_MAX", 0.80))
+        )
+        self._move_direct_lead_max_fraction = max(
+            0.05, min(0.25, _env_float("TRACKER_MOVE_DIRECT_LEAD_MAX_FRACTION", 0.12))
+        )
 
         self.active = False
         self.state = "OFF"
@@ -1404,7 +1517,15 @@ class DogTracker:
         if policy == "off":
             return False, False
         zoom_missing = self.cfg.autozoom and len(self._zoom_map.points()) < 2
-        motion_missing = not self._active_calibration.has_motion_calibration()
+        saved_move = self._active_calibration.move_directly()
+        try:
+            motion_revision = int(saved_move.get("controller_revision", 0) or 0)
+        except (TypeError, ValueError):
+            motion_revision = 0
+        motion_missing = (
+            not self._active_calibration.has_motion_calibration()
+            or motion_revision < 2
+        )
         motion_stale = not self._active_calibration.is_fresh(self._calibration_max_age_days)
         if policy == "always":
             zoom_needed = self.cfg.autozoom
@@ -1603,19 +1724,20 @@ class DogTracker:
         nx, ny = shift.normalized(before.shape)
         observed_x, observed_y = -nx, -ny
         requested = math.hypot(err_x, err_y)
-        elapsed = time.monotonic() - started
+        command_s = command_done - started
+        settled_s = command_s + float(wait["elapsed_s"])
         row = {
             "zoom_factor": round(factor, 3),
             "requested_error": [round(err_x, 4), round(err_y, 4)],
             "observed_correction": [round(observed_x, 4), round(observed_y, 4)],
             "move_distance": round(requested, 4),
             "command_http_ms": int((command_done - started) * 1000),
-            "motion_start_ms": None if wait["motion_start_s"] is None else int(wait["motion_start_s"] * 1000),
-            "settled_ms": int(elapsed * 1000),
+            "motion_start_ms": None if wait["motion_start_s"] is None else int((command_s + float(wait["motion_start_s"])) * 1000),
+            "settled_ms": int(settled_s * 1000),
             "shift": shift.public_dict(),
         }
         if requested > 0.01 and math.hypot(observed_x, observed_y) > 0.03:
-            self._update_move_timing_model(requested, elapsed)
+            self._update_move_timing_model(requested, settled_s)
         self._record_event("active_calibration_move_directly", **row)
         return row
 
@@ -1650,6 +1772,7 @@ class DogTracker:
         correction = -nx if axis == "pan" else -ny
         rate = abs(correction) / max(0.05, self._calibration_continuous_duration)
         desired_sign = raw_sign if correction >= 0 else -raw_sign
+        settled_s = (command_done - started) + self._calibration_continuous_duration + float(wait["elapsed_s"])
         row = {
             "zoom_factor": round(factor, 3),
             "axis": axis,
@@ -1658,7 +1781,7 @@ class DogTracker:
             "correction_sign": desired_sign,
             "normalized_rate_per_s": round(rate, 4),
             "command_http_ms": int((command_done - started) * 1000),
-            "settled_ms": int((time.monotonic() - started) * 1000),
+            "settled_ms": int(settled_s * 1000),
             "shift": shift.public_dict(),
         }
         self._record_event("active_calibration_continuous", **row)
@@ -1722,8 +1845,17 @@ class DogTracker:
         run_continuous = mode in ("continuous", "motion", "all")
         run_onvif = mode in ("onvif", "motion", "all")
         safe_to_track = True
+        result_payload: Optional[dict] = None
         try:
             if run_move:
+                self._move_timing_samples.clear()
+                self._move_eta_intercept = max(
+                    self.cfg.move_eta_min,
+                    min(self.cfg.move_eta_max, self.cfg.lead_time),
+                )
+                self._move_eta_slope = 0.0
+                self._move_eta_model_ready = False
+                self._last_predicted_move_eta = self._move_eta_intercept
                 for zoom_index, factor in enumerate(self._calibration_zoom_levels):
                     offsets = self._calibration_offsets if zoom_index == 0 else [max(self._calibration_offsets)]
                     for offset in offsets:
@@ -1751,8 +1883,12 @@ class DogTracker:
                 for bucket, values in bucket_ratios.items():
                     pan_ratio = float(np.median(values["pan"])) if values["pan"] else 1.0
                     tilt_ratio = float(np.median(values["tilt"])) if values["tilt"] else 1.0
-                    pan_scale = max(0.75, min(1.25, 1.0 / max(0.20, pan_ratio)))
-                    tilt_scale = max(0.75, min(1.25, 1.0 / max(0.20, tilt_ratio)))
+                    # Runtime moveDirectly applies cfg.move_gain first. Seed the
+                    # learned multiplier so a stationary target receives about an
+                    # 80% one-step correction. Live moving targets never tune this.
+                    target_fraction = 0.80
+                    pan_scale = max(0.75, min(1.35, target_fraction / max(0.20, self.cfg.move_gain * pan_ratio)))
+                    tilt_scale = max(0.75, min(1.35, target_fraction / max(0.20, self.cfg.move_gain * tilt_ratio)))
                     self._calibration.set_spatial_scales(bucket, pan_scale, tilt_scale)
 
             if run_continuous:
@@ -1779,6 +1915,7 @@ class DogTracker:
 
             if run_move and move_samples:
                 move_result = {
+                    "controller_revision": 2,
                     "samples": move_samples,
                     "timing": {
                         "intercept_s": round(self._move_eta_intercept, 4),
@@ -1820,7 +1957,9 @@ class DogTracker:
 
             move_ok = (not run_move) or len(move_samples) >= 4
             continuous_ok = (not run_continuous) or len(continuous_samples) >= 4
-            onvif_ok = (not run_onvif) or isinstance(onvif_result, dict)
+            # ONVIF remains optional for native motion/all calibration. An
+            # explicit mode=onvif request succeeds only if the service is reachable.
+            onvif_ok = mode != "onvif" or bool(isinstance(onvif_result, dict) and onvif_result.get("available"))
             success = move_ok and continuous_ok and onvif_ok
             if success or move_samples or continuous_samples:
                 self._active_calibration.replace_motion_calibration(
@@ -1828,7 +1967,7 @@ class DogTracker:
                     continuous=continuous_result,
                     onvif_benchmark=onvif_result,
                 )
-            return {
+            result_payload = {
                 "success": success,
                 "mode": mode,
                 "move_directly_samples": len(move_samples),
@@ -1841,19 +1980,25 @@ class DogTracker:
                 },
                 "active_calibration": self._active_calibration.public_dict(),
                 "onvif_benchmark": onvif_result,
-                "safe_to_track": safe_to_track,
+                "safe_to_track": True,
             }
+            return result_payload
         except asyncio.CancelledError:
             safe_to_track = False
             raise
         except Exception as exc:
             self.logger.error("Active PTZ calibration failed: %s", exc, exc_info=True)
-            return {"success": False, "mode": mode, "error": str(exc), "safe_to_track": False}
+            result_payload = {"success": False, "mode": mode, "error": str(exc), "safe_to_track": False}
+            return result_payload
         finally:
             await asyncio.to_thread(self.ptz.continuous_stop)
             home_ok = await self._calibration_home()
-            if not home_ok:
-                safe_to_track = False
+            safe_to_track = bool(home_ok)
+            if result_payload is not None:
+                result_payload["safe_to_track"] = safe_to_track
+                if not home_ok:
+                    result_payload["success"] = False
+                    result_payload["home_error"] = "Camera did not safely return to the configured home preset."
             self.state = "OFF"
             self._calibrating = False
 
@@ -2254,8 +2399,8 @@ class DogTracker:
             "move_failure_count": self._move_failure_count,
             "history_events": len(self._history),
             "state": self.state,
-            "control_mode": "hybrid",
-            "primary_control_mode": "moveDirectly",
+            "control_mode": "adaptive_hybrid",
+            "primary_control_mode": "continuous_when_moving",
             "hybrid_chase_active": self._hybrid_chase_active,
             "hybrid_chase_speed": [self._hybrid_pan_speed, self._hybrid_tilt_speed],
             "hybrid_chase_elapsed_ms": (
@@ -2313,6 +2458,14 @@ class DogTracker:
                 "target_history": self._smart_history.metrics(now, 1.0),
                 "move_quality_samples": len(self._quality_improvements),
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
+                "motion_control": {
+                    "controller_revision": 2,
+                    "min_velocity_sample_ms": self._motion_control_min_sample_ms,
+                    "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
+                    "move_direct_lead_horizon_max_s": round(self._move_direct_lead_horizon_max, 3),
+                    "move_direct_lead_max_fraction": round(self._move_direct_lead_max_fraction, 3),
+                    "live_spatial_learning": False,
+                },
                 "overshoots": self._quality_overshoots,
                 "undershoots": self._quality_undershoots,
                 "calibration": self._calibration.public_dict(),
@@ -2444,6 +2597,8 @@ class DogTracker:
     def _validate_velocity_for_lead(self, frame_shape: Tuple[int, ...]) -> Tuple[bool, Optional[str]]:
         if self.target is None or not self.target.velocity_valid:
             return False, "velocity_sample"
+        if self.target.velocity_sample_ms < self._motion_control_min_sample_ms:
+            return False, "velocity_sample"
 
         h, w = frame_shape[:2]
         vx = self.target.vx
@@ -2533,21 +2688,10 @@ class DogTracker:
         self._quality_undershoots += int(undershoot)
         bucket = str(pending["bucket"])
         pan_scale, tilt_scale = self._calibration.spatial_scales(bucket)
+        # Live-target telemetry is observational only. Active calibration
+        # uses a static scene and is authoritative for spatial camera response;
+        # a walking target must never rewrite those camera-specific scales.
         learned = False
-        if float(pending.get("speed_norm", 1.0)) <= 0.02 and self._frame_sharpness_ok and self.target.confidence >= self.cfg.lead_min_conf:
-            rate = 0.04
-            def tune(pre, post, scale):
-                if abs(pre) < 0.10:
-                    return scale
-                if pre * post < 0 and abs(post) > 0.04:
-                    return max(0.75, scale * (1.0 - rate))
-                if abs(post) / max(1e-6, abs(pre)) > 0.55:
-                    return min(1.25, scale * (1.0 + rate))
-                return scale
-            new_pan, new_tilt = tune(pre_x, post_x, pan_scale), tune(pre_y, post_y, tilt_scale)
-            if abs(new_pan - pan_scale) > 1e-6 or abs(new_tilt - tilt_scale) > 1e-6:
-                self._calibration.set_spatial_scales(bucket, new_pan, new_tilt)
-                pan_scale, tilt_scale, learned = new_pan, new_tilt, True
         self._record_event("move_quality", pre_error=[round(pre_x, 3), round(pre_y, 3)], post_error=[round(post_x, 3), round(post_y, 3)], improvement=round(improvement, 3), overshoot=overshoot, undershoot=undershoot, learned=learned, zoom_bucket=bucket, pan_scale=round(pan_scale, 3), tilt_scale=round(tilt_scale, 3))
         self._pending_move_quality = None
 
@@ -3293,7 +3437,10 @@ class DogTracker:
                 matched,
                 now,
                 update_velocity=velocity_learning_allowed,
-                min_velocity_sample_s=self.cfg.velocity_min_sample_ms / 1000.0,
+                min_velocity_sample_s=max(
+                    self.cfg.velocity_min_sample_ms,
+                    self._motion_control_min_sample_ms,
+                ) / 1000.0,
             )
             self._smart_history.add(now, matched.bbox, matched.confidence, frame.shape)
             if self._ptz_operation is None and ptz_ready and not self._frame_sharpness_ok:
@@ -3360,7 +3507,10 @@ class DogTracker:
                 and self.target.velocity_reference_time is not None
                 and not self.target.velocity_valid
                 and (now - self.target.velocity_reference_time)
-                    < (self.cfg.velocity_min_sample_ms / 1000.0)
+                    < (
+                        max(self.cfg.velocity_min_sample_ms, self._motion_control_min_sample_ms)
+                        / 1000.0
+                    )
             ):
                 self.state = "VELOCITY_SAMPLE"
                 return
@@ -3604,34 +3754,52 @@ class DogTracker:
                 and dominant_axis_error * dominant_axis_velocity < 0.0
                 and abs(dominant_axis_velocity) / frame_diag >= self.cfg.hybrid_chase_motion_speed_norm
             )
-            motion_escape = (
-                dominant_error >= self.cfg.hybrid_chase_motion_error
-                and target_speed_norm >= self.cfg.hybrid_chase_motion_speed_norm
-                and moving_outward
+            rough_move_distance = min(
+                2.0,
+                (abs(err_x) + abs(err_y)) * self.cfg.move_gain,
             )
-            hybrid_entry = (
-                self.cfg.hybrid_chase_enabled
-                and not self._hybrid_disabled_for_session
-                and (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
-                and (
-                    (edge_clipped_now and dominant_error >= self.cfg.hybrid_chase_entry_error and not moving_inward_dominant)
-                    or (dominant_error >= hard_escape_error and not moving_inward_dominant)
-                    or motion_escape
-                )
+            handoff_eta_s = self._predict_move_eta(rough_move_distance)
+            control_decision = _motion_control_decision(
+                err_x=err_x,
+                err_y=err_y,
+                vx=self.target.vx,
+                vy=self.target.vy,
+                velocity_valid=self.target.velocity_valid,
+                velocity_sample_ms=self.target.velocity_sample_ms,
+                frame_shape=frame_shape,
+                move_eta_s=handoff_eta_s,
+                hybrid_enabled=self.cfg.hybrid_chase_enabled,
+                hybrid_disabled=self._hybrid_disabled_for_session,
+                cooldown_ready=(now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown,
+                edge_clipped=edge_clipped_now,
+                exit_error=self.cfg.hybrid_chase_exit_error,
+                entry_error=self.cfg.hybrid_chase_entry_error,
+                motion_error=self.cfg.hybrid_chase_motion_error,
+                motion_speed_norm=self.cfg.hybrid_chase_motion_speed_norm,
+                min_sample_ms=self._motion_control_min_sample_ms,
+                deadline_travel_norm=self._motion_control_deadline_travel,
             )
+            target_speed_norm = float(control_decision["target_speed_norm"])
+            moving_outward = bool(control_decision["moving_outward"])
+            moving_inward_dominant = bool(control_decision["moving_inward_dominant"])
+            motion_escape = bool(control_decision["motion_escape"])
+            deadline_escape = bool(control_decision["deadline_escape"])
+            hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
-                pan_speed = self.cfg.hybrid_chase_pan_sign * self._hybrid_axis_speed(err_x)
-                tilt_speed = -self._hybrid_axis_speed(err_y)
+                pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
+                tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
+                pan_speed = pan_sign * self._hybrid_axis_speed(err_x, "pan")
+                tilt_speed = tilt_sign * self._hybrid_axis_speed(err_y, "tilt")
                 self._record_event(
                     "hybrid_chase_enter",
                     label=self.target.label,
-                    entry_reason=(
-                        "motion_escape" if motion_escape else
-                        ("edge_clipped" if edge_clipped_now else "hard_escape")
-                    ),
+                    entry_reason=control_decision["reason"],
                     error_x=round(err_x, 3),
                     error_y=round(err_y, 3),
                     target_speed_norm=round(target_speed_norm, 4),
+                    velocity_mature=bool(control_decision["velocity_mature"]),
+                    projected_travel_norm=round(float(control_decision["projected_travel_norm"]), 4),
+                    deadline_escape=deadline_escape,
                     moving_outward=bool(moving_outward),
                     moving_inward_dominant=bool(moving_inward_dominant),
                     edge_clipped=edge_clipped_now,
@@ -3682,7 +3850,11 @@ class DogTracker:
                 or abs(err_x) >= self.cfg.edge_rescue_error
                 or abs(err_y) >= self.cfg.edge_rescue_error
             )
-            edge_rescue_active = edge_rescue_requested and not moving_inward_dominant
+            edge_rescue_active = (
+                edge_rescue_requested
+                and not moving_inward_dominant
+                and (not self.cfg.hybrid_chase_enabled or self._hybrid_disabled_for_session)
+            )
             edge_rescue_reason: Optional[str] = None
             if edge_rescue_active:
                 edge_rescue_reason = "edge_clipped" if edge_clipped else "extreme_error"
@@ -3710,7 +3882,8 @@ class DogTracker:
                 frame_cy + (target_cy - frame_cy) * gain_y,
             )
             base_move_distance = self._move_distance_from_center(base_command_center, frame_shape)
-            lead_horizon_s = self._predict_move_eta(base_move_distance)
+            predicted_move_eta_s = self._predict_move_eta(base_move_distance)
+            lead_horizon_s = min(predicted_move_eta_s, self._move_direct_lead_horizon_max)
 
             lead_suppressed_reason: Optional[str] = None
             if not self.target.velocity_valid:
@@ -3730,8 +3903,8 @@ class DogTracker:
             if lead_valid:
                 lead_dx = velocity_x * lead_horizon_s
                 lead_dy = velocity_y * lead_horizon_s
-                max_lead_x = w * 0.20
-                max_lead_y = h * 0.20
+                max_lead_x = w * self._move_direct_lead_max_fraction
+                max_lead_y = h * self._move_direct_lead_max_fraction
                 lead_dx = max(-max_lead_x, min(max_lead_x, lead_dx))
                 lead_dy = max(-max_lead_y, min(max_lead_y, lead_dy))
             else:
@@ -3796,7 +3969,7 @@ class DogTracker:
                     edge_rescue_reason=edge_rescue_reason,
                     lead_time=round(self.cfg.lead_time, 3),
                     lead_horizon_s=round(lead_horizon_s, 3),
-                    predicted_move_eta_ms=int(lead_horizon_s * 1000),
+                    predicted_move_eta_ms=int(predicted_move_eta_s * 1000),
                     move_distance=round(move_distance, 3),
                     move_timing_samples=len(self._move_timing_samples),
                     move_eta_model_ready=self._move_eta_model_ready,
