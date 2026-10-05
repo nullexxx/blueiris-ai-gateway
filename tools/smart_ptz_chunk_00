@@ -172,9 +172,15 @@ tracker = replace_once(
 # Persist the already-existing robust timing fit.
 tracker = replace_once(
     tracker,
-    '        self._move_eta_model_ready = True\n',
+    '        self._move_eta_slope = max(0.0, min(2.0, slope))\n'
+    '        self._move_eta_model_ready = True\n\n'
+    '    @staticmethod\n'
+    '    def _point_segment_distance',
+    '        self._move_eta_slope = max(0.0, min(2.0, slope))\n'
     '        self._move_eta_model_ready = True\n'
-    '        self._calibration.set_timing(self._move_eta_intercept, self._move_eta_slope, list(self._move_timing_samples))\n',
+    '        self._calibration.set_timing(self._move_eta_intercept, self._move_eta_slope, list(self._move_timing_samples))\n\n'
+    '    @staticmethod\n'
+    '    def _point_segment_distance',
     'persist timing',
 )
 
