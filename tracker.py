@@ -3003,10 +3003,11 @@ class DogTracker:
 
         generation = self._session_generation
         t0 = time.monotonic()
+        command_pan, command_tilt = desired
         ok = await asyncio.to_thread(
             self.ptz.continuous_move,
-            pan_speed,
-            tilt_speed,
+            command_pan,
+            command_tilt,
             self.cfg.hybrid_chase_camera_timeout,
         )
         t1 = time.monotonic()
@@ -3017,8 +3018,8 @@ class DogTracker:
         if not ok:
             self._record_event(
                 "hybrid_chase_move_failed",
-                pan_speed=pan_speed,
-                tilt_speed=tilt_speed,
+                pan_speed=command_pan,
+                tilt_speed=command_tilt,
                 error=self.ptz.last_error,
             )
             if self._hybrid_chase_active:
@@ -3032,8 +3033,8 @@ class DogTracker:
             self._hybrid_divergence_count = 0
             self.hybrid_chase_entries += 1
         self._hybrid_chase_active = True
-        self._hybrid_pan_speed = pan_speed
-        self._hybrid_tilt_speed = tilt_speed
+        self._hybrid_pan_speed = command_pan
+        self._hybrid_tilt_speed = command_tilt
         self._hybrid_last_command_at = t1
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
@@ -3048,8 +3049,8 @@ class DogTracker:
                 "hybrid_chase_move",
                 entering=entering,
                 label=None if self.target is None else self.target.label,
-                pan_speed=pan_speed,
-                tilt_speed=tilt_speed,
+                pan_speed=command_pan,
+                tilt_speed=command_tilt,
                 error_x=round(error_x, 3),
                 error_y=round(error_y, 3),
                 target_span=round(target_span, 3),
