@@ -3449,7 +3449,10 @@ class DogTracker:
                 self._last_processed_seq = seq
                 self._last_frame_shape = frame.shape[:2]
                 inference_conf = self.cfg.hold_conf
-                if self.target is not None:
+                if self.target is not None and (
+                    self._hybrid_chase_active
+                    or self.state in ("COAST", "REACQUIRE", "PTZ_MOVING", "PTZ_SETTLING")
+                ):
                     inference_conf = min(inference_conf, self._retention_detection_conf)
                 if self._hybrid_chase_active:
                     inference_conf = min(inference_conf, self._chase_detection_conf)
@@ -3729,6 +3732,16 @@ class DogTracker:
                     label=self.target.label,
                     center_px=[round(self.target.center[0], 1), round(self.target.center[1], 1)],
                 )
+                return
+
+            # Low-confidence detections are allowed to preserve association during
+            # blur/recovery, but may never initiate a new camera movement. Active
+            # chase has its own bounded confidence grace in _drive_hybrid_chase.
+            if (
+                not self._hybrid_chase_active
+                and self.target.confidence < self.cfg.hold_conf
+            ):
+                self.state = "TARGET_RETENTION"
                 return
 
             # Wait only for one robust stationary-camera sample after a PTZ move.
