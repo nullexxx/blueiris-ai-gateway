@@ -1254,6 +1254,14 @@ class DogTracker:
             os.getenv("TRACKER_ACTIVE_CALIBRATION_PATH", "/app/models/tracker_ptz_active_calibration.json"),
             cfg.camera_ip,
         )
+        self._onvif_motion = OnvifPanTiltProbe(
+            cfg.camera_ip,
+            _env_int("TRACKER_ONVIF_PORT", 80),
+            cfg.camera_user,
+            cfg.camera_password,
+        )
+        self._servo_onvif_available = False
+        self._servo_onvif_capabilities: Dict[str, object] = {}
         self._startup_calibration_policy = os.getenv("TRACKER_CALIBRATE_ON_START", "if_missing").strip().lower()
         if self._startup_calibration_policy not in ("off", "if_missing", "if_stale", "always"):
             self._startup_calibration_policy = "if_missing"
@@ -1377,6 +1385,22 @@ class DogTracker:
         self._servo_telemetry_interval = max(
             0.10, min(1.0, _env_float("TRACKER_SERVO_TELEMETRY_INTERVAL", 0.20))
         )
+        self._servo_actuator_mode = os.getenv("TRACKER_SERVO_ACTUATOR", "auto").strip().lower()
+        if self._servo_actuator_mode not in ("auto", "onvif", "native"):
+            self._servo_actuator_mode = "auto"
+        self._servo_onvif_max_velocity = max(
+            0.05, min(1.0, _env_float("TRACKER_ONVIF_SERVO_MAX_VELOCITY", 0.35))
+        )
+        self._servo_onvif_calibration_velocities = _env_float_list(
+            "TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES",
+            [0.04, 0.08, 0.16],
+            0.02,
+            0.50,
+        )
+        self._servo_onvif_calibration_duration = max(
+            0.12,
+            min(0.45, _env_float("TRACKER_ONVIF_SERVO_CALIBRATION_DURATION", 0.22)),
+        )
 
         continuity_default = "dog,cat,bird"
         self._class_continuity_labels = {
@@ -1475,6 +1499,9 @@ class DogTracker:
         self._hybrid_chase_active = False
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
+        self._hybrid_actuator = "none"
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_stopped_at = 0.0
@@ -1554,6 +1581,43 @@ class DogTracker:
         self._history.clear()
         return {"success": True, "event_count": 0}
 
+    async def _ensure_onvif_motion_runtime(self) -> bool:
+        profile_ready = self._active_calibration.has_onvif_fractional_continuous()
+        if self._servo_actuator_mode == "native":
+            self._servo_onvif_available = False
+            self._servo_onvif_capabilities = {
+                "available": False,
+                "reason": "native actuator forced",
+                "calibrated_fractional_profile": profile_ready,
+            }
+            return False
+        if not profile_ready:
+            self._servo_onvif_available = False
+            self._servo_onvif_capabilities = {
+                "available": False,
+                "reason": "fractional ONVIF calibration required",
+                "calibrated_fractional_profile": False,
+            }
+            return False
+        if self._servo_onvif_available:
+            return True
+        try:
+            await self._onvif_motion.close()
+            capabilities = await asyncio.wait_for(self._onvif_motion.initialize(), timeout=5.0)
+        except Exception as exc:
+            capabilities = {"available": False, "continuous_supported": False, "error": str(exc)}
+        self._servo_onvif_capabilities = dict(capabilities)
+        self._servo_onvif_capabilities["calibrated_fractional_profile"] = profile_ready
+        self._servo_onvif_available = bool(capabilities.get("continuous_supported"))
+        if self._servo_onvif_available:
+            self.logger.info("PTZ tracker servo: calibrated fractional ONVIF ContinuousMove enabled")
+        else:
+            self.logger.warning(
+                "Fractional ONVIF servo unavailable; native PTZ remains edge-rescue fallback: %s",
+                capabilities.get("error"),
+            )
+        return self._servo_onvif_available
+
     async def initialize(self) -> None:
         if not self.cfg.camera_ip:
             raise RuntimeError("TRACKER_CAMERA_IP is required when TRACKER_ENABLED=true")
@@ -1576,6 +1640,7 @@ class DogTracker:
                     "ONVIF absolute zoom unavailable; CGI fallback remains active and re-probe is scheduled in %.1fs: %s",
                     delay, self._onvif_zoom.last_error,
                 )
+        await self._ensure_onvif_motion_runtime()
         self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
         self.logger.info(
             "PTZ tracker initialized: camera=%s model=%s fps=%.1f mode=moveDirectly autozoom=%s autostart=%s",
@@ -1631,6 +1696,10 @@ class DogTracker:
             await self._onvif_zoom.close()
         except Exception:
             pass
+        try:
+            await self._onvif_motion.close()
+        except Exception:
+            pass
         self._calibration.flush(force=True)
         await asyncio.to_thread(self.capture.stop)
         self.ptz.close()
@@ -1667,6 +1736,9 @@ class DogTracker:
         self._hybrid_chase_active = False
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
+        self._hybrid_actuator = "none"
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_error = None
@@ -2498,6 +2570,7 @@ class DogTracker:
         self._shutdown = False
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
+        await self._ensure_onvif_motion_runtime()
         self.active = True
         self.state = "SEARCHING"
         self._home_sent = False
@@ -2510,7 +2583,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev5 damped feedback servo + semantic continuity)")
+        self.logger.info("PTZ tracker STARTED (Rev6 fractional servo + settled velocity rebase)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -2653,6 +2726,11 @@ class DogTracker:
             "primary_control_mode": "continuous_when_moving",
             "hybrid_chase_active": self._hybrid_chase_active,
             "hybrid_chase_speed": [self._hybrid_pan_speed, self._hybrid_tilt_speed],
+            "hybrid_chase_actuator": self._hybrid_actuator,
+            "hybrid_chase_velocity": [
+                round(self._hybrid_pan_velocity, 4),
+                round(self._hybrid_tilt_velocity, 4),
+            ],
             "hybrid_chase_elapsed_ms": (
                 None
                 if not self._hybrid_chase_active or self._hybrid_started_at <= 0
@@ -2744,6 +2822,12 @@ class DogTracker:
                         "divergence_recovery_remaining_ms": max(
                             0, int((self._hybrid_recover_after - now) * 1000)
                         ),
+                        "actuator_mode": self._servo_actuator_mode,
+                        "active_actuator": self._hybrid_actuator,
+                        "fractional_onvif_available": self._servo_onvif_available,
+                        "fractional_onvif_profile_ready": self._active_calibration.has_onvif_fractional_continuous(),
+                        "onvif_max_velocity": round(self._servo_onvif_max_velocity, 3),
+                        "onvif_capabilities": self._servo_onvif_capabilities or None,
                         "last_decision": self._servo_last_decision or None,
                     },
                     "semantic_continuity": {
