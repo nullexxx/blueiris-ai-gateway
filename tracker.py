@@ -3833,7 +3833,10 @@ class DogTracker:
             if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
                 count = self._hybrid_divergence_count
                 cutoff = now - self._servo_divergence_window_s
-                while self._hybrid_divergence_strikes and self._hybrid_divergence_strikes[0] < cutoff:
+                while (
+                    self._hybrid_divergence_strikes
+                    and self._hybrid_divergence_strikes[0] < cutoff
+                ):
                     self._hybrid_divergence_strikes.popleft()
                 self._hybrid_divergence_strikes.append(now)
                 strikes = len(self._hybrid_divergence_strikes)
@@ -3850,6 +3853,7 @@ class DogTracker:
                     strikes_in_window=strikes,
                     trip_limit=self._servo_divergence_trip_limit,
                     session_disabled=trip,
+                    actuator=self._hybrid_actuator,
                     pan_sign=self.cfg.hybrid_chase_pan_sign,
                 )
                 await self._stop_hybrid_chase(
@@ -3864,9 +3868,10 @@ class DogTracker:
         if (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds:
             await self._stop_hybrid_chase("max_duration", seq=seq)
             return
-        if max(abs(err_x), abs(err_y)) <= self._motion_control_continuous_exit_error:
+        if dominant_error <= self._motion_control_continuous_exit_error:
             await self._stop_hybrid_chase("safe_inner_region", seq=seq)
             return
+
         if self.target is not None and self.target.confidence < self.cfg.reacquire_conf:
             if self._hybrid_low_confidence_since is None:
                 self._hybrid_low_confidence_since = now
@@ -3875,60 +3880,58 @@ class DogTracker:
                     confidence=round(self.target.confidence, 3),
                     grace_ms=int(self._hybrid_confidence_grace * 1000),
                 )
-
-                # Never coast through a detector-confidence gap at a high native
-                # motor speed. Preserve direction only, immediately dropping each
-                # active axis to minimum speed while association gets its grace
-                # window. This is braking, not new steering from a weak bbox.
-                current_pan = self._hybrid_pan_speed
-                current_tilt = self._hybrid_tilt_speed
-                safe_pan = (
-                    int(math.copysign(self.cfg.hybrid_chase_min_speed, current_pan))
-                    if current_pan != 0 else 0
-                )
-                safe_tilt = (
-                    int(math.copysign(self.cfg.hybrid_chase_min_speed, current_tilt))
-                    if current_tilt != 0 else 0
-                )
-                if (
-                    (safe_pan, safe_tilt) != (current_pan, current_tilt)
-                    and (safe_pan != 0 or safe_tilt != 0)
-                ):
-                    self._record_event(
-                        "hybrid_confidence_decelerate",
-                        confidence=round(self.target.confidence, 3),
-                        from_speed=[current_pan, current_tilt],
-                        to_speed=[safe_pan, safe_tilt],
-                    )
-                    await self._set_hybrid_chase_speed(
-                        safe_pan,
-                        safe_tilt,
-                        seq=seq,
-                        now=now,
-                        error_x=err_x,
-                        error_y=err_y,
-                        target_span=target_span,
-                        force_command=True,
-                    )
+                # Rev 6 does not coast blind at even the minimum native speed.
+                # Stop physical motion but preserve the chase identity while the
+                # detector gets its bounded grace window.
+                await self._pause_hybrid_actuator("confidence_grace")
             if (now - self._hybrid_low_confidence_since) <= self._hybrid_confidence_grace:
                 self.state = "ESCAPE_CHASE"
                 return
             await self._stop_hybrid_chase("low_confidence", seq=seq)
             return
+
         self._hybrid_low_confidence_since = None
-        pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
-        tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
         pan_control, pan_meta = self._servo_axis_command(err_x, "pan", now)
         tilt_control, tilt_meta = self._servo_axis_command(err_y, "tilt", now)
-        pan_speed = pan_sign * pan_control
-        tilt_speed = tilt_sign * tilt_control
-        self._record_servo_telemetry(now, pan_meta, tilt_meta, pan_speed, tilt_speed)
-        if pan_speed == 0 and tilt_speed == 0:
+        actuator, pan_command, tilt_command = self._servo_camera_command(
+            pan_control, tilt_control, pan_meta, tilt_meta
+        )
+        self._record_servo_telemetry(
+            now,
+            pan_meta,
+            tilt_meta,
+            actuator,
+            pan_command,
+            tilt_command,
+        )
+        if abs(pan_command) <= 1e-6 and abs(tilt_command) <= 1e-6:
             await self._stop_hybrid_chase("servo_brake", seq=seq)
             return
+
+        if actuator == "onvif_fractional":
+            ok = await self._set_hybrid_chase_velocity(
+                pan_command,
+                tilt_command,
+                seq=seq,
+                now=now,
+                error_x=err_x,
+                error_y=err_y,
+                target_span=target_span,
+            )
+            if ok:
+                return
+            # Fail safe: only use coarse native movement if the subject is still
+            # in genuine edge-danger territory. Otherwise hold for a fresh sample.
+            if dominant_error < 0.85:
+                return
+
+        pan_sign = self._active_calibration.continuous_sign(
+            "pan", self.cfg.hybrid_chase_pan_sign
+        )
+        tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
         await self._set_hybrid_chase_speed(
-            pan_speed,
-            tilt_speed,
+            pan_sign * pan_control,
+            tilt_sign * tilt_control,
             seq=seq,
             now=now,
             error_x=err_x,
