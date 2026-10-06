@@ -2114,6 +2114,7 @@ class DogTracker:
         if prepared is None:
             return None
         before, seq = prepared
+        raw_sign = 1 if float(velocity) >= 0.0 else -1
         pan = float(velocity) if axis == "pan" else 0.0
         tilt = float(velocity) if axis == "tilt" else 0.0
         started = time.monotonic()
@@ -2141,7 +2142,7 @@ class DogTracker:
         nx, ny = shift.normalized(before.shape)
         correction = -nx if axis == "pan" else -ny
         rate = abs(correction) / max(0.05, self._servo_onvif_calibration_duration)
-        correction_sign = 1 if correction >= 0.0 else -1
+        correction_sign = raw_sign if correction >= 0.0 else -raw_sign
         settled_s = (
             (command_done - started)
             + self._servo_onvif_calibration_duration
@@ -2150,7 +2151,7 @@ class DogTracker:
         row = {
             "axis": axis,
             "velocity": round(abs(float(velocity)), 5),
-            "raw_sign": 1,
+            "raw_sign": raw_sign,
             "correction_sign": correction_sign,
             "normalized_rate_per_s": round(rate, 5),
             "command_http_ms": int((command_done - started) * 1000),
@@ -2160,7 +2161,10 @@ class DogTracker:
         self._record_event("active_calibration_onvif_continuous", **row)
         return row
 
-    async def _calibration_onvif_benchmark_run(self) -> dict:
+    async def _calibration_onvif_benchmark_run(
+        self,
+        native_samples: Optional[List[dict]] = None,
+    ) -> dict:
         probe = OnvifPanTiltProbe(
             self.cfg.camera_ip,
             _env_int("TRACKER_ONVIF_PORT", 80),
@@ -2214,20 +2218,25 @@ class DogTracker:
 
             fractional_rows: List[dict] = []
             if result.get("continuous_supported"):
+                velocities = sorted(self._servo_onvif_calibration_velocities)
+                midpoint = velocities[len(velocities) // 2] if velocities else None
                 for axis in ("pan", "tilt"):
-                    for velocity in self._servo_onvif_calibration_velocities:
-                        row = await self._calibration_onvif_continuous_sample(
-                            probe, axis, velocity
-                        )
-                        if (
-                            row is not None
-                            and float(row.get("normalized_rate_per_s", 0.0)) > 0.003
-                        ):
-                            fractional_rows.append(row)
+                    for velocity in velocities:
+                        raw_signs = (1, -1) if velocity == midpoint else (1,)
+                        for raw_sign in raw_signs:
+                            row = await self._calibration_onvif_continuous_sample(
+                                probe, axis, raw_sign * velocity
+                            )
+                            if (
+                                row is not None
+                                and float(row.get("normalized_rate_per_s", 0.0)) > 0.003
+                            ):
+                                fractional_rows.append(row)
 
             signs: Dict[str, int] = {}
             axis_metrics: Dict[str, dict] = {}
             usable_axes = []
+            native_samples = native_samples or []
             for axis in ("pan", "tilt"):
                 rows = [
                     row for row in fractional_rows
@@ -2235,37 +2244,108 @@ class DogTracker:
                 ]
                 votes = [int(row.get("correction_sign", 1)) for row in rows]
                 signs[axis] = 1 if not votes or sum(votes) >= 0 else -1
+                sign_agreement = (
+                    abs(sum(votes)) / max(1, len(votes))
+                    if votes else 0.0
+                )
+
+                by_velocity: Dict[float, List[float]] = {}
+                for row in rows:
+                    velocity = abs(float(row["velocity"]))
+                    rate = abs(float(row["normalized_rate_per_s"]))
+                    if velocity > 0.0 and rate > 0.0:
+                        by_velocity.setdefault(velocity, []).append(rate)
                 rates = sorted(
                     (
-                        abs(float(row["velocity"])),
-                        abs(float(row["normalized_rate_per_s"])),
+                        velocity,
+                        float(np.median(values)),
                     )
-                    for row in rows
+                    for velocity, values in by_velocity.items()
+                    if values
                 )
-                rate_values = [rate for _, rate in rates if rate > 0.0]
+                rate_values = [rate for _, rate in rates]
                 spread = (
                     max(rate_values) / max(1e-6, min(rate_values))
                     if len(rate_values) >= 2 else 0.0
                 )
-                monotonic_steps = 0
-                for (_, r0), (_, r1) in zip(rates, rates[1:]):
-                    if r1 >= r0 * 0.80:
-                        monotonic_steps += 1
+                monotonic_steps = sum(
+                    1
+                    for (_, r0), (_, r1) in zip(rates, rates[1:])
+                    if r1 >= r0 * 0.80
+                )
                 monotonic_fraction = (
                     monotonic_steps / max(1, len(rates) - 1)
                     if rates else 0.0
                 )
+
+                native_rate_values = []
+                for row in native_samples:
+                    try:
+                        if (
+                            str(row.get("axis")) == axis
+                            and int(row.get("speed", 0)) == self.cfg.hybrid_chase_min_speed
+                            and abs(
+                                float(row.get("zoom_factor", 1.0))
+                                - float(self._calibration_zoom_levels[0])
+                            ) <= 0.10
+                        ):
+                            native_rate_values.append(
+                                abs(float(row.get("normalized_rate_per_s", 0.0)))
+                            )
+                    except (TypeError, ValueError):
+                        continue
+                native_speed1_rate = (
+                    float(np.median(native_rate_values))
+                    if native_rate_values else None
+                )
+                if native_speed1_rate is None:
+                    native_speed1_rate = self._active_calibration.continuous_rates(
+                        axis,
+                        1.0,
+                        min_speed=self.cfg.hybrid_chase_min_speed,
+                        max_speed=self.cfg.hybrid_chase_min_speed,
+                    ).get(self.cfg.hybrid_chase_min_speed)
+
+                lowest_rate = min(rate_values) if rate_values else None
+                below_native_ratio = (
+                    None
+                    if lowest_rate is None or not native_speed1_rate
+                    else lowest_rate / max(1e-6, float(native_speed1_rate))
+                )
+                sub_native_proven = (
+                    True
+                    if below_native_ratio is None
+                    else below_native_ratio <= 0.80
+                )
                 axis_usable = bool(
-                    len(rates) >= 2
-                    and spread >= 1.20
+                    len(rates) >= 3
+                    and spread >= 1.35
                     and monotonic_fraction >= 0.50
+                    and sign_agreement >= 0.50
+                    and sub_native_proven
                 )
                 if axis_usable:
                     usable_axes.append(axis)
                 axis_metrics[axis] = {
-                    "samples": len(rates),
+                    "samples": len(rows),
+                    "unique_velocities": len(rates),
                     "rate_spread": round(spread, 3),
                     "monotonic_fraction": round(monotonic_fraction, 3),
+                    "sign_agreement": round(sign_agreement, 3),
+                    "native_speed1_rate": (
+                        None
+                        if native_speed1_rate is None
+                        else round(float(native_speed1_rate), 5)
+                    ),
+                    "lowest_fractional_rate": (
+                        None if lowest_rate is None else round(lowest_rate, 5)
+                    ),
+                    "lowest_to_native_ratio": (
+                        None
+                        if below_native_ratio is None
+                        else round(float(below_native_ratio), 3)
+                    ),
+                    "sub_native_proven": sub_native_proven,
                     "usable": axis_usable,
                 }
 
@@ -2369,7 +2449,9 @@ class DogTracker:
                                     continuous_samples.append(row)
 
             if run_onvif:
-                onvif_result = await self._calibration_onvif_benchmark_run()
+                onvif_result = await self._calibration_onvif_benchmark_run(
+                    continuous_samples
+                )
 
             existing_move = self._active_calibration.move_directly()
             existing_continuous = self._active_calibration.continuous()
