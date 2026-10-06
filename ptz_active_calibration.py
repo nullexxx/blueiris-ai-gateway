@@ -163,6 +163,73 @@ class ActivePtzCalibrationStore:
         value = self._camera().get("onvif_benchmark")
         return dict(value) if isinstance(value, dict) else None
 
+    def onvif_fractional_continuous(self) -> dict:
+        benchmark = self._camera().get("onvif_benchmark")
+        if not isinstance(benchmark, dict):
+            return {}
+        value = benchmark.get("fractional_continuous")
+        return dict(value) if isinstance(value, dict) else {}
+
+    def has_onvif_fractional_continuous(self) -> bool:
+        profile = self.onvif_fractional_continuous()
+        return bool(profile.get("usable")) and bool(profile.get("samples"))
+
+    def onvif_continuous_sign(self, axis: str, fallback: int = 1) -> int:
+        profile = self.onvif_fractional_continuous()
+        signs = profile.get("signs", {}) if isinstance(profile, dict) else {}
+        try:
+            value = int(signs.get(axis, fallback))
+            return 1 if value >= 0 else -1
+        except Exception:
+            return 1 if fallback >= 0 else -1
+
+    def onvif_velocity_for_rate(
+        self,
+        axis: str,
+        desired_rate_per_s: float,
+        *,
+        max_velocity: float = 0.35,
+    ) -> Optional[float]:
+        """Map a desired image-space correction rate to fractional ONVIF velocity.
+
+        Rev 6 learns this relationship directly from the camera. Interpolation
+        always includes the physical origin (0 velocity -> 0 image rate) so very
+        small servo requests remain sub-speed instead of being rounded up to the
+        camera's native speed-1 floor.
+        """
+        profile = self.onvif_fractional_continuous()
+        if not profile.get("usable"):
+            return None
+        samples = profile.get("samples", [])
+        points = [(0.0, 0.0)]
+        for row in samples if isinstance(samples, list) else []:
+            if not isinstance(row, dict) or str(row.get("axis")) != str(axis):
+                continue
+            try:
+                velocity = abs(float(row.get("velocity", 0.0)))
+                rate = abs(float(row.get("normalized_rate_per_s", 0.0)))
+            except (TypeError, ValueError):
+                continue
+            if velocity > 0.0 and rate > 0.0 and math.isfinite(velocity) and math.isfinite(rate):
+                points.append((rate, velocity))
+        if len(points) < 2:
+            return None
+
+        desired = max(0.0, float(desired_rate_per_s))
+        if desired <= 1e-6:
+            return 0.0
+        points = sorted(points)
+        for (r0, v0), (r1, v1) in zip(points, points[1:]):
+            if desired <= r1:
+                span = max(1e-6, r1 - r0)
+                fraction = _clamp((desired - r0) / span, 0.0, 1.0)
+                return _clamp(v0 + fraction * (v1 - v0), 0.0, max_velocity)
+
+        r0, v0 = points[-1]
+        if r0 <= 1e-6:
+            return None
+        return _clamp(v0 * desired / r0, 0.0, max_velocity)
+
     def age_days(self) -> Optional[float]:
         stamp = self._camera().get("calibrated_at_epoch")
         try:
@@ -328,6 +395,8 @@ class OnvifPanTiltProbe:
         self.relative_x: Optional[Tuple[float, float]] = None
         self.relative_y: Optional[Tuple[float, float]] = None
         self.continuous_uri: Optional[str] = None
+        self.continuous_x: Optional[Tuple[float, float]] = None
+        self.continuous_y: Optional[Tuple[float, float]] = None
         self.last_error: Optional[str] = None
 
     @staticmethod
@@ -356,6 +425,8 @@ class OnvifPanTiltProbe:
             "continuous_supported": False,
             "relative_uri": None,
             "continuous_uri": None,
+            "continuous_x_range": None,
+            "continuous_y_range": None,
             "error": None,
         }
         if ONVIFCamera is None:
@@ -392,14 +463,21 @@ class OnvifPanTiltProbe:
 
             continuous = self._get(spaces, "ContinuousPanTiltVelocitySpace", []) or []
             if continuous:
-                self.continuous_uri = str(self._get(continuous[0], "URI", ""))
+                continuous_space = continuous[0]
+                self.continuous_uri = str(self._get(continuous_space, "URI", ""))
+                self.continuous_x = self._range(self._get(continuous_space, "XRange"))
+                self.continuous_y = self._range(self._get(continuous_space, "YRange"))
 
             result.update(
                 available=True,
                 relative_fov_supported=bool(self.relative_uri and self.relative_x and self.relative_y),
-                continuous_supported=bool(self.continuous_uri),
+                continuous_supported=bool(
+                    self.continuous_uri and self.continuous_x and self.continuous_y
+                ),
                 relative_uri=self.relative_uri,
                 continuous_uri=self.continuous_uri,
+                continuous_x_range=self.continuous_x,
+                continuous_y_range=self.continuous_y,
             )
             return result
         except Exception as exc:
@@ -429,6 +507,47 @@ class OnvifPanTiltProbe:
                 }
             }
             await self.ptz.RelativeMove(request)
+            self.last_error = None
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    async def continuous_move(self, pan: float, tilt: float) -> bool:
+        if (
+            self.ptz is None
+            or self.profile_token is None
+            or not self.continuous_uri
+            or not self.continuous_x
+            or not self.continuous_y
+        ):
+            return False
+        try:
+            request = self.ptz.create_type("ContinuousMove")
+            request.ProfileToken = self.profile_token
+            request.Velocity = {
+                "PanTilt": {
+                    "x": self._map_norm(pan, self.continuous_x),
+                    "y": self._map_norm(tilt, self.continuous_y),
+                    "space": self.continuous_uri,
+                }
+            }
+            await self.ptz.ContinuousMove(request)
+            self.last_error = None
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    async def stop(self) -> bool:
+        if self.ptz is None or self.profile_token is None:
+            return False
+        try:
+            request = self.ptz.create_type("Stop")
+            request.ProfileToken = self.profile_token
+            request.PanTilt = True
+            request.Zoom = False
+            await self.ptz.Stop(request)
             self.last_error = None
             return True
         except Exception as exc:
