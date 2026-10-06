@@ -71,12 +71,14 @@ class Rev4ControllerTests(unittest.TestCase):
         result = validator.validate((20, 150, 610, 250), 1.1, shape)
         self.assertFalse(result.valid)
 
-    def test_rev4_status_contract(self):
-        self.assertIn('"controller_revision": 4', TRACKER)
-        self.assertIn('"persistent_velocity_continuous_servo_precision"', TRACKER)
+    def test_rev5_status_contract(self):
+        self.assertIn('"controller_revision": 5', TRACKER)
+        self.assertIn('"damped_feedback_servo_semantic_continuity"', TRACKER)
         self.assertIn('"missing_grace_s"', TRACKER)
         self.assertIn('"velocity_ttl_s"', TRACKER)
         self.assertIn('"axis_reverse_holdoff_s"', TRACKER)
+        self.assertIn('"servo": {', TRACKER)
+        self.assertIn('"semantic_continuity": {', TRACKER)
 
 
 if __name__ == "__main__":
