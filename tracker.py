@@ -1058,6 +1058,26 @@ def _servo_axis_decision(
     }
 
 
+def _servo_large_error_gain(
+    error: float,
+    *,
+    start_error: float,
+    full_error: float,
+    max_gain: float,
+) -> float:
+    """Progressively add servo authority only when the target is far off-center."""
+    magnitude = abs(float(error))
+    start = max(0.0, float(start_error))
+    full = max(start + 1e-6, float(full_error))
+    ceiling = max(1.0, float(max_gain))
+    if magnitude <= start:
+        return 1.0
+    if magnitude >= full:
+        return ceiling
+    fraction = (magnitude - start) / (full - start)
+    return 1.0 + fraction * (ceiling - 1.0)
+
+
 def _motion_control_decision(
     *,
     err_x,
@@ -1350,6 +1370,16 @@ class DogTracker:
         # Rev 5 closes the loop on observed image error instead of choosing
         # speed from position error alone. Acceleration is gradual; braking is immediate.
         self._servo_kp = max(0.10, min(2.00, _env_float("TRACKER_SERVO_KP", 0.70)))
+        self._servo_large_error_start = max(
+            0.20, min(0.80, _env_float("TRACKER_SERVO_LARGE_ERROR_START", 0.45))
+        )
+        self._servo_large_error_full = max(
+            self._servo_large_error_start + 0.05,
+            min(1.00, _env_float("TRACKER_SERVO_LARGE_ERROR_FULL", 0.75)),
+        )
+        self._servo_large_error_gain = max(
+            1.0, min(2.0, _env_float("TRACKER_SERVO_LARGE_ERROR_GAIN", 1.45))
+        )
         self._servo_kd = max(0.0, min(1.50, _env_float("TRACKER_SERVO_KD", 0.24)))
         self._servo_feedforward_gain = max(
             0.0, min(1.50, _env_float("TRACKER_SERVO_FEEDFORWARD_GAIN", 0.45))
@@ -3091,6 +3121,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
+                    "controller_patch": "6.2",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
@@ -3099,6 +3130,9 @@ class DogTracker:
                     "continuous_exit_error": round(self._motion_control_continuous_exit_error, 3),
                     "post_chase_precision_holdoff_s": round(self._post_chase_precision_holdoff, 3),
                     "confidence_grace_s": round(self._hybrid_confidence_grace, 3),
+                    "active_chase_confidence_threshold": round(self.cfg.hold_conf, 3),
+                    "native_max_chase_seconds": round(self.cfg.hybrid_chase_max_seconds, 3),
+                    "fractional_max_chase_seconds": None,
                     "missing_grace_s": round(self._hybrid_missing_grace, 3),
                     "retention_detection_conf": round(self._retention_detection_conf, 3),
                     "chase_detection_conf": round(self._chase_detection_conf, 3),
@@ -3109,6 +3143,9 @@ class DogTracker:
                     "axis_reverse_holdoff_s": round(self._hybrid_axis_reverse_holdoff, 3),
                     "servo": {
                         "kp": round(self._servo_kp, 3),
+                        "large_error_start": round(self._servo_large_error_start, 3),
+                        "large_error_full": round(self._servo_large_error_full, 3),
+                        "large_error_gain": round(self._servo_large_error_gain, 3),
                         "kd": round(self._servo_kd, 3),
                         "feedforward_gain": round(self._servo_feedforward_gain, 3),
                         "feedforward_decay_s": round(self._servo_feedforward_decay_s, 3),
@@ -3445,12 +3482,19 @@ class DogTracker:
             self.cfg.hybrid_chase_exit_error,
             self._motion_control_continuous_exit_error,
         )
+        error_gain = _servo_large_error_gain(
+            error,
+            start_error=self._servo_large_error_start,
+            full_error=self._servo_large_error_full,
+            max_gain=self._servo_large_error_gain,
+        )
+        effective_kp = self._servo_kp * error_gain
         decision = _servo_axis_decision(
             error=error,
             error_rate=filtered_rate,
             feedforward_rate=ff,
             exit_error=axis_exit_error,
-            kp=self._servo_kp,
+            kp=effective_kp,
             kd=self._servo_kd,
             feedforward_gain=self._servo_feedforward_gain,
             brake_horizon_s=self._servo_brake_horizon,
@@ -3519,6 +3563,8 @@ class DogTracker:
             "predicted_error": round(float(decision["predicted_error"]), 4),
             "closing_rate": round(float(decision["closing_rate"]), 4),
             "desired_rate": round(signed_desired_rate, 4),
+            "error_gain": round(error_gain, 3),
+            "effective_kp": round(effective_kp, 3),
             "requested_speed": requested_speed,
             "command_speed": command,
             "calibrated_rate": (
@@ -4284,19 +4330,27 @@ class DogTracker:
         else:
             self._hybrid_last_error = dominant_error
 
-        if (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds:
+        # Rev 6.2: the calibrated fractional ONVIF path is a closed-loop servo,
+        # so forcing a periodic stop only creates dead time and loses moving targets.
+        # Keep the hard duration watchdog for coarse native-discrete rescue only.
+        if (
+            self._hybrid_actuator != "onvif_fractional"
+            and (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds
+        ):
             await self._stop_hybrid_chase("max_duration", seq=seq)
             return
         if dominant_error <= self._motion_control_continuous_exit_error:
             await self._stop_hybrid_chase("safe_inner_region", seq=seq)
             return
 
-        if self.target is not None and self.target.confidence < self.cfg.reacquire_conf:
+        chase_confidence_threshold = self.cfg.hold_conf
+        if self.target is not None and self.target.confidence < chase_confidence_threshold:
             if self._hybrid_low_confidence_since is None:
                 self._hybrid_low_confidence_since = now
                 self._record_event(
                     "hybrid_chase_confidence_grace",
                     confidence=round(self.target.confidence, 3),
+                    threshold=round(chase_confidence_threshold, 3),
                     grace_ms=int(self._hybrid_confidence_grace * 1000),
                 )
                 # Rev 6 does not coast blind at even the minimum native speed.
