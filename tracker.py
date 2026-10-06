@@ -2104,6 +2104,62 @@ class DogTracker:
         self._record_event("active_calibration_continuous", **row)
         return row
 
+    async def _calibration_onvif_continuous_sample(
+        self,
+        probe: OnvifPanTiltProbe,
+        axis: str,
+        velocity: float,
+    ) -> Optional[dict]:
+        prepared = await self._calibration_prepare_scene(1.0)
+        if prepared is None:
+            return None
+        before, seq = prepared
+        pan = float(velocity) if axis == "pan" else 0.0
+        tilt = float(velocity) if axis == "tilt" else 0.0
+        started = time.monotonic()
+        ok = await probe.continuous_move(pan, tilt)
+        command_done = time.monotonic()
+        if not ok:
+            return None
+        try:
+            await asyncio.sleep(self._servo_onvif_calibration_duration)
+        finally:
+            await probe.stop()
+        wait = await self._calibration_wait_pan_tilt_idle(
+            max(self.cfg.ptz_operation_timeout, 4.0)
+        )
+        if wait is None:
+            return None
+        await asyncio.sleep(0.12)
+        captured = await self._calibration_capture_frame(after_seq=seq, timeout_s=2.0)
+        if captured is None:
+            return None
+        after, _ = captured
+        shift = estimate_static_frame_shift(before, after)
+        if shift is None:
+            return None
+        nx, ny = shift.normalized(before.shape)
+        correction = -nx if axis == "pan" else -ny
+        rate = abs(correction) / max(0.05, self._servo_onvif_calibration_duration)
+        correction_sign = 1 if correction >= 0.0 else -1
+        settled_s = (
+            (command_done - started)
+            + self._servo_onvif_calibration_duration
+            + float(wait["elapsed_s"])
+        )
+        row = {
+            "axis": axis,
+            "velocity": round(abs(float(velocity)), 5),
+            "raw_sign": 1,
+            "correction_sign": correction_sign,
+            "normalized_rate_per_s": round(rate, 5),
+            "command_http_ms": int((command_done - started) * 1000),
+            "settled_ms": int(settled_s * 1000),
+            "shift": shift.public_dict(),
+        }
+        self._record_event("active_calibration_onvif_continuous", **row)
+        return row
+
     async def _calibration_onvif_benchmark_run(self) -> dict:
         probe = OnvifPanTiltProbe(
             self.cfg.camera_ip,
@@ -2113,38 +2169,126 @@ class DogTracker:
         )
         result = await probe.initialize()
         try:
-            if not self._calibration_onvif_benchmark or not result.get("relative_fov_supported"):
+            if not self._calibration_onvif_benchmark:
                 return result
-            prepared = await self._calibration_prepare_scene(1.0)
-            if prepared is None:
-                result["benchmark_error"] = "unable to prepare stable home scene"
-                return result
-            before, seq = prepared
-            started = time.monotonic()
-            ok = await probe.relative_move(0.12, 0.0)
-            command_done = time.monotonic()
-            if not ok:
-                result["benchmark_error"] = probe.last_error or "RelativeMove failed"
-                return result
-            wait = await self._calibration_wait_pan_tilt_idle(max(self.cfg.ptz_operation_timeout, 5.0))
-            if wait is None:
-                result["benchmark_error"] = "RelativeMove did not settle"
-                return result
-            await asyncio.sleep(0.15)
-            captured = await self._calibration_capture_frame(after_seq=seq, timeout_s=2.0)
-            if captured is None:
-                result["benchmark_error"] = "no stable post-ONVIF frame"
-                return result
-            after, _ = captured
-            shift = estimate_static_frame_shift(before, after)
-            result["relative_move"] = {
-                "success": shift is not None,
-                "command_http_ms": int((command_done - started) * 1000),
-                "settled_ms": int((time.monotonic() - started) * 1000),
-                "shift": None if shift is None else shift.public_dict(),
+
+            if result.get("relative_fov_supported"):
+                prepared = await self._calibration_prepare_scene(1.0)
+                if prepared is None:
+                    result["benchmark_error"] = "unable to prepare stable home scene"
+                else:
+                    before, seq = prepared
+                    started = time.monotonic()
+                    ok = await probe.relative_move(0.12, 0.0)
+                    command_done = time.monotonic()
+                    if not ok:
+                        result["benchmark_error"] = probe.last_error or "RelativeMove failed"
+                    else:
+                        wait = await self._calibration_wait_pan_tilt_idle(
+                            max(self.cfg.ptz_operation_timeout, 5.0)
+                        )
+                        if wait is None:
+                            result["benchmark_error"] = "RelativeMove did not settle"
+                        else:
+                            await asyncio.sleep(0.15)
+                            captured = await self._calibration_capture_frame(
+                                after_seq=seq, timeout_s=2.0
+                            )
+                            if captured is None:
+                                result["benchmark_error"] = "no stable post-ONVIF frame"
+                            else:
+                                after, _ = captured
+                                shift = estimate_static_frame_shift(before, after)
+                                result["relative_move"] = {
+                                    "success": shift is not None,
+                                    "command_http_ms": int(
+                                        (command_done - started) * 1000
+                                    ),
+                                    "settled_ms": int(
+                                        (time.monotonic() - started) * 1000
+                                    ),
+                                    "shift": (
+                                        None if shift is None else shift.public_dict()
+                                    ),
+                                }
+
+            fractional_rows: List[dict] = []
+            if result.get("continuous_supported"):
+                for axis in ("pan", "tilt"):
+                    for velocity in self._servo_onvif_calibration_velocities:
+                        row = await self._calibration_onvif_continuous_sample(
+                            probe, axis, velocity
+                        )
+                        if (
+                            row is not None
+                            and float(row.get("normalized_rate_per_s", 0.0)) > 0.003
+                        ):
+                            fractional_rows.append(row)
+
+            signs: Dict[str, int] = {}
+            axis_metrics: Dict[str, dict] = {}
+            usable_axes = []
+            for axis in ("pan", "tilt"):
+                rows = [
+                    row for row in fractional_rows
+                    if str(row.get("axis")) == axis
+                ]
+                votes = [int(row.get("correction_sign", 1)) for row in rows]
+                signs[axis] = 1 if not votes or sum(votes) >= 0 else -1
+                rates = sorted(
+                    (
+                        abs(float(row["velocity"])),
+                        abs(float(row["normalized_rate_per_s"])),
+                    )
+                    for row in rows
+                )
+                rate_values = [rate for _, rate in rates if rate > 0.0]
+                spread = (
+                    max(rate_values) / max(1e-6, min(rate_values))
+                    if len(rate_values) >= 2 else 0.0
+                )
+                monotonic_steps = 0
+                for (_, r0), (_, r1) in zip(rates, rates[1:]):
+                    if r1 >= r0 * 0.80:
+                        monotonic_steps += 1
+                monotonic_fraction = (
+                    monotonic_steps / max(1, len(rates) - 1)
+                    if rates else 0.0
+                )
+                axis_usable = bool(
+                    len(rates) >= 2
+                    and spread >= 1.20
+                    and monotonic_fraction >= 0.50
+                )
+                if axis_usable:
+                    usable_axes.append(axis)
+                axis_metrics[axis] = {
+                    "samples": len(rates),
+                    "rate_spread": round(spread, 3),
+                    "monotonic_fraction": round(monotonic_fraction, 3),
+                    "usable": axis_usable,
+                }
+
+            fractional_usable = set(usable_axes) == {"pan", "tilt"}
+            result["fractional_continuous"] = {
+                "usable": fractional_usable,
+                "reason": (
+                    "calibrated_fractional_response"
+                    if fractional_usable
+                    else "quantized_or_insufficient_response"
+                ),
+                "duration_s": self._servo_onvif_calibration_duration,
+                "requested_velocities": list(self._servo_onvif_calibration_velocities),
+                "samples": fractional_rows,
+                "signs": signs,
+                "axis_metrics": axis_metrics,
             }
             return result
         finally:
+            try:
+                await probe.stop()
+            except Exception:
+                pass
             await probe.close()
             await self._calibration_home()
 
@@ -2160,7 +2304,9 @@ class DogTracker:
         onvif_result = self._active_calibration.onvif_benchmark()
         run_move = mode in ("movedirectly", "motion", "all")
         run_continuous = mode in ("continuous", "motion", "all")
-        run_onvif = mode in ("onvif", "motion", "all")
+        # Rev 6 continuous calibration also characterizes fractional ONVIF
+        # ContinuousMove so the runtime can operate below native speed 1.
+        run_onvif = mode in ("continuous", "onvif", "motion", "all")
         safe_to_track = True
         result_payload: Optional[dict] = None
         try:
