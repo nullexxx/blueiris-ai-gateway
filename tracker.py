@@ -4892,20 +4892,45 @@ class DogTracker:
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
                 self._precision_slow_since = None
+                # Native speed 1 is physically too coarse on this camera for the
+                # normal feedback loop (especially tilt). Without a calibrated
+                # fractional actuator, reserve native continuous movement for a
+                # genuinely clipped/hard-escape target instead of ping-ponging.
+                if (
+                    not self._servo_onvif_available
+                    and not edge_clipped_now
+                    and dominant_error < hard_escape_error
+                ):
+                    self._record_event(
+                        "hybrid_chase_deferred",
+                        reason="fractional_actuator_unavailable",
+                        entry_reason=control_decision["reason"],
+                        error_x=round(err_x, 3),
+                        error_y=round(err_y, 3),
+                    )
+                    self.state = "MOTION_HOLD"
+                    return
+
                 self._seed_servo_feedback(frame_shape, now, err_x, err_y)
-                pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
-                tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
                 pan_control, pan_meta = self._servo_axis_command(err_x, "pan", now)
                 tilt_control, tilt_meta = self._servo_axis_command(err_y, "tilt", now)
-                pan_speed = pan_sign * pan_control
-                tilt_speed = tilt_sign * tilt_control
+                actuator, pan_command, tilt_command = self._servo_camera_command(
+                    pan_control, tilt_control, pan_meta, tilt_meta
+                )
                 self._record_servo_telemetry(
-                    now, pan_meta, tilt_meta, pan_speed, tilt_speed, force=True
+                    now,
+                    pan_meta,
+                    tilt_meta,
+                    actuator,
+                    pan_command,
+                    tilt_command,
+                    force=True,
                 )
                 self._record_event(
                     "hybrid_chase_enter",
                     label=self.target.label,
                     entry_reason=control_decision["reason"],
+                    actuator=actuator,
                     error_x=round(err_x, 3),
                     error_y=round(err_y, 3),
                     target_speed_norm=round(target_speed_norm, 4),
@@ -4915,13 +4940,35 @@ class DogTracker:
                     moving_outward=bool(moving_outward),
                     moving_inward_dominant=bool(moving_inward_dominant),
                     edge_clipped=edge_clipped_now,
-                    pan_speed=pan_speed,
-                    tilt_speed=tilt_speed,
+                    pan_command=round(float(pan_command), 5),
+                    tilt_command=round(float(tilt_command), 5),
                     confidence=round(self.target.confidence, 3),
                 )
+                if abs(pan_command) <= 1e-6 and abs(tilt_command) <= 1e-6:
+                    self.state = "TRACK"
+                    return
+                if actuator == "onvif_fractional":
+                    ok = await self._set_hybrid_chase_velocity(
+                        pan_command,
+                        tilt_command,
+                        seq=seq,
+                        now=now,
+                        error_x=err_x,
+                        error_y=err_y,
+                        target_span=target_span,
+                    )
+                    if ok:
+                        return
+                    if not edge_clipped_now and dominant_error < hard_escape_error:
+                        return
+
+                pan_sign = self._active_calibration.continuous_sign(
+                    "pan", self.cfg.hybrid_chase_pan_sign
+                )
+                tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
                 await self._set_hybrid_chase_speed(
-                    pan_speed,
-                    tilt_speed,
+                    pan_sign * pan_control,
+                    tilt_sign * tilt_control,
                     seq=seq,
                     now=now,
                     error_x=err_x,
