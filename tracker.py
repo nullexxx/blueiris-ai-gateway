@@ -927,8 +927,9 @@ class TargetTrack:
         update_velocity: bool = True,
         min_velocity_sample_s: float = 0.10,
         preserve_velocity: bool = False,
+        allow_class_mismatch: bool = False,
     ) -> None:
-        if det.class_id != self.class_id:
+        if det.class_id != self.class_id and not allow_class_mismatch:
             raise ValueError("TargetTrack.update received a different object class")
 
         new_center = det.center
@@ -995,6 +996,59 @@ def _iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, flo
     return inter / max(1.0, area_a + area_b - inter)
 
 
+def _servo_axis_decision(
+    *,
+    error: float,
+    error_rate: float,
+    feedforward_rate: float,
+    exit_error: float,
+    kp: float,
+    kd: float,
+    feedforward_gain: float,
+    brake_horizon_s: float,
+) -> Dict[str, float | bool | str]:
+    """Rev 5 proportional+damped image-space servo decision for one axis.
+
+    error_rate is measured from successive tracked bbox centers while the
+    camera is moving. That captures both subject motion and the camera's real
+    mechanical response, so braking follows what the image is actually doing.
+    """
+    error = float(error)
+    error_rate = float(error_rate)
+    exit_error = max(0.01, abs(float(exit_error)))
+    predicted_error = error + error_rate * max(0.0, float(brake_horizon_s))
+    closing_rate = 0.0 if abs(error) < 1e-6 else -math.copysign(error_rate, error)
+    p_term = float(kp) * error
+    d_term = float(kd) * error_rate
+    ff_term = float(feedforward_gain) * float(feedforward_rate)
+    raw_rate = p_term + d_term + ff_term
+
+    phase = "track"
+    brake = False
+    if abs(error) <= exit_error:
+        brake = True
+        phase = "deadband"
+    elif error * predicted_error <= 0.0 or abs(predicted_error) <= exit_error * 0.90:
+        brake = True
+        phase = "predicted_stop"
+    elif error * raw_rate <= 0.0:
+        brake = True
+        phase = "closing_fast"
+    elif closing_rate > 0.0 and abs(predicted_error) < abs(error) * 0.55:
+        phase = "brake"
+
+    desired_rate = 0.0 if brake else raw_rate
+    return {
+        "desired_rate": desired_rate,
+        "raw_rate": raw_rate,
+        "predicted_error": predicted_error,
+        "closing_rate": closing_rate,
+        "p_term": p_term,
+        "d_term": d_term,
+        "ff_term": ff_term,
+        "brake": brake,
+        "phase": phase,
+    }
 
 
 def _motion_control_decision(
@@ -1277,6 +1331,49 @@ class DogTracker:
             0.10, min(0.75, _env_float("TRACKER_HYBRID_AXIS_REVERSE_HOLDOFF", 0.25))
         )
 
+        # Rev 5 closes the loop on observed image error instead of choosing
+        # speed from position error alone. Acceleration is gradual; braking is immediate.
+        self._servo_kp = max(0.10, min(2.00, _env_float("TRACKER_SERVO_KP", 0.70)))
+        self._servo_kd = max(0.0, min(1.50, _env_float("TRACKER_SERVO_KD", 0.24)))
+        self._servo_feedforward_gain = max(
+            0.0, min(1.50, _env_float("TRACKER_SERVO_FEEDFORWARD_GAIN", 0.45))
+        )
+        self._servo_feedforward_decay_s = max(
+            0.20, min(3.0, _env_float("TRACKER_SERVO_FEEDFORWARD_DECAY", 0.80))
+        )
+        self._servo_brake_horizon = max(
+            0.05, min(0.75, _env_float("TRACKER_SERVO_BRAKE_HORIZON", 0.24))
+        )
+        self._servo_derivative_alpha = max(
+            0.05, min(1.0, _env_float("TRACKER_SERVO_DERIVATIVE_ALPHA", 0.40))
+        )
+        self._servo_start_speed_max = max(
+            1, min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_SERVO_START_SPEED_MAX", 1))
+        )
+        self._servo_accel_step = max(1, min(3, _env_int("TRACKER_SERVO_ACCEL_STEP", 1)))
+        self._servo_divergence_grace = max(
+            0.20, min(2.0, _env_float("TRACKER_SERVO_DIVERGENCE_GRACE", 0.80))
+        )
+        self._servo_telemetry_interval = max(
+            0.10, min(1.0, _env_float("TRACKER_SERVO_TELEMETRY_INTERVAL", 0.20))
+        )
+
+        continuity_default = "dog,cat,bird"
+        self._class_continuity_labels = {
+            token.strip().lower()
+            for token in os.getenv("TRACKER_CLASS_CONTINUITY_LABELS", continuity_default).split(",")
+            if token.strip().lower() in self.cfg.target_classes
+        }
+        self._class_vote_window = max(
+            0.40, min(4.0, _env_float("TRACKER_CLASS_VOTE_WINDOW", 1.50))
+        )
+        self._class_switch_ratio = max(
+            1.05, min(3.0, _env_float("TRACKER_CLASS_SWITCH_RATIO", 1.35))
+        )
+        self._class_switch_min_hits = max(
+            2, min(8, _env_int("TRACKER_CLASS_SWITCH_MIN_HITS", 2))
+        )
+
         self.active = False
         self.state = "OFF"
         self.target: Optional[TargetTrack] = None
@@ -1384,6 +1481,15 @@ class DogTracker:
         self._precision_defer_last_event_at = 0.0
         self._hybrid_pan_reverse_until = 0.0
         self._hybrid_tilt_reverse_until = 0.0
+        self._servo_axis_state: Dict[str, dict] = {
+            "pan": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+            "tilt": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+        }
+        self._servo_feedforward = {"pan": 0.0, "tilt": 0.0}
+        self._servo_feedforward_started_at = 0.0
+        self._servo_last_telemetry_at = 0.0
+        self._servo_last_decision: Dict[str, object] = {}
+        self._class_evidence: Deque[Tuple[float, str, int, float]] = deque(maxlen=32)
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -1549,6 +1655,15 @@ class DogTracker:
         self._precision_defer_last_event_at = 0.0
         self._hybrid_pan_reverse_until = 0.0
         self._hybrid_tilt_reverse_until = 0.0
+        self._servo_axis_state = {
+            "pan": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+            "tilt": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+        }
+        self._servo_feedforward = {"pan": 0.0, "tilt": 0.0}
+        self._servo_feedforward_started_at = 0.0
+        self._servo_last_telemetry_at = 0.0
+        self._servo_last_decision = {}
+        self._class_evidence.clear()
         self._move_failure_count = 0
         self._move_retry_after = 0.0
         self._smart_history.clear()
@@ -2369,7 +2484,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev4 persistent-motion + continuous-servo control)")
+        self.logger.info("PTZ tracker STARTED (Rev5 damped feedback servo + semantic continuity)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -2568,8 +2683,8 @@ class DogTracker:
                 "move_quality_samples": len(self._quality_improvements),
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
-                    "controller_revision": 4,
-                    "strategy": "persistent_velocity_continuous_servo_precision",
+                    "controller_revision": 5,
+                    "strategy": "damped_feedback_servo_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -2585,6 +2700,23 @@ class DogTracker:
                     "precision_min_error": round(self._precision_min_error, 3),
                     "precision_settle_s": round(self._precision_settle_s, 3),
                     "axis_reverse_holdoff_s": round(self._hybrid_axis_reverse_holdoff, 3),
+                    "servo": {
+                        "kp": round(self._servo_kp, 3),
+                        "kd": round(self._servo_kd, 3),
+                        "feedforward_gain": round(self._servo_feedforward_gain, 3),
+                        "feedforward_decay_s": round(self._servo_feedforward_decay_s, 3),
+                        "brake_horizon_s": round(self._servo_brake_horizon, 3),
+                        "start_speed_max": self._servo_start_speed_max,
+                        "accel_step": self._servo_accel_step,
+                        "divergence_grace_s": round(self._servo_divergence_grace, 3),
+                        "last_decision": self._servo_last_decision or None,
+                    },
+                    "semantic_continuity": {
+                        "labels": sorted(self._class_continuity_labels),
+                        "vote_window_s": round(self._class_vote_window, 3),
+                        "switch_ratio": round(self._class_switch_ratio, 3),
+                        "switch_min_hits": self._class_switch_min_hits,
+                    },
                     "precision_hold_until_ms": max(0, int((self._precision_hold_until - now) * 1000)),
                     "move_direct_predictive_lead": False,
                     "live_spatial_learning": False,
@@ -2823,6 +2955,212 @@ class DogTracker:
         self._record_event("move_quality", pre_error=[round(pre_x, 3), round(pre_y, 3)], post_error=[round(post_x, 3), round(post_y, 3)], improvement=round(improvement, 3), overshoot=overshoot, undershoot=undershoot, learned=learned, zoom_bucket=bucket, pan_scale=round(pan_scale, 3), tilt_scale=round(tilt_scale, 3))
         self._pending_move_quality = None
 
+    def _reset_servo_feedback(self) -> None:
+        self._servo_axis_state = {
+            "pan": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+            "tilt": {"last_error": None, "last_time": 0.0, "filtered_rate": 0.0},
+        }
+        self._servo_feedforward = {"pan": 0.0, "tilt": 0.0}
+        self._servo_feedforward_started_at = 0.0
+        self._servo_last_telemetry_at = 0.0
+        self._servo_last_decision = {}
+
+    def _seed_servo_feedback(
+        self,
+        frame_shape: Tuple[int, ...],
+        now: float,
+        err_x: float,
+        err_y: float,
+    ) -> None:
+        h, w = frame_shape[:2]
+        self._reset_servo_feedback()
+        self._servo_axis_state["pan"]["last_error"] = float(err_x)
+        self._servo_axis_state["pan"]["last_time"] = float(now)
+        self._servo_axis_state["tilt"]["last_error"] = float(err_y)
+        self._servo_axis_state["tilt"]["last_time"] = float(now)
+        if (
+            self.target is not None
+            and self.target.velocity_valid
+            and self.target.velocity_estimate_time is not None
+            and (now - self.target.velocity_estimate_time) <= self._motion_velocity_ttl
+        ):
+            self._servo_feedforward["pan"] = self.target.vx / max(1.0, w / 2.0)
+            self._servo_feedforward["tilt"] = self.target.vy / max(1.0, h / 2.0)
+        self._servo_feedforward_started_at = float(now)
+
+    def _servo_axis_command(
+        self,
+        error: float,
+        axis: str,
+        now: float,
+    ) -> Tuple[int, dict]:
+        state = self._servo_axis_state[axis]
+        previous_error = state.get("last_error")
+        previous_time = float(state.get("last_time") or 0.0)
+        filtered_rate = float(state.get("filtered_rate") or 0.0)
+        dt = max(0.0, float(now) - previous_time)
+        if previous_error is None or dt < 0.02 or dt > 0.75:
+            raw_error_rate = 0.0
+        else:
+            raw_error_rate = (float(error) - float(previous_error)) / dt
+        alpha = self._servo_derivative_alpha
+        filtered_rate = (1.0 - alpha) * filtered_rate + alpha * raw_error_rate
+        state["last_error"] = float(error)
+        state["last_time"] = float(now)
+        state["filtered_rate"] = filtered_rate
+
+        ff = float(self._servo_feedforward.get(axis, 0.0))
+        if self._servo_feedforward_started_at > 0.0:
+            age = max(0.0, now - self._servo_feedforward_started_at)
+            ff *= math.exp(-age / max(0.05, self._servo_feedforward_decay_s))
+
+        axis_exit_error = min(
+            self.cfg.hybrid_chase_exit_error,
+            self._motion_control_continuous_exit_error,
+        )
+        decision = _servo_axis_decision(
+            error=error,
+            error_rate=filtered_rate,
+            feedforward_rate=ff,
+            exit_error=axis_exit_error,
+            kp=self._servo_kp,
+            kd=self._servo_kd,
+            feedforward_gain=self._servo_feedforward_gain,
+            brake_horizon_s=self._servo_brake_horizon,
+        )
+        desired_rate = abs(float(decision["desired_rate"]))
+        requested_speed = 0
+        command = 0
+        if desired_rate > 1e-6:
+            calibrated = self._active_calibration.choose_continuous_speed_for_rate(
+                axis,
+                desired_rate,
+                self._current_zoom_factor(),
+                min_speed=self.cfg.hybrid_chase_min_speed,
+                max_speed=self.cfg.hybrid_chase_max_speed,
+            )
+            if calibrated is None:
+                span = max(0.05, self.cfg.hybrid_chase_full_speed_error - axis_exit_error)
+                ratio = max(0.0, min(1.0, (abs(error) - axis_exit_error) / span))
+                calibrated = int(round(
+                    self.cfg.hybrid_chase_min_speed
+                    + ratio * (self.cfg.hybrid_chase_max_speed - self.cfg.hybrid_chase_min_speed)
+                ))
+            requested_speed = max(
+                self.cfg.hybrid_chase_min_speed,
+                min(self.cfg.hybrid_chase_max_speed, int(calibrated)),
+            )
+            current_mag = abs(
+                self._hybrid_pan_speed if axis == "pan" else self._hybrid_tilt_speed
+            )
+            allowed_mag = (
+                self._servo_start_speed_max
+                if not self._hybrid_chase_active
+                else min(self.cfg.hybrid_chase_max_speed, current_mag + self._servo_accel_step)
+            )
+            command_mag = min(requested_speed, allowed_mag)
+            if abs(error) <= axis_exit_error + 0.16:
+                command_mag = min(command_mag, self.cfg.hybrid_chase_min_speed)
+            command = command_mag if float(decision["desired_rate"]) > 0.0 else -command_mag
+
+        meta = {
+            "axis": axis,
+            "error": round(float(error), 4),
+            "error_rate": round(filtered_rate, 4),
+            "feedforward_rate": round(ff, 4),
+            "predicted_error": round(float(decision["predicted_error"]), 4),
+            "closing_rate": round(float(decision["closing_rate"]), 4),
+            "desired_rate": round(float(decision["desired_rate"]), 4),
+            "requested_speed": requested_speed,
+            "command_speed": command,
+            "phase": str(decision["phase"]),
+        }
+        return command, meta
+
+    def _record_servo_telemetry(
+        self,
+        now: float,
+        pan_meta: dict,
+        tilt_meta: dict,
+        pan_command: int,
+        tilt_command: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        payload = {
+            "pan": pan_meta,
+            "tilt": tilt_meta,
+            "camera_command": [int(pan_command), int(tilt_command)],
+        }
+        self._servo_last_decision = payload
+        if force or (now - self._servo_last_telemetry_at) >= self._servo_telemetry_interval:
+            self._servo_last_telemetry_at = now
+            self._record_event("hybrid_servo", **payload)
+
+    def _class_mismatch_compatible(
+        self,
+        det: Detection,
+        *,
+        dist_norm: float,
+        overlap: float,
+        size_similarity: float,
+    ) -> bool:
+        if self.target is None or det.class_id == self.target.class_id:
+            return True
+        pair = {self.target.label, det.label}
+        if not pair.issubset(self._class_continuity_labels):
+            return False
+        if "bird" in pair:
+            return bool(
+                size_similarity >= 0.45
+                and (overlap >= 0.40 or dist_norm <= 0.07)
+            )
+        return bool(
+            size_similarity >= 0.30
+            and (overlap >= 0.25 or dist_norm <= 0.12)
+        )
+
+    def _observe_target_class(self, det: Detection, now: float) -> None:
+        if self.target is None:
+            return
+        self._class_evidence.append((float(now), det.label, det.class_id, det.confidence))
+        cutoff = now - self._class_vote_window
+        while self._class_evidence and self._class_evidence[0][0] < cutoff:
+            self._class_evidence.popleft()
+
+        scores: Dict[str, float] = {}
+        hits: Dict[str, int] = {}
+        class_ids: Dict[str, int] = {}
+        for _, label, class_id, confidence in self._class_evidence:
+            scores[label] = scores.get(label, 0.0) + max(0.05, float(confidence))
+            hits[label] = hits.get(label, 0) + 1
+            class_ids[label] = int(class_id)
+
+        current_label = self.target.label
+        if current_label in scores:
+            scores[current_label] += 0.25
+        if not scores:
+            return
+        candidate = max(scores, key=lambda label: scores[label])
+        if candidate == current_label:
+            return
+        current_score = max(0.05, scores.get(current_label, 0.0))
+        if (
+            hits.get(candidate, 0) >= self._class_switch_min_hits
+            and scores[candidate] >= current_score * self._class_switch_ratio
+        ):
+            old_label = self.target.label
+            self.target.label = candidate
+            self.target.class_id = class_ids[candidate]
+            self._record_event(
+                "target_class_switched",
+                from_label=old_label,
+                to_label=candidate,
+                candidate_score=round(scores[candidate], 3),
+                previous_score=round(current_score, 3),
+                hits=hits[candidate],
+            )
+
     def _hybrid_axis_speed(self, error: float, axis: str) -> int:
         magnitude = abs(error)
         axis_exit_error = min(
@@ -2885,6 +3223,7 @@ class DogTracker:
         self._hybrid_pan_reverse_until = 0.0
         self._hybrid_tilt_reverse_until = 0.0
         self._precision_slow_since = None
+        self._reset_servo_feedback()
         if ok and was_active:
             self.ptz_commands += 1
             self.hybrid_chase_stops += 1
@@ -2927,7 +3266,7 @@ class DogTracker:
         raw_desired = (pan_speed, tilt_speed)
         current = (self._hybrid_pan_speed, self._hybrid_tilt_speed)
 
-        # Rev 4 handles center crossings independently per axis. Motor inertia on
+        # Rev 5 preserves Rev 4's independent per-axis center-crossing handling. Motor inertia on
         # one axis must not cancel useful tracking on the other. A reversing axis
         # is neutralized briefly, then may reverse only if the error still demands
         # it after the holdoff.
@@ -3072,7 +3411,10 @@ class DogTracker:
             return
         dominant_error = max(abs(err_x), abs(err_y))
         if self._hybrid_last_error is not None:
-            if dominant_error > (self._hybrid_last_error + self.cfg.hybrid_divergence_growth):
+            if (
+                (now - self._hybrid_started_at) >= self._servo_divergence_grace
+                and dominant_error > (self._hybrid_last_error + self.cfg.hybrid_divergence_growth)
+            ):
                 self._hybrid_divergence_count += 1
             elif dominant_error < self._hybrid_last_error:
                 self._hybrid_divergence_count = 0
@@ -3113,8 +3455,14 @@ class DogTracker:
         self._hybrid_low_confidence_since = None
         pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
         tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
-        pan_speed = pan_sign * self._hybrid_axis_speed(err_x, "pan")
-        tilt_speed = tilt_sign * self._hybrid_axis_speed(err_y, "tilt")
+        pan_control, pan_meta = self._servo_axis_command(err_x, "pan", now)
+        tilt_control, tilt_meta = self._servo_axis_command(err_y, "tilt", now)
+        pan_speed = pan_sign * pan_control
+        tilt_speed = tilt_sign * tilt_control
+        self._record_servo_telemetry(now, pan_meta, tilt_meta, pan_speed, tilt_speed)
+        if pan_speed == 0 and tilt_speed == 0:
+            await self._stop_hybrid_chase("servo_brake", seq=seq)
+            return
         await self._set_hybrid_chase_speed(
             pan_speed,
             tilt_speed,
@@ -3590,6 +3938,8 @@ class DogTracker:
             self._last_velocity_geometry = None
             self._smart_history.clear()
             self._smart_history.add(now, chosen.bbox, chosen.confidence, frame.shape)
+            self._class_evidence.clear()
+            self._class_evidence.append((now, chosen.label, chosen.class_id, chosen.confidence))
             self.state = "ACQUIRE"
             self._record_event(
                 "acquire_candidate",
@@ -3668,6 +4018,7 @@ class DogTracker:
                 and self.target.velocity_valid
                 and velocity_age_s <= self._motion_velocity_ttl
             )
+            self._observe_target_class(matched, now)
             self.target.update(
                 matched,
                 now,
@@ -3677,6 +4028,7 @@ class DogTracker:
                     self._motion_control_min_sample_ms,
                 ) / 1000.0,
                 preserve_velocity=preserve_velocity,
+                allow_class_mismatch=True,
             )
             self._smart_history.add(now, matched.bbox, matched.confidence, frame.shape)
             if self._ptz_operation is None and ptz_ready and not self._frame_sharpness_ok:
@@ -3900,8 +4252,6 @@ class DogTracker:
         best: Optional[Detection] = None
         best_score = -1.0
         for det in detections:
-            if det.class_id != self.target.class_id:
-                continue
             cx, cy = det.center
             if (
                 camera_recently_moved
@@ -3922,7 +4272,21 @@ class DogTracker:
             if dist_norm > max_dist and overlap < 0.30:
                 continue
             size_similarity = min(old_area, det.area) / max(old_area, det.area)
-            score = 0.35 * overlap + 0.45 * proximity + 0.10 * size_similarity + 0.10 * det.confidence
+            if not self._class_mismatch_compatible(
+                det,
+                dist_norm=dist_norm,
+                overlap=overlap,
+                size_similarity=size_similarity,
+            ):
+                continue
+            class_penalty = 0.0 if det.class_id == self.target.class_id else 0.12
+            score = (
+                0.35 * overlap
+                + 0.45 * proximity
+                + 0.10 * size_similarity
+                + 0.10 * det.confidence
+                - class_penalty
+            )
             if score > best_score:
                 best_score = score
                 best = det
@@ -4048,10 +4412,16 @@ class DogTracker:
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
                 self._precision_slow_since = None
+                self._seed_servo_feedback(frame_shape, now, err_x, err_y)
                 pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
                 tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
-                pan_speed = pan_sign * self._hybrid_axis_speed(err_x, "pan")
-                tilt_speed = tilt_sign * self._hybrid_axis_speed(err_y, "tilt")
+                pan_control, pan_meta = self._servo_axis_command(err_x, "pan", now)
+                tilt_control, tilt_meta = self._servo_axis_command(err_y, "tilt", now)
+                pan_speed = pan_sign * pan_control
+                tilt_speed = tilt_sign * tilt_control
+                self._record_servo_telemetry(
+                    now, pan_meta, tilt_meta, pan_speed, tilt_speed, force=True
+                )
                 self._record_event(
                     "hybrid_chase_enter",
                     label=self.target.label,
