@@ -1083,7 +1083,7 @@ def _motion_control_decision(
 ):
     """Choose continuous chase vs slow/stationary precision positioning.
 
-    Rev 4 treats moveDirectly as a precision controller, not a predictor. A
+    Rev 6 keeps moveDirectly as a precision controller, not a predictor. A
     moving target either receives continuous PTZ (when sufficiently displaced)
     or is intentionally held until its motion settles. This avoids committing
     the camera to a 1.3-1.8 second move based on a target that will be somewhere
@@ -2933,8 +2933,8 @@ class DogTracker:
                 "move_quality_samples": len(self._quality_improvements),
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
-                    "controller_revision": 5,
-                    "strategy": "damped_feedback_servo_semantic_continuity",
+                    "controller_revision": 6,
+                    "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
