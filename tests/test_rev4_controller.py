@@ -49,6 +49,8 @@ class Rev4ControllerTests(unittest.TestCase):
         block = TRACKER[start:end]
         self.assertIn("hybrid_axis_reversal_suppressed", block)
         self.assertIn("hybrid_axis_pause", block)
+        self.assertIn("command_pan, command_tilt = desired", block)
+        self.assertIn("self.ptz.continuous_move,\n            command_pan,\n            command_tilt,", block)
         self.assertNotIn('_stop_hybrid_chase("direction_reversal"', block)
 
     def test_bbox_scale_change_with_coherent_translation_is_accepted(self):
