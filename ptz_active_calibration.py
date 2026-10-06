@@ -254,6 +254,49 @@ class ActivePtzCalibrationStore:
         desired = low_rate + ratio * max(0.0, high_rate - low_rate)
         return min(ordered, key=lambda item: (abs(item[1] - desired), item[0]))[0]
 
+    def continuous_rates(
+        self,
+        axis: str,
+        zoom_factor: float,
+        *,
+        min_speed: int = 1,
+        max_speed: int = 8,
+    ) -> Dict[int, float]:
+        """Return measured normalized image-correction rates for one PTZ axis."""
+        rates = self._nearest_zoom_rates(axis, zoom_factor)
+        return {
+            speed: rate
+            for speed, rate in rates.items()
+            if min_speed <= speed <= max_speed and math.isfinite(rate) and rate > 0.0
+        }
+
+    def choose_continuous_speed_for_rate(
+        self,
+        axis: str,
+        desired_rate_per_s: float,
+        zoom_factor: float,
+        *,
+        min_speed: int,
+        max_speed: int,
+    ) -> Optional[int]:
+        """Choose the calibrated motor speed closest to a desired image rate.
+
+        Rev 5 drives the PTZ as a feedback servo. The controller produces a
+        desired normalized image correction rate; calibration translates that
+        rate into the camera's discrete native speed levels.
+        """
+        rates = self.continuous_rates(
+            axis,
+            zoom_factor,
+            min_speed=min_speed,
+            max_speed=max_speed,
+        )
+        if not rates:
+            return None
+        desired = max(0.0, float(desired_rate_per_s))
+        ordered = sorted(rates.items())
+        return min(ordered, key=lambda item: (abs(item[1] - desired), item[0]))[0]
+
     def public_dict(self) -> dict:
         camera = self._camera()
         move = camera.get("move_directly", {}) if isinstance(camera, dict) else {}
