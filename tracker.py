@@ -1829,10 +1829,10 @@ class DogTracker:
             )
 
 
-    def _startup_calibration_requirements(self) -> Tuple[bool, bool]:
+    def _startup_calibration_requirements(self) -> Tuple[bool, bool, bool]:
         policy = self._startup_calibration_policy
         if policy == "off":
-            return False, False
+            return False, False, False
         zoom_missing = self.cfg.autozoom and len(self._zoom_map.points()) < 2
         saved_move = self._active_calibration.move_directly()
         try:
@@ -1843,23 +1843,42 @@ class DogTracker:
             not self._active_calibration.has_motion_calibration()
             or motion_revision < 2
         )
+        # Rev 6 adds a calibrated fractional ONVIF ContinuousMove profile. Older
+        # Rev 2-5 motion calibration is still valid for moveDirectly/native PTZ,
+        # but it cannot safely drive the fractional servo until this profile has
+        # been measured on the actual camera. Treat that as a one-time migration
+        # requirement instead of forcing a full motion recalibration.
+        fractional_missing = bool(
+            self._servo_actuator_mode in ("auto", "onvif")
+            and not self._active_calibration.has_onvif_fractional_continuous()
+        )
         motion_stale = not self._active_calibration.is_fresh(self._calibration_max_age_days)
         if policy == "always":
             zoom_needed = self.cfg.autozoom
             motion_needed = True
+            fractional_needed = self._servo_actuator_mode in ("auto", "onvif")
         elif policy == "if_stale":
             zoom_needed = zoom_missing
             motion_needed = motion_missing or motion_stale
+            fractional_needed = fractional_missing or motion_stale
         else:  # if_missing
             zoom_needed = zoom_missing
             motion_needed = motion_missing
+            fractional_needed = fractional_missing
 
         scope = self._calibration_scope
         if scope == "zoom":
             motion_needed = False
-        elif scope in ("movedirectly", "continuous", "motion", "onvif"):
+            fractional_needed = False
+        elif scope == "movedirectly":
             zoom_needed = False
-        return zoom_needed, motion_needed
+            fractional_needed = False
+        elif scope in ("continuous", "onvif"):
+            zoom_needed = False
+            motion_needed = False
+        elif scope == "motion":
+            zoom_needed = False
+        return zoom_needed, motion_needed, fractional_needed
 
     async def _startup_calibration_sequence(self) -> None:
         self._startup_calibration_state = "checking"
@@ -1873,8 +1892,8 @@ class DogTracker:
                     break
                 await asyncio.sleep(0.10)
 
-            zoom_needed, motion_needed = self._startup_calibration_requirements()
-            if not zoom_needed and not motion_needed:
+            zoom_needed, motion_needed, fractional_needed = self._startup_calibration_requirements()
+            if not zoom_needed and not motion_needed and not fractional_needed:
                 self._startup_calibration_state = "skipped"
                 self._startup_calibration_last_result = {
                     "success": True,
@@ -1886,10 +1905,19 @@ class DogTracker:
                     mode = "all"
                 elif zoom_needed:
                     mode = "zoom"
-                elif self._calibration_scope in ("movedirectly", "continuous", "onvif"):
-                    mode = self._calibration_scope
+                elif motion_needed:
+                    if self._calibration_scope in ("movedirectly", "continuous", "onvif"):
+                        mode = self._calibration_scope
+                    else:
+                        mode = "motion"
+                elif fractional_needed:
+                    # Upgrade a valid Rev 2-5 motion calibration in place by
+                    # measuring native continuous response + fractional ONVIF
+                    # response only. This preserves moveDirectly/zoom calibration
+                    # and avoids a long full-camera exercise after a Rev 6 update.
+                    mode = "continuous"
                 else:
-                    mode = "motion"
+                    mode = self._calibration_scope
                 self._startup_calibration_state = "running"
                 self._record_event("startup_calibration_started", mode=mode, policy=self._startup_calibration_policy)
                 result = await self.calibrate(mode=mode)
