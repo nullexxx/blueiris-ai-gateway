@@ -5310,11 +5310,7 @@ class DogTracker:
         diag = max(1.0, math.hypot(w, h))
         motion_start: Optional[Tuple[float, float]] = None
         motion_end: Optional[Tuple[float, float]] = None
-        motion_point = (
-            self._camera_motion.apply_point(self.target.center)
-            if camera_recently_moved and self._camera_motion is not None
-            else None
-        )
+        motion_point = self._camera_motion.apply_point(self.target.center) if camera_recently_moved and self._camera_motion is not None else None
         if self._hybrid_chase_active:
             px, py = self.target.center
         elif camera_recently_moved:
