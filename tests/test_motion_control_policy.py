@@ -92,10 +92,11 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertTrue(decision["use_continuous"])
         self.assertEqual(decision["reason"], "hard_escape")
 
-    def test_hybrid_disabled_preserves_move_direct_fallback(self):
+    def test_hybrid_disabled_does_not_send_stale_positional_move(self):
         decision = self.call_policy(hybrid_enabled=False, velocity_sample_ms=0)
         self.assertFalse(decision["use_continuous"])
-        self.assertTrue(decision["precision_move_allowed"])
+        self.assertFalse(decision["precision_move_allowed"])
+        self.assertEqual(decision["precision_hold_reason"], "velocity_sample")
 
     def test_live_target_quality_no_longer_mutates_spatial_calibration(self):
         start = TRACKER.index("    def _complete_move_quality")
@@ -104,9 +105,9 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertNotIn("set_spatial_scales", block)
         self.assertIn("Live-target telemetry is observational only", block)
 
-    def test_rev5_precision_contracts_are_present(self):
-        self.assertIn('"controller_revision": 5', TRACKER)
-        self.assertIn('"damped_feedback_servo_semantic_continuity"', TRACKER)
+    def test_rev6_precision_contracts_are_present(self):
+        self.assertIn('"controller_revision": 6', TRACKER)
+        self.assertIn('"fractional_servo_settled_velocity_semantic_continuity"', TRACKER)
         self.assertIn('"adaptive_hybrid_current_center"', TRACKER)
         self.assertIn("self._precision_hold_until", TRACKER)
         self.assertIn("hybrid_chase_confidence_grace", TRACKER)
