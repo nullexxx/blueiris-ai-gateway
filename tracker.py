@@ -1848,9 +1848,11 @@ class DogTracker:
         # but it cannot safely drive the fractional servo until this profile has
         # been measured on the actual camera. Treat that as a one-time migration
         # requirement instead of forcing a full motion recalibration.
+        fractional_profile = self._active_calibration.onvif_fractional_continuous()
         fractional_missing = bool(
-            self._servo_actuator_mode in ("auto", "onvif")
-            and not self._active_calibration.has_onvif_fractional_continuous()
+            self._calibration_onvif_benchmark
+            and self._servo_actuator_mode in ("auto", "onvif")
+            and "usable" not in fractional_profile
         )
         motion_stale = not self._active_calibration.is_fresh(self._calibration_max_age_days)
         if policy == "always":
