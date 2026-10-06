@@ -39,7 +39,9 @@ class Rev4ControllerTests(unittest.TestCase):
         self.assertIn("TRACKER_RETENTION_DETECTION_CONF", TRACKER)
         self.assertIn("TRACKER_CHASE_DETECTION_CONF", TRACKER)
         self.assertIn("inference_conf = self.cfg.hold_conf", TRACKER)
-        self.assertIn("if self.target is not None:", TRACKER)
+        self.assertIn('self.state in ("COAST", "REACQUIRE", "PTZ_MOVING", "PTZ_SETTLING")', TRACKER)
+        self.assertIn('self.state = "TARGET_RETENTION"', TRACKER)
+        self.assertIn("self.target.confidence < self.cfg.hold_conf", TRACKER)
         # New acquisition remains independently gated at acquire_conf.
         self.assertIn("d.confidence >= self.cfg.acquire_conf", TRACKER)
 
