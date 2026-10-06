@@ -1007,7 +1007,7 @@ def _servo_axis_decision(
     feedforward_gain: float,
     brake_horizon_s: float,
 ) -> Dict[str, float | bool | str]:
-    """Rev 5 proportional+damped image-space servo decision for one axis.
+    """Rev 6 proportional+damped image-space servo decision for one axis.
 
     error_rate is measured from successive tracked bbox centers while the
     camera is moving. That captures both subject motion and the camera's real
@@ -1017,7 +1017,14 @@ def _servo_axis_decision(
     error_rate = float(error_rate)
     exit_error = max(0.01, abs(float(exit_error)))
     predicted_error = error + error_rate * max(0.0, float(brake_horizon_s))
-    closing_rate = 0.0 if abs(error) < 1e-6 else -math.copysign(error_rate, error)
+    # Positive means the tracked bbox is moving toward center. Rev 5 used
+    # copysign(error_rate, error), which discarded the sign of error_rate and
+    # could report an outward-moving negative error as "closing".
+    closing_rate = (
+        0.0
+        if abs(error) < 1e-6
+        else -error_rate * math.copysign(1.0, error)
+    )
     p_term = float(kp) * error
     d_term = float(kd) * error_rate
     ff_term = float(feedforward_gain) * float(feedforward_rate)
@@ -1156,16 +1163,17 @@ def _motion_control_decision(
         else:
             reason = "hard_escape"
 
-    adaptive_hybrid_available = bool(hybrid_enabled and not hybrid_disabled)
+    # Rev 6 never falls back to a 1.3-1.8 s positional move just because the
+    # continuous path is cooling down or circuit-broken. moveDirectly remains
+    # a stationary-target precision tool in every controller state.
     precision_move_allowed = True
     precision_hold_reason = None
-    if adaptive_hybrid_available:
-        if not velocity_mature:
-            precision_move_allowed = False
-            precision_hold_reason = "velocity_sample"
-        elif moving_target:
-            precision_move_allowed = False
-            precision_hold_reason = "moving_target"
+    if not velocity_mature:
+        precision_move_allowed = False
+        precision_hold_reason = "velocity_sample"
+    elif moving_target:
+        precision_move_allowed = False
+        precision_hold_reason = "moving_target"
 
     return {
         "use_continuous": use_continuous,
@@ -1354,6 +1362,18 @@ class DogTracker:
         self._servo_divergence_grace = max(
             0.20, min(2.0, _env_float("TRACKER_SERVO_DIVERGENCE_GRACE", 0.80))
         )
+        self._servo_post_stop_settle_s = max(
+            0.15, min(1.50, _env_float("TRACKER_SERVO_POST_STOP_SETTLE", 0.35))
+        )
+        self._servo_divergence_trip_limit = max(
+            2, min(8, _env_int("TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT", 3))
+        )
+        self._servo_divergence_window_s = max(
+            5.0, min(120.0, _env_float("TRACKER_SERVO_DIVERGENCE_WINDOW", 30.0))
+        )
+        self._servo_divergence_cooldown_s = max(
+            0.25, min(5.0, _env_float("TRACKER_SERVO_DIVERGENCE_COOLDOWN", 0.75))
+        )
         self._servo_telemetry_interval = max(
             0.10, min(1.0, _env_float("TRACKER_SERVO_TELEMETRY_INTERVAL", 0.20))
         )
@@ -1474,6 +1494,9 @@ class DogTracker:
         self._hybrid_disabled_for_session = False
         self._hybrid_last_error: Optional[float] = None
         self._hybrid_divergence_count = 0
+        self._hybrid_divergence_strikes: Deque[float] = deque(maxlen=16)
+        self._hybrid_recover_after = 0.0
+        self._continuous_settle_until = 0.0
         self._hybrid_low_confidence_since: Optional[float] = None
         self._precision_hold_until = 0.0
         self._precision_slow_since: Optional[float] = None
@@ -1648,6 +1671,9 @@ class DogTracker:
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
+        self._hybrid_divergence_strikes.clear()
+        self._hybrid_recover_after = 0.0
+        self._continuous_settle_until = 0.0
         self._hybrid_low_confidence_since = None
         self._precision_hold_until = 0.0
         self._precision_slow_since = None
@@ -2709,6 +2735,15 @@ class DogTracker:
                         "start_speed_max": self._servo_start_speed_max,
                         "accel_step": self._servo_accel_step,
                         "divergence_grace_s": round(self._servo_divergence_grace, 3),
+                        "post_stop_settle_s": round(self._servo_post_stop_settle_s, 3),
+                        "post_stop_settle_remaining_ms": max(
+                            0, int((self._continuous_settle_until - now) * 1000)
+                        ),
+                        "divergence_strikes": len(self._hybrid_divergence_strikes),
+                        "divergence_trip_limit": self._servo_divergence_trip_limit,
+                        "divergence_recovery_remaining_ms": max(
+                            0, int((self._hybrid_recover_after - now) * 1000)
+                        ),
                         "last_decision": self._servo_last_decision or None,
                     },
                     "semantic_continuity": {
@@ -3227,8 +3262,14 @@ class DogTracker:
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = t1
         self._hybrid_last_stopped_at = t1
+        self._last_ptz_stopped_at = t1
+        self._continuous_settle_until = max(
+            self._continuous_settle_until,
+            t1 + self._servo_post_stop_settle_s,
+        )
         self._precision_hold_until = max(
-            self._precision_hold_until, t1 + self._post_chase_precision_holdoff
+            self._precision_hold_until,
+            self._continuous_settle_until + self._post_chase_precision_holdoff,
         )
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
@@ -3237,17 +3278,29 @@ class DogTracker:
         self._hybrid_tilt_reverse_until = 0.0
         self._precision_slow_since = None
         self._reset_servo_feedback()
-        if ok and was_active:
-            self.ptz_commands += 1
-            self.hybrid_chase_stops += 1
-            self._record_event(
-                "hybrid_chase_stop",
-                reason=reason,
-                http_ms=int((t1 - t0) * 1000),
-            )
-        elif not ok and was_active:
-            self._record_event("hybrid_chase_stop_failed", reason=reason, error=self.ptz.last_error)
+
         if was_active:
+            # Continuous PTZ is not represented by _ptz_operation, so Rev 5
+            # could rebase velocity only a few milliseconds after Stop. Force
+            # the same optical-flow settle discipline used after positional PTZ.
+            self._scene_stability.reset(t1)
+            self._scene_stable_ready = False
+            if ok:
+                self.ptz_commands += 1
+                self.hybrid_chase_stops += 1
+                self._record_event(
+                    "hybrid_chase_stop",
+                    reason=reason,
+                    http_ms=int((t1 - t0) * 1000),
+                    settle_ms=int(self._servo_post_stop_settle_s * 1000),
+                )
+            else:
+                self._record_event(
+                    "hybrid_chase_stop_failed",
+                    reason=reason,
+                    error=self.ptz.last_error,
+                )
+
             if self.target is not None:
                 self.target.clear_velocity()
                 self._velocity_rebase_required = True
@@ -3440,14 +3493,31 @@ class DogTracker:
             self._hybrid_last_error = dominant_error
             if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
                 count = self._hybrid_divergence_count
-                self._hybrid_disabled_for_session = True
+                cutoff = now - self._servo_divergence_window_s
+                while self._hybrid_divergence_strikes and self._hybrid_divergence_strikes[0] < cutoff:
+                    self._hybrid_divergence_strikes.popleft()
+                self._hybrid_divergence_strikes.append(now)
+                strikes = len(self._hybrid_divergence_strikes)
+                trip = strikes >= self._servo_divergence_trip_limit
+                self._hybrid_disabled_for_session = trip
+                self._hybrid_recover_after = max(
+                    self._hybrid_recover_after,
+                    now + self._servo_divergence_cooldown_s,
+                )
                 self._record_event(
                     "hybrid_chase_diverging",
                     error=round(dominant_error, 3),
                     consecutive_growth_frames=count,
+                    strikes_in_window=strikes,
+                    trip_limit=self._servo_divergence_trip_limit,
+                    session_disabled=trip,
                     pan_sign=self.cfg.hybrid_chase_pan_sign,
                 )
-                await self._stop_hybrid_chase("diverging", seq=seq, force=True)
+                await self._stop_hybrid_chase(
+                    "repeated_divergence" if trip else "diverging",
+                    seq=seq,
+                    force=True,
+                )
                 return
         else:
             self._hybrid_last_error = dominant_error
@@ -3800,6 +3870,7 @@ class DogTracker:
             self._ptz_operation is None
             and seq >= self._post_motion_release_seq
             and self._scene_stable_ready
+            and time.monotonic() >= self._continuous_settle_until
         )
 
     async def _run(self) -> None:
@@ -3932,16 +4003,25 @@ class DogTracker:
         )
         self._update_frame_quality(frame, now)
         if self._ptz_operation is None and not self._scene_stable_ready:
-            was_ready = self._scene_stable_ready
-            self._scene_stable_ready = self._scene_stability.observe(
+            observed_ready = self._scene_stability.observe(
                 now, self._camera_motion, self._frame_sharpness_ok, frame.shape
             )
-            if self._scene_stable_ready and not was_ready:
+            # A continuous stop needs both optical-flow stability and a minimum
+            # physical quiet interval. If flow settles early, restart the gate so
+            # we still require fresh stable frames after the inertia window.
+            if observed_ready and now < self._continuous_settle_until:
+                self._scene_stability.reset(now)
+                observed_ready = False
+            self._scene_stable_ready = observed_ready
+            if self._scene_stable_ready:
                 self._record_event(
                     "post_move_scene_stable",
                     reason=self._scene_stability.last_reason,
                     flow_norm=self._scene_stability.last_flow_norm,
                     timed_out=self._scene_stability.timed_out,
+                    post_stop_quiet_ms=max(
+                        0, int((now - self._last_ptz_stopped_at) * 1000)
+                    ),
                 )
 
         # Never acquire a new target while a home preset is still moving, or from
@@ -4447,7 +4527,11 @@ class DogTracker:
                 move_eta_s=handoff_eta_s,
                 hybrid_enabled=self.cfg.hybrid_chase_enabled,
                 hybrid_disabled=self._hybrid_disabled_for_session,
-                cooldown_ready=(now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown,
+                cooldown_ready=(
+                    (now - self._hybrid_last_stopped_at) >= self.cfg.hybrid_chase_cooldown
+                    and now >= self._hybrid_recover_after
+                    and now >= self._continuous_settle_until
+                ),
                 edge_clipped=edge_clipped_now,
                 exit_error=self.cfg.hybrid_chase_exit_error,
                 entry_error=self.cfg.hybrid_chase_entry_error,
@@ -4504,21 +4588,21 @@ class DogTracker:
                 )
                 return
 
-            adaptive_hybrid_available = (
-                self.cfg.hybrid_chase_enabled and not self._hybrid_disabled_for_session
-            )
             dominant_error = max(abs(err_x), abs(err_y))
             precision_hold_reason = None
-            if adaptive_hybrid_available and now < self._precision_hold_until:
+            if now < self._continuous_settle_until:
+                self._precision_slow_since = None
+                precision_hold_reason = "camera_settling"
+            elif now < self._precision_hold_until:
                 self._precision_slow_since = None
                 precision_hold_reason = "post_chase_holdoff"
-            elif adaptive_hybrid_available and not bool(control_decision["precision_move_allowed"]):
+            elif not bool(control_decision["precision_move_allowed"]):
                 self._precision_slow_since = None
                 precision_hold_reason = str(control_decision["precision_hold_reason"] or "moving_target")
-            elif adaptive_hybrid_available and dominant_error < self._precision_min_error:
+            elif dominant_error < self._precision_min_error:
                 self._precision_slow_since = None
                 precision_hold_reason = "precision_deadband"
-            elif adaptive_hybrid_available:
+            else:
                 if self._precision_slow_since is None:
                     self._precision_slow_since = now
                 if (now - self._precision_slow_since) < self._precision_settle_s:
@@ -4530,6 +4614,7 @@ class DogTracker:
                     if precision_hold_reason == "velocity_sample"
                     else "PRECISION_HOLD"
                     if precision_hold_reason in (
+                        "camera_settling",
                         "post_chase_holdoff",
                         "precision_deadband",
                         "stationary_settle",
