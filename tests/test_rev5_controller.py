@@ -97,10 +97,14 @@ class Rev5ServoTests(unittest.TestCase):
         self.assertIn('"last_decision": self._servo_last_decision or None', TRACKER)
         self.assertIn('"semantic_continuity": {', TRACKER)
 
-    def test_low_confidence_grace_stops_physical_motion_without_weak_bbox_steering(self):
+    def test_low_confidence_grace_uses_bounded_verified_velocity_coast(self):
         self.assertIn('"hybrid_chase_confidence_grace"', TRACKER)
-        self.assertIn('await self._pause_hybrid_actuator("confidence_grace")', TRACKER)
-        self.assertIn('"hybrid_actuator_pause"', TRACKER)
+        self.assertIn("self._hybrid_confidence_coast_velocity", TRACKER)
+        self.assertIn("TRACKER_CONFIDENCE_COAST_START_SCALE", TRACKER)
+        self.assertIn("TRACKER_CONFIDENCE_COAST_END_SCALE", TRACKER)
+        self.assertIn('self.target.confidence < self._chase_detection_conf', TRACKER)
+        self.assertIn('_stop_hybrid_chase("confidence_floor"', TRACKER)
+        self.assertNotIn('await self._pause_hybrid_actuator("confidence_grace")', TRACKER)
         self.assertIn('"calibrated_rate"', TRACKER)
 
 
