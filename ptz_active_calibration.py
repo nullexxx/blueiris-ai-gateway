@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
@@ -532,6 +532,9 @@ class OnvifPanTiltProbe:
                     "space": self.continuous_uri,
                 }
             }
+            # Fail-safe camera-side lease: if the process or network path dies
+            # while tracking, ONVIF must not leave the PTZ running indefinitely.
+            request.Timeout = timedelta(seconds=1)
             await self.ptz.ContinuousMove(request)
             self.last_error = None
             return True
