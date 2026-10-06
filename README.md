@@ -118,7 +118,7 @@ Normal pan/tilt tracking uses Dahua/Amcrest `moveDirectly` 3D positioning. The t
 
 Predictive target velocity is learned only while the camera is stationary. It is suppressed for immature/noisy velocity samples, low-confidence or tiny detections, and edge-clipped detections. A one-shot **edge rescue** can use a stronger positional gain when the target is already near escape.
 
-For fast outward motion, the tracker can enter an **escape-only hybrid chase**. Continuous PTZ is used only until the target returns to a safe inner region, then it stops and hands control back to `moveDirectly`. Continuous chase is bounded by speed, keepalive, maximum duration, cooldown, and camera-side timeout controls.
+For moving targets, Rev 6 prefers a **fractional ONVIF feedback servo** when the camera proves during active calibration that its ONVIF ContinuousMove velocity is genuinely proportional below native speed 1. The controller maps desired image-space correction rate into that measured fractional velocity, brakes on confidence loss, and waits for both a minimum physical quiet interval and optical-flow stability before learning subject velocity again. If fractional ONVIF is unavailable or quantized, native Dahua continuous movement is reserved for clipped/hard-edge rescue rather than used for fine servo tracking. `moveDirectly` is a stationary-target precision tool and no longer uses predictive lead.
 
 PTZ completion is fail-closed. At the operation deadline the tracker performs a final status read. If status remains unavailable, or the camera still cannot be established as safely idle, tracking stops with `state=PTZ_ERROR` rather than issuing another movement command. A later `/v1/tracker/start` can resume tracking; if the tracker task itself crashed, `start` recreates it.
 
@@ -156,7 +156,11 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_CALIBRATION_OFFSETS` | `0.18,0.35` | Normalized moveDirectly offsets used to learn response and timing. |
 | `TRACKER_CALIBRATION_CONTINUOUS_SPEEDS` | `1,3,6` | Native continuous PTZ speeds sampled during calibration. |
 | `TRACKER_CALIBRATION_CONTINUOUS_DURATION` | `0.22` | Seconds each bounded continuous test pulse runs. |
-| `TRACKER_CALIBRATION_ONVIF_BENCHMARK` | `true` | Probe ONVIF PTZ spaces and benchmark a tiny FOV-relative move when supported. |
+| `TRACKER_CALIBRATION_ONVIF_BENCHMARK` | `true` | Probe ONVIF PTZ spaces, benchmark a tiny FOV-relative move, and characterize fractional ContinuousMove response when supported. |
+| `TRACKER_SERVO_ACTUATOR` | `auto` | Rev 6 servo actuator: `auto`, `onvif`, or `native`. `auto` uses ONVIF only after a usable fractional response has been calibrated. |
+| `TRACKER_ONVIF_SERVO_MAX_VELOCITY` | `0.35` | Maximum normalized ONVIF velocity the feedback servo may request. |
+| `TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES` | `0.04,0.08,0.16` | Fractional ONVIF ContinuousMove velocities sampled by manual/active continuous calibration. |
+| `TRACKER_ONVIF_SERVO_CALIBRATION_DURATION` | `0.22` | Seconds each fractional ONVIF calibration pulse runs. |
 | `TRACKER_CAMERA_IP` | blank | PTZ camera IP or hostname. |
 | `TRACKER_CAMERA_USER` | `admin` | Camera username. |
 | `TRACKER_CAMERA_PASSWORD` | blank | Camera password. Prefer `.env`; do not commit it. |
@@ -228,6 +232,10 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 | `TRACKER_HYBRID_CHASE_SETTLE_FRAMES` | `2` | Fresh frames required after chase stops. |
 | `TRACKER_HYBRID_DIVERGENCE_FRAMES` | `3` | Consecutive materially-worsening chase frames before the chase is aborted. |
 | `TRACKER_HYBRID_DIVERGENCE_GROWTH` | `0.05` | Minimum normalized error growth that counts toward divergence. |
+| `TRACKER_SERVO_POST_STOP_SETTLE` | `0.35` | Minimum physical quiet time after continuous PTZ stops before velocity can be rebased. |
+| `TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT` | `3` | Divergence strikes required within the rolling window before continuous tracking is disabled for the session. |
+| `TRACKER_SERVO_DIVERGENCE_WINDOW` | `30` | Seconds in the rolling divergence strike window. |
+| `TRACKER_SERVO_DIVERGENCE_COOLDOWN` | `0.75` | Recovery cooldown after a single aborted divergent chase. |
 
 ### PTZ Operation Settling
 
@@ -266,29 +274,15 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 
 ## Recommended Tracker Tuning
 
-The included example Compose reflects the current hybrid controller:
+The included example Compose reflects the current Rev 6 controller. After upgrading from an older controller, run one manual continuous calibration with tracking stopped so Rev 6 can determine whether the camera really supports sub-speed ONVIF motion:
 
-```text
-TRACKER_FPS=15
-TRACKER_MOVE_GAIN=0.60
-TRACKER_LEAD_TIME=0.75
-TRACKER_ADAPTIVE_LEAD=true
-TRACKER_EDGE_RESCUE_ENABLED=true
-TRACKER_EDGE_RESCUE_ERROR=0.75
-TRACKER_EDGE_RESCUE_GAIN=0.85
-TRACKER_HYBRID_CHASE_ENABLED=true
-TRACKER_HYBRID_CHASE_PAN_SIGN=-1
-TRACKER_HYBRID_CHASE_ENTRY_ERROR=0.82
-TRACKER_HYBRID_CHASE_EXIT_ERROR=0.50
-TRACKER_HYBRID_CHASE_MOTION_ERROR=0.55
-TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM=0.03
-TRACKER_HYBRID_CHASE_MIN_SPEED=1
-TRACKER_HYBRID_CHASE_MAX_SPEED=6
-TRACKER_PTZ_STATUS_POLL_INTERVAL=0.06
-TRACKER_PTZ_OPERATION_TIMEOUT=4.0
-TRACKER_POST_MOVE_FRAMES=1
-TRACKER_ZOOM_MAX_FACTOR=6.0
+```bash
+curl -s -X POST 'http://<gateway>:32168/v1/tracker/stop'
+curl -s -X POST 'http://<gateway>:32168/v1/tracker/calibrate?mode=continuous'
+curl -s -X POST 'http://<gateway>:32168/v1/tracker/start'
 ```
+
+A successful calibration stores `onvif_benchmark.fractional_continuous`. If `usable=true`, the runtime uses calibrated fractional ONVIF velocities for normal moving-target servo tracking. If it is false, the controller safely holds rather than repeatedly quantizing fine corrections up to native speed 1; coarse native continuous motion remains available for genuine edge rescue.
 
 When tuning, use `/v1/tracker/history`. `move_directly` events include target/predicted/command centers, velocity quality, lead suppression, effective gain, move distance, predicted ETA, confidence, and CGI latency. Hybrid chase history records entry reason, signed speed, frame error, outward-motion state, stops, and failures. `ptz_operation_complete`, `ptz_operation_timeout`, and `tracking_stopped_ptz_error` show whether camera motion settled safely.
 
