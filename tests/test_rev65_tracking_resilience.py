@@ -44,7 +44,7 @@ class Rev65TrackingResilienceTests(unittest.TestCase):
     def test_drive_has_bounded_native_rescue_and_per_axis_divergence(self):
         chase=block("    async def _drive_hybrid_chase(","    def _begin_ptz_operation")
         self.assertIn("_servo_axis_divergence_count(",chase)
-        self.assertIn('"axis_counts"',chase)
+        self.assertIn("axis_counts=",chase)
         self.assertIn('"native_edge_rescue_enter"',chase)
         self.assertIn('"native_edge_rescue_exit"',chase)
         self.assertIn("self._native_edge_rescue_cooldown_until",chase)

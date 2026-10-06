@@ -5868,7 +5868,9 @@ class DogTracker:
 
             overlap = _iou(self.target.bbox, det.bbox)
             size_similarity = min(old_area, det.area) / max(old_area, det.area)
-            inside_distance_gate = bool(dist_norm <= max_dist or overlap >= 0.30)
+            inside_distance_gate = True
+            if dist_norm > max_dist and overlap < 0.30:
+                inside_distance_gate = False
             class_compatible = self._class_mismatch_compatible(
                 det,
                 dist_norm=dist_norm,
