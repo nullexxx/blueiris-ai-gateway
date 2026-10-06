@@ -129,9 +129,10 @@ class Rev6ControllerTests(unittest.TestCase):
         )
         self.assertIn("fractional_missing = bool(", TRACKER)
         self.assertIn(
-            "not self._active_calibration.has_onvif_fractional_continuous()",
+            "fractional_profile = self._active_calibration.onvif_fractional_continuous()",
             TRACKER,
         )
+        self.assertIn('"usable" not in fractional_profile', TRACKER)
         self.assertIn(
             "zoom_needed, motion_needed, fractional_needed = self._startup_calibration_requirements()",
             TRACKER,
