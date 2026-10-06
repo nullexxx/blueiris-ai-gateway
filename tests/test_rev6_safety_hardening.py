@@ -54,7 +54,7 @@ class Rev6SafetyHardeningTests(unittest.TestCase):
     def test_continuous_handoff_precedes_move_directly_gate(self):
         drive = block(
             "    async def _drive_to_target(",
-            "    async def _maybe_autozoom(",
+            "    def _render_debug_frame(",
         )
         self.assertLess(
             drive.index("if hybrid_entry:"),
