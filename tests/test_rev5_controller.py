@@ -91,17 +91,16 @@ class Rev5ServoTests(unittest.TestCase):
         self.assertIn("allow_class_mismatch", source)
         self.assertIn("and not allow_class_mismatch", source)
 
-    def test_rev5_status_exposes_tuning_and_last_servo_decision(self):
-        self.assertIn('"controller_revision": 5', TRACKER)
-        self.assertIn('"damped_feedback_servo_semantic_continuity"', TRACKER)
+    def test_rev6_status_exposes_tuning_and_last_servo_decision(self):
+        self.assertIn('"controller_revision": 6', TRACKER)
+        self.assertIn('"fractional_servo_settled_velocity_semantic_continuity"', TRACKER)
         self.assertIn('"last_decision": self._servo_last_decision or None', TRACKER)
         self.assertIn('"semantic_continuity": {', TRACKER)
 
-    def test_low_confidence_grace_brakes_without_weak_bbox_steering(self):
-        self.assertIn('"hybrid_confidence_decelerate"', TRACKER)
-        self.assertIn("force_command=True", TRACKER)
-        self.assertIn("safe_pan", TRACKER)
-        self.assertIn("safe_tilt", TRACKER)
+    def test_low_confidence_grace_stops_physical_motion_without_weak_bbox_steering(self):
+        self.assertIn('"hybrid_chase_confidence_grace"', TRACKER)
+        self.assertIn('await self._pause_hybrid_actuator("confidence_grace")', TRACKER)
+        self.assertIn('"hybrid_actuator_pause"', TRACKER)
         self.assertIn('"calibrated_rate"', TRACKER)
 
 
