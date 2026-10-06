@@ -50,7 +50,7 @@ class Rev4ControllerTests(unittest.TestCase):
         end = TRACKER.index("    async def _drive_hybrid_chase", start)
         block = TRACKER[start:end]
         self.assertIn("hybrid_axis_reversal_suppressed", block)
-        self.assertIn("hybrid_axis_pause", block)
+        self.assertIn("hybrid_actuator_pause", TRACKER)
         self.assertIn("command_pan, command_tilt = desired", block)
         self.assertIn("self.ptz.continuous_move,\n            command_pan,\n            command_tilt,", block)
         self.assertNotIn('_stop_hybrid_chase("direction_reversal"', block)
@@ -71,9 +71,9 @@ class Rev4ControllerTests(unittest.TestCase):
         result = validator.validate((20, 150, 610, 250), 1.1, shape)
         self.assertFalse(result.valid)
 
-    def test_rev5_status_contract(self):
-        self.assertIn('"controller_revision": 5', TRACKER)
-        self.assertIn('"damped_feedback_servo_semantic_continuity"', TRACKER)
+    def test_rev6_status_contract(self):
+        self.assertIn('"controller_revision": 6', TRACKER)
+        self.assertIn('"fractional_servo_settled_velocity_semantic_continuity"', TRACKER)
         self.assertIn('"missing_grace_s"', TRACKER)
         self.assertIn('"velocity_ttl_s"', TRACKER)
         self.assertIn('"axis_reverse_holdoff_s"', TRACKER)
