@@ -31,6 +31,15 @@ TRACKER_SERVO_OUTWARD_CATCHUP_GAIN=1.30
 TRACKER_SERVO_HOLD_SECONDS=0.30
 TRACKER_SERVO_HOLD_MIN_FRAMES=3
 TRACKER_SERVO_HOLD_RESUME_GROWTH=0.06
+TRACKER_NATIVE_EDGE_RESCUE_ENABLED=true
+TRACKER_NATIVE_EDGE_RESCUE_ERROR=0.75
+TRACKER_NATIVE_EDGE_RESCUE_EXIT_ERROR=0.65
+TRACKER_NATIVE_EDGE_RESCUE_FULL_ERROR=0.92
+TRACKER_NATIVE_EDGE_RESCUE_SATURATION=0.80
+TRACKER_NATIVE_EDGE_RESCUE_SECONDS=0.35
+TRACKER_NATIVE_EDGE_RESCUE_COOLDOWN=0.25
+TRACKER_NATIVE_EDGE_RESCUE_MIN_SPEED=3
+TRACKER_NATIVE_EDGE_RESCUE_MAX_SPEED=6
 TRACKER_CONFIDENCE_COAST_START_SCALE=0.70
 TRACKER_CONFIDENCE_COAST_END_SCALE=0.20
 TRACKER_HYBRID_CHASE_COOLDOWN=0.35
@@ -54,3 +63,13 @@ Association failures are attached to `target_missing` / `target_loss_paused` his
 ## Rev 6.4 refinements
 
 Rev 6.4 preserves the Rev 6.3 braking and loss windows while improving pursuit continuity. Large errors that are still growing receive a progressive outward-only desired-rate multiplier up to 1.30x. Marginal-confidence detections and complete detector misses inside their existing grace windows use a decaying snapshot of the last verified fractional velocity, so they cannot accelerate or reverse the camera. A transient predicted stop now enters a 0.30-second servo hold for at least three observations; error growth of 0.06 immediately resumes the chase, otherwise the hold settles into a normal stop.
+
+
+## Rev 6.5 refinements
+
+Rev 6.5 fixes two state-machine errors exposed by Rev 6.4 and adds a narrowly gated hard-edge rescue for very fast animals.
+
+- Divergence is **per-axis and sign-aware**. Center crossing resets that axis, changing dominant axes cannot create a false strike, and only same-side growth while the axis is requesting correction contributes to divergence.
+- Servo hold may settle only when current dominant error is inside the normal continuous-exit region. A center crossing that remains off-center, or an expired hold still outside the exit region, resumes the chase without the full settle/velocity-relearn cycle.
+- Association diagnostics include `nearest_any` and up to three candidate records with label, confidence, distance, IoU, size similarity, distance-gate status, and semantic compatibility.
+- Native edge rescue is not a replacement controller. It can start only when a near-edge axis is still escaping and the fractional ONVIF request is near saturation (or projected to the extreme edge). One burst lasts at most 0.35 seconds, is followed by a 0.25-second fractional cooldown, uses native speed 3 normally and speed 6 only at extreme error, and detector loss stops it immediately.

@@ -1127,6 +1127,104 @@ def _servo_coast_scale(
     return start + (end - start) * fraction
 
 
+def _servo_axis_divergence_count(
+    previous_error: float | None,
+    current_error: float,
+    desired_rate: float,
+    previous_count: int,
+    growth: float,
+) -> int:
+    """Count only same-side worsening while this axis is actively correcting."""
+    if previous_error is None:
+        return 0
+    prev = float(previous_error)
+    cur = float(current_error)
+    desired = float(desired_rate)
+    if abs(desired) <= 1e-6:
+        return 0
+    if prev == 0.0 or cur == 0.0 or ((prev > 0.0) != (cur > 0.0)):
+        return 0
+    if cur * desired <= 0.0:
+        return 0
+    if abs(cur) > abs(prev) + max(0.0, float(growth)):
+        return max(0, int(previous_count)) + 1
+    if abs(cur) < abs(prev):
+        return 0
+    return max(0, int(previous_count))
+
+
+def _servo_hold_action(
+    held_error_x: float,
+    held_error_y: float,
+    current_error_x: float,
+    current_error_y: float,
+    *,
+    exit_error: float,
+    resume_growth: float,
+    elapsed_s: float,
+    hold_seconds: float,
+    frames: int,
+    min_frames: int,
+) -> str:
+    """Keep chase identity unless the target is genuinely settled near center."""
+    hx, hy = float(held_error_x), float(held_error_y)
+    cx, cy = float(current_error_x), float(current_error_y)
+    exit_mag = max(0.0, float(exit_error))
+    crossed = (
+        (hx * cx < 0.0 and abs(cx) > exit_mag)
+        or (hy * cy < 0.0 and abs(cy) > exit_mag)
+    )
+    if crossed:
+        return "resume_center_cross"
+    held_dom = max(abs(hx), abs(hy))
+    current_dom = max(abs(cx), abs(cy))
+    if current_dom >= held_dom + max(0.0, float(resume_growth)):
+        return "resume_growth"
+    if float(elapsed_s) < float(hold_seconds) or int(frames) < int(min_frames):
+        return "wait"
+    if current_dom <= exit_mag:
+        return "settled"
+    return "resume_outside_exit"
+
+
+def _native_edge_rescue_axis_requested(
+    error: float,
+    error_rate: float,
+    predicted_error: float,
+    onvif_velocity: float | None,
+    *,
+    max_velocity: float,
+    start_error: float,
+    saturation: float,
+    full_error: float,
+) -> bool:
+    """Request native rescue only when a near-edge axis is still escaping."""
+    err = float(error)
+    rate = float(error_rate)
+    if abs(err) < float(start_error) or err * rate <= 0.0:
+        return False
+    velocity = 0.0 if onvif_velocity is None else abs(float(onvif_velocity))
+    saturated = velocity >= max(1e-6, abs(float(max_velocity))) * float(saturation)
+    projected_edge = abs(float(predicted_error)) >= float(full_error)
+    return saturated or projected_edge
+
+
+def _native_edge_rescue_speed(
+    error: float,
+    *,
+    start_error: float,
+    full_error: float,
+    min_speed: int,
+    max_speed: int,
+) -> int:
+    """Use calibrated mid-speed rescue until the target reaches the extreme edge."""
+    magnitude = abs(float(error))
+    if magnitude < float(start_error):
+        return 0
+    speed = int(max_speed) if magnitude >= float(full_error) else int(min_speed)
+    return speed if float(error) > 0.0 else -speed
+
+
 def _motion_control_decision(
     *,
     err_x,
@@ -1457,6 +1555,35 @@ class DogTracker:
         self._servo_hold_resume_growth = max(
             0.02, min(0.20, _env_float("TRACKER_SERVO_HOLD_RESUME_GROWTH", 0.06))
         )
+        self._native_edge_rescue_enabled = _env_bool("TRACKER_NATIVE_EDGE_RESCUE_ENABLED", True)
+        self._native_edge_rescue_error = max(
+            0.60, min(0.95, _env_float("TRACKER_NATIVE_EDGE_RESCUE_ERROR", 0.75))
+        )
+        self._native_edge_rescue_exit_error = max(
+            self._motion_control_continuous_exit_error + 0.10,
+            min(0.85, _env_float("TRACKER_NATIVE_EDGE_RESCUE_EXIT_ERROR", 0.65)),
+        )
+        self._native_edge_rescue_full_error = max(
+            self._native_edge_rescue_error + 0.05,
+            min(1.00, _env_float("TRACKER_NATIVE_EDGE_RESCUE_FULL_ERROR", 0.92)),
+        )
+        self._native_edge_rescue_saturation = max(
+            0.60, min(0.98, _env_float("TRACKER_NATIVE_EDGE_RESCUE_SATURATION", 0.80))
+        )
+        self._native_edge_rescue_seconds = max(
+            0.15, min(0.75, _env_float("TRACKER_NATIVE_EDGE_RESCUE_SECONDS", 0.35))
+        )
+        self._native_edge_rescue_cooldown = max(
+            0.0, min(1.0, _env_float("TRACKER_NATIVE_EDGE_RESCUE_COOLDOWN", 0.25))
+        )
+        self._native_edge_rescue_min_speed = max(
+            self.cfg.hybrid_chase_min_speed,
+            min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_EDGE_RESCUE_MIN_SPEED", 3)),
+        )
+        self._native_edge_rescue_max_speed = max(
+            self._native_edge_rescue_min_speed,
+            min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_EDGE_RESCUE_MAX_SPEED", 6)),
+        )
         self._servo_kd = max(0.0, min(1.50, _env_float("TRACKER_SERVO_KD", 0.24)))
         self._servo_feedforward_gain = max(
             0.0, min(1.50, _env_float("TRACKER_SERVO_FEEDFORWARD_GAIN", 0.45))
@@ -1636,6 +1763,10 @@ class DogTracker:
         self._hybrid_disabled_for_session = False
         self._hybrid_last_error: Optional[float] = None
         self._hybrid_divergence_count = 0
+        self._hybrid_axis_divergence = {
+            "pan": {"last_error": None, "count": 0},
+            "tilt": {"last_error": None, "count": 0},
+        }
         self._hybrid_divergence_strikes: Deque[float] = deque(maxlen=16)
         self._hybrid_recover_after = 0.0
         self._continuous_settle_until = 0.0
@@ -1646,6 +1777,9 @@ class DogTracker:
         self._servo_hold_since: Optional[float] = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
+        self._native_edge_rescue_until = 0.0
+        self._native_edge_rescue_started_at = 0.0
+        self._native_edge_rescue_cooldown_until = 0.0
         self._precision_hold_until = 0.0
         self._precision_slow_since: Optional[float] = None
         self._precision_defer_reason: Optional[str] = None
@@ -1866,6 +2000,10 @@ class DogTracker:
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
+        self._hybrid_axis_divergence = {
+            "pan": {"last_error": None, "count": 0},
+            "tilt": {"last_error": None, "count": 0},
+        }
         self._hybrid_divergence_strikes.clear()
         self._hybrid_recover_after = 0.0
         self._continuous_settle_until = 0.0
@@ -1876,6 +2014,9 @@ class DogTracker:
         self._servo_hold_since = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
+        self._native_edge_rescue_until = 0.0
+        self._native_edge_rescue_started_at = 0.0
+        self._native_edge_rescue_cooldown_until = 0.0
         self._precision_hold_until = 0.0
         self._precision_slow_since = None
         self._precision_defer_reason = None
@@ -3215,7 +3356,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.4",
+                    "controller_patch": "6.5",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
@@ -3251,6 +3392,24 @@ class DogTracker:
                         "hold_resume_growth": round(self._servo_hold_resume_growth, 3),
                         "hold_active": self._servo_hold_since is not None,
                         "hold_elapsed_ms": 0 if self._servo_hold_since is None else int(max(0.0, now - self._servo_hold_since) * 1000),
+                        "axis_divergence_counts": {
+                            "pan": int(self._hybrid_axis_divergence["pan"]["count"]),
+                            "tilt": int(self._hybrid_axis_divergence["tilt"]["count"]),
+                        },
+                        "native_edge_rescue": {
+                            "enabled": self._native_edge_rescue_enabled,
+                            "active": now < self._native_edge_rescue_until,
+                            "remaining_ms": max(0, int((self._native_edge_rescue_until - now) * 1000)),
+                            "cooldown_remaining_ms": max(0, int((self._native_edge_rescue_cooldown_until - now) * 1000)),
+                            "error": round(self._native_edge_rescue_error, 3),
+                            "exit_error": round(self._native_edge_rescue_exit_error, 3),
+                            "full_error": round(self._native_edge_rescue_full_error, 3),
+                            "saturation": round(self._native_edge_rescue_saturation, 3),
+                            "duration_s": round(self._native_edge_rescue_seconds, 3),
+                            "cooldown_s": round(self._native_edge_rescue_cooldown, 3),
+                            "min_speed": self._native_edge_rescue_min_speed,
+                            "max_speed": self._native_edge_rescue_max_speed,
+                        },
                         "kd": round(self._servo_kd, 3),
                         "feedforward_gain": round(self._servo_feedforward_gain, 3),
                         "feedforward_decay_s": round(self._servo_feedforward_decay_s, 3),
@@ -4063,6 +4222,13 @@ class DogTracker:
         )
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
+        self._hybrid_axis_divergence = {
+            "pan": {"last_error": None, "count": 0},
+            "tilt": {"last_error": None, "count": 0},
+        }
+        self._native_edge_rescue_until = 0.0
+        self._native_edge_rescue_started_at = 0.0
+        self._native_edge_rescue_cooldown_until = 0.0
         self._hybrid_low_confidence_since = None
         self._hybrid_confidence_coast_velocity = (0.0, 0.0)
         self._hybrid_missing_coast_since = None
@@ -4429,18 +4595,30 @@ class DogTracker:
 
         if self._servo_hold_since is not None:
             self._servo_hold_frames += 1
-            hold_dominant = max(abs(self._servo_hold_error[0]), abs(self._servo_hold_error[1]))
             hold_elapsed = max(0.0, now - self._servo_hold_since)
             if self.target is not None and self.target.confidence < self._chase_detection_conf:
                 await self._stop_hybrid_chase("confidence_floor", seq=seq)
                 return
-            if dominant_error >= (hold_dominant + self._servo_hold_resume_growth):
+            hold_action = _servo_hold_action(
+                self._servo_hold_error[0],
+                self._servo_hold_error[1],
+                err_x,
+                err_y,
+                exit_error=self._motion_control_continuous_exit_error,
+                resume_growth=self._servo_hold_resume_growth,
+                elapsed_s=hold_elapsed,
+                hold_seconds=self._servo_hold_seconds,
+                frames=self._servo_hold_frames,
+                min_frames=self._servo_hold_min_frames,
+            )
+            if hold_action.startswith("resume_"):
                 self._record_event(
                     "servo_hold_resume",
+                    reason=hold_action,
                     hold_ms=int(hold_elapsed * 1000),
                     frames=self._servo_hold_frames,
-                    held_error=round(hold_dominant, 3),
-                    current_error=round(dominant_error, 3),
+                    held_error=[round(self._servo_hold_error[0], 3), round(self._servo_hold_error[1], 3)],
+                    current_error=[round(err_x, 3), round(err_y, 3)],
                 )
                 self._servo_hold_since = None
                 self._servo_hold_frames = 0
@@ -4448,48 +4626,22 @@ class DogTracker:
                 self._seed_servo_feedback(frame_shape, now, err_x, err_y)
                 self._hybrid_last_error = dominant_error
                 self._hybrid_divergence_count = 0
-            elif hold_elapsed < self._servo_hold_seconds or self._servo_hold_frames < self._servo_hold_min_frames:
+                self._hybrid_axis_divergence = {
+                    "pan": {"last_error": err_x, "count": 0},
+                    "tilt": {"last_error": err_y, "count": 0},
+                }
+            elif hold_action == "wait":
                 self.state = "ESCAPE_CHASE"
                 return
             else:
                 await self._stop_hybrid_chase("servo_hold_settled", seq=seq)
                 return
 
-        if self._hybrid_last_error is not None:
-            if (
-                (now - self._hybrid_started_at) >= self._servo_divergence_grace
-                and dominant_error > (self._hybrid_last_error + self.cfg.hybrid_divergence_growth)
-            ):
-                self._hybrid_divergence_count += 1
-            elif dominant_error < self._hybrid_last_error:
-                self._hybrid_divergence_count = 0
-            self._hybrid_last_error = dominant_error
-            if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
-                count = self._hybrid_divergence_count
-                cutoff = now - self._servo_divergence_window_s
-                while self._hybrid_divergence_strikes and self._hybrid_divergence_strikes[0] < cutoff:
-                    self._hybrid_divergence_strikes.popleft()
-                self._hybrid_divergence_strikes.append(now)
-                strikes = len(self._hybrid_divergence_strikes)
-                trip = strikes >= self._servo_divergence_trip_limit
-                self._hybrid_disabled_for_session = trip
-                self._hybrid_recover_after = max(self._hybrid_recover_after, now + self._servo_divergence_cooldown_s)
-                self._record_event(
-                    "hybrid_chase_diverging",
-                    error=round(dominant_error, 3),
-                    consecutive_growth_frames=count,
-                    strikes_in_window=strikes,
-                    trip_limit=self._servo_divergence_trip_limit,
-                    session_disabled=trip,
-                    actuator=self._hybrid_actuator,
-                    pan_sign=self.cfg.hybrid_chase_pan_sign,
-                )
-                await self._stop_hybrid_chase("repeated_divergence" if trip else "diverging", seq=seq, force=True)
-                return
-        else:
-            self._hybrid_last_error = dominant_error
-
-        if self._hybrid_actuator != "onvif_fractional" and (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds:
+        if (
+            self._hybrid_actuator != "onvif_fractional"
+            and now >= self._native_edge_rescue_until
+            and (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds
+        ):
             await self._stop_hybrid_chase("max_duration", seq=seq)
             return
         if dominant_error <= self._motion_control_continuous_exit_error:
@@ -4540,6 +4692,12 @@ class DogTracker:
                         target_span=target_span,
                     )
                 else:
+                    self._native_edge_rescue_until = 0.0
+                    self._native_edge_rescue_started_at = 0.0
+                    self._native_edge_rescue_cooldown_until = max(
+                        self._native_edge_rescue_cooldown_until,
+                        now + self._native_edge_rescue_cooldown,
+                    )
                     await self._pause_hybrid_actuator("confidence_grace_native")
                 self.state = "ESCAPE_CHASE"
                 return
@@ -4557,8 +4715,170 @@ class DogTracker:
 
         pan_control, pan_meta = self._servo_axis_command(err_x, "pan", now)
         tilt_control, tilt_meta = self._servo_axis_command(err_y, "tilt", now)
-        actuator, pan_command, tilt_command = self._servo_camera_command(pan_control, tilt_control, pan_meta, tilt_meta)
+        actuator, pan_command, tilt_command = self._servo_camera_command(
+            pan_control, tilt_control, pan_meta, tilt_meta
+        )
         self._record_servo_telemetry(now, pan_meta, tilt_meta, actuator, pan_command, tilt_command)
+
+        pan_rescue_requested = (
+            self._native_edge_rescue_enabled
+            and now >= self._native_edge_rescue_cooldown_until
+            and actuator == "onvif_fractional"
+            and _native_edge_rescue_axis_requested(
+                err_x,
+                float(pan_meta.get("error_rate") or 0.0),
+                float(pan_meta.get("predicted_error") or err_x),
+                pan_meta.get("onvif_velocity"),
+                max_velocity=self._servo_onvif_max_velocity,
+                start_error=self._native_edge_rescue_error,
+                saturation=self._native_edge_rescue_saturation,
+                full_error=self._native_edge_rescue_full_error,
+            )
+        )
+        tilt_rescue_requested = (
+            self._native_edge_rescue_enabled
+            and now >= self._native_edge_rescue_cooldown_until
+            and actuator == "onvif_fractional"
+            and _native_edge_rescue_axis_requested(
+                err_y,
+                float(tilt_meta.get("error_rate") or 0.0),
+                float(tilt_meta.get("predicted_error") or err_y),
+                tilt_meta.get("onvif_velocity"),
+                max_velocity=self._servo_onvif_max_velocity,
+                start_error=self._native_edge_rescue_error,
+                saturation=self._native_edge_rescue_saturation,
+                full_error=self._native_edge_rescue_full_error,
+            )
+        )
+
+        rescue_active = now < self._native_edge_rescue_until
+        rescue_entering = False
+        if (pan_rescue_requested or tilt_rescue_requested) and not rescue_active:
+            rescue_entering = True
+            rescue_active = True
+            self._native_edge_rescue_started_at = now
+            self._native_edge_rescue_until = now + self._native_edge_rescue_seconds
+            self._record_event(
+                "native_edge_rescue_enter",
+                axes=[
+                    axis for axis, requested in (
+                        ("pan", pan_rescue_requested),
+                        ("tilt", tilt_rescue_requested),
+                    ) if requested
+                ],
+                error=[round(err_x, 3), round(err_y, 3)],
+                fractional_velocity=[
+                    round(float(pan_meta.get("onvif_velocity") or 0.0), 5),
+                    round(float(tilt_meta.get("onvif_velocity") or 0.0), 5),
+                ],
+                saturation=round(self._native_edge_rescue_saturation, 3),
+                duration_ms=int(self._native_edge_rescue_seconds * 1000),
+            )
+
+        if rescue_active:
+            if dominant_error <= self._native_edge_rescue_exit_error:
+                self._record_event(
+                    "native_edge_rescue_exit",
+                    reason="inside_exit_region",
+                    elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
+                    error=[round(err_x, 3), round(err_y, 3)],
+                )
+                self._native_edge_rescue_until = 0.0
+                self._native_edge_rescue_started_at = 0.0
+                self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
+            else:
+                rescue_pan = _native_edge_rescue_speed(
+                    err_x,
+                    start_error=self._native_edge_rescue_exit_error,
+                    full_error=self._native_edge_rescue_full_error,
+                    min_speed=self._native_edge_rescue_min_speed,
+                    max_speed=self._native_edge_rescue_max_speed,
+                )
+                rescue_tilt = _native_edge_rescue_speed(
+                    err_y,
+                    start_error=self._native_edge_rescue_exit_error,
+                    full_error=self._native_edge_rescue_full_error,
+                    min_speed=self._native_edge_rescue_min_speed,
+                    max_speed=self._native_edge_rescue_max_speed,
+                )
+                if rescue_pan != 0 or rescue_tilt != 0:
+                    self._hybrid_divergence_count = 0
+                    self._hybrid_axis_divergence = {
+                        "pan": {"last_error": err_x, "count": 0},
+                        "tilt": {"last_error": err_y, "count": 0},
+                    }
+                    pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
+                    tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
+                    await self._set_hybrid_chase_speed(
+                        pan_sign * rescue_pan,
+                        tilt_sign * rescue_tilt,
+                        seq=seq,
+                        now=now,
+                        error_x=err_x,
+                        error_y=err_y,
+                        target_span=target_span,
+                        force_command=rescue_entering,
+                    )
+                    return
+
+        if self._native_edge_rescue_until > 0.0 and now >= self._native_edge_rescue_until:
+            self._record_event(
+                "native_edge_rescue_exit",
+                reason="duration_expired",
+                elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
+                error=[round(err_x, 3), round(err_y, 3)],
+            )
+            self._native_edge_rescue_until = 0.0
+            self._native_edge_rescue_started_at = 0.0
+            self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
+
+        if (now - self._hybrid_started_at) >= self._servo_divergence_grace:
+            pan_state = self._hybrid_axis_divergence["pan"]
+            tilt_state = self._hybrid_axis_divergence["tilt"]
+            pan_state["count"] = _servo_axis_divergence_count(
+                pan_state["last_error"], err_x, float(pan_meta.get("desired_rate") or 0.0),
+                pan_state["count"], self.cfg.hybrid_divergence_growth,
+            )
+            tilt_state["count"] = _servo_axis_divergence_count(
+                tilt_state["last_error"], err_y, float(tilt_meta.get("desired_rate") or 0.0),
+                tilt_state["count"], self.cfg.hybrid_divergence_growth,
+            )
+            pan_state["last_error"] = err_x
+            tilt_state["last_error"] = err_y
+            self._hybrid_divergence_count = max(int(pan_state["count"]), int(tilt_state["count"]))
+            if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
+                axis = "pan" if int(pan_state["count"]) >= int(tilt_state["count"]) else "tilt"
+                count = int(self._hybrid_axis_divergence[axis]["count"])
+                cutoff = now - self._servo_divergence_window_s
+                while self._hybrid_divergence_strikes and self._hybrid_divergence_strikes[0] < cutoff:
+                    self._hybrid_divergence_strikes.popleft()
+                self._hybrid_divergence_strikes.append(now)
+                strikes = len(self._hybrid_divergence_strikes)
+                trip = strikes >= self._servo_divergence_trip_limit
+                self._hybrid_disabled_for_session = trip
+                self._hybrid_recover_after = max(self._hybrid_recover_after, now + self._servo_divergence_cooldown_s)
+                self._record_event(
+                    "hybrid_chase_diverging",
+                    axis=axis,
+                    error=round(err_x if axis == "pan" else err_y, 3),
+                    axis_counts={"pan": int(pan_state["count"]), "tilt": int(tilt_state["count"])},
+                    consecutive_growth_frames=count,
+                    strikes_in_window=strikes,
+                    trip_limit=self._servo_divergence_trip_limit,
+                    session_disabled=trip,
+                    actuator=self._hybrid_actuator,
+                    pan_sign=self.cfg.hybrid_chase_pan_sign,
+                )
+                await self._stop_hybrid_chase(
+                    "repeated_divergence" if trip else "diverging", seq=seq, force=True
+                )
+                return
+        else:
+            self._hybrid_axis_divergence["pan"] = {"last_error": err_x, "count": 0}
+            self._hybrid_axis_divergence["tilt"] = {"last_error": err_y, "count": 0}
+            self._hybrid_divergence_count = 0
+
+        self._hybrid_last_error = dominant_error
 
         if abs(pan_command) <= 1e-6 and abs(tilt_command) <= 1e-6:
             if self._servo_hold_since is None:
@@ -4569,6 +4889,10 @@ class DogTracker:
                 self._servo_hold_frames = 1
                 self._servo_hold_error = (err_x, err_y)
                 self._hybrid_divergence_count = 0
+                self._hybrid_axis_divergence = {
+                    "pan": {"last_error": err_x, "count": 0},
+                    "tilt": {"last_error": err_y, "count": 0},
+                }
                 self._record_event(
                     "servo_hold_enter",
                     error_x=round(err_x, 3),
@@ -4581,13 +4905,8 @@ class DogTracker:
 
         if actuator == "onvif_fractional":
             ok = await self._set_hybrid_chase_velocity(
-                pan_command,
-                tilt_command,
-                seq=seq,
-                now=now,
-                error_x=err_x,
-                error_y=err_y,
-                target_span=target_span,
+                pan_command, tilt_command, seq=seq, now=now,
+                error_x=err_x, error_y=err_y, target_span=target_span,
             )
             if ok:
                 return
@@ -4597,13 +4916,8 @@ class DogTracker:
         pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
         tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
         await self._set_hybrid_chase_speed(
-            pan_sign * pan_control,
-            tilt_sign * tilt_control,
-            seq=seq,
-            now=now,
-            error_x=err_x,
-            error_y=err_y,
-            target_span=target_span,
+            pan_sign * pan_control, tilt_sign * tilt_control,
+            seq=seq, now=now, error_x=err_x, error_y=err_y, target_span=target_span,
         )
 
     def _begin_ptz_operation(self, kind: str, seq: int, now: float) -> None:
@@ -5372,6 +5686,12 @@ class DogTracker:
                         target_span=self._last_target_span or 0.0,
                     )
                 else:
+                    self._native_edge_rescue_until = 0.0
+                    self._native_edge_rescue_started_at = 0.0
+                    self._native_edge_rescue_cooldown_until = max(
+                        self._native_edge_rescue_cooldown_until,
+                        now + self._native_edge_rescue_cooldown,
+                    )
                     await self._pause_hybrid_actuator("missing_detection_grace")
                 self.state = "ESCAPE_CHASE"
                 return
@@ -5490,6 +5810,8 @@ class DogTracker:
                 "detection_count": 0,
                 "same_class_count": 0,
                 "camera_recently_moved": camera_recently_moved,
+                "nearest_any": None,
+                "rejected_candidates": [],
             }
             return None
 
@@ -5520,6 +5842,8 @@ class DogTracker:
         best: Optional[Detection] = None
         best_score = -1.0
         nearest_same_class: Optional[dict] = None
+        nearest_any: Optional[dict] = None
+        candidate_diagnostics: List[dict] = []
         same_class_count = 0
         compatible_count = 0
 
@@ -5544,32 +5868,37 @@ class DogTracker:
 
             overlap = _iou(self.target.bbox, det.bbox)
             size_similarity = min(old_area, det.area) / max(old_area, det.area)
-            if det.class_id == self.target.class_id:
-                same_class_count += 1
-                candidate_diag = {
-                    "label": det.label,
-                    "confidence": round(det.confidence, 3),
-                    "distance_norm": round(dist_norm, 4),
-                    "iou": round(overlap, 3),
-                    "size_similarity": round(size_similarity, 3),
-                    "inside_distance_gate": bool(dist_norm <= max_dist),
-                }
-                if (
-                    nearest_same_class is None
-                    or candidate_diag["distance_norm"] < nearest_same_class["distance_norm"]
-                ):
-                    nearest_same_class = candidate_diag
-
-            proximity_span = 0.75 if camera_recently_moved else 0.45
-            proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
-            if dist_norm > max_dist and overlap < 0.30:
-                continue
-            if not self._class_mismatch_compatible(
+            inside_distance_gate = bool(dist_norm <= max_dist or overlap >= 0.30)
+            class_compatible = self._class_mismatch_compatible(
                 det,
                 dist_norm=dist_norm,
                 overlap=overlap,
                 size_similarity=size_similarity,
-            ):
+            )
+            candidate_diag = {
+                "label": det.label,
+                "class_id": det.class_id,
+                "confidence": round(det.confidence, 3),
+                "distance_norm": round(dist_norm, 4),
+                "iou": round(overlap, 3),
+                "size_similarity": round(size_similarity, 3),
+                "same_class": bool(det.class_id == self.target.class_id),
+                "inside_distance_gate": inside_distance_gate,
+                "class_compatible": bool(class_compatible),
+            }
+            candidate_diagnostics.append(candidate_diag)
+            if nearest_any is None or candidate_diag["distance_norm"] < nearest_any["distance_norm"]:
+                nearest_any = candidate_diag
+            if det.class_id == self.target.class_id:
+                same_class_count += 1
+                if nearest_same_class is None or candidate_diag["distance_norm"] < nearest_same_class["distance_norm"]:
+                    nearest_same_class = candidate_diag
+
+            proximity_span = 0.75 if camera_recently_moved else 0.45
+            proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
+            if not inside_distance_gate:
+                continue
+            if not class_compatible:
                 continue
 
             compatible_count += 1
@@ -5581,9 +5910,15 @@ class DogTracker:
                 + 0.10 * det.confidence
                 - class_penalty
             )
+            candidate_diag["score"] = round(score, 3)
             if score > best_score:
                 best_score = score
                 best = det
+
+        rejected_candidates = sorted(
+            candidate_diagnostics,
+            key=lambda item: (item.get("distance_norm", 99.0), -item.get("confidence", 0.0)),
+        )[:3]
 
         if best is not None and best_score >= 0.20:
             self._last_association_diagnostic = {
@@ -5598,6 +5933,8 @@ class DogTracker:
                 "matched_label": best.label,
                 "matched_confidence": round(best.confidence, 3),
                 "nearest_same_class": nearest_same_class,
+                "nearest_any": nearest_any,
+                "rejected_candidates": rejected_candidates,
             }
             return best
 
@@ -5611,6 +5948,8 @@ class DogTracker:
             "max_distance_norm": round(max_dist, 3),
             "best_score": None if best_score < 0.0 else round(best_score, 3),
             "nearest_same_class": nearest_same_class,
+            "nearest_any": nearest_any,
+            "rejected_candidates": rejected_candidates,
         }
         return None
 
