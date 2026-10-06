@@ -1456,6 +1456,10 @@ class DogTracker:
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
         self._velocity_rebase_required = False
+        self._velocity_learning_ready = True
+        self._velocity_stable_frames = self._scene_stability.required_frames
+        self._ptz_command_lockout = False
+        self._ptz_command_lockout_reason: Optional[str] = None
 
         # Learned moveDirectly timing model. Samples persist across target sessions
         # for the life of the process because they describe the camera, not a target.
@@ -1729,6 +1733,8 @@ class DogTracker:
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
         self._velocity_rebase_required = False
+        self._velocity_learning_ready = True
+        self._velocity_stable_frames = self._scene_stability.required_frames
         self._pending_move_distance = None
         self._association_motion_start_center = None
         self._association_motion_end_center = None
@@ -2584,6 +2590,12 @@ class DogTracker:
         allowed = ("zoom", "movedirectly", "continuous", "motion", "onvif", "all")
         if mode not in allowed:
             return {"success": False, "error": f"Unknown calibration mode '{mode}'. Allowed: {', '.join(allowed)}"}
+        if self._ptz_command_lockout and not await self._ensure_ptz_command_unlocked("calibrate"):
+            return {
+                "success": False,
+                "error": "PTZ command lockout is active because continuous motion could not be proven stopped.",
+                "safe_to_track": False,
+            }
         if self.active:
             return {"success": False, "error": "Stop tracking before calibration.", "safe_to_track": True}
         if self._calibrating:
@@ -2818,6 +2830,8 @@ class DogTracker:
     async def start(self) -> dict:
         if self._calibrating:
             return {"success": False, "error": "Calibration is in progress.", "status": self.status()}
+        lockout_was_active = self._ptz_command_lockout
+        lockout_reason = self._ptz_command_lockout_reason
         self._session_generation += 1
         self._history.clear()
         self._session_started_wall = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -2825,6 +2839,8 @@ class DogTracker:
         self._stop_reason = None
         self._last_task_error = None
         self._hybrid_disabled_for_session = False
+        self._ptz_command_lockout = False
+        self._ptz_command_lockout_reason = None
         self._shutdown = False
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="direct-3d-ptz-tracker")
@@ -2833,6 +2849,13 @@ class DogTracker:
         self.state = "SEARCHING"
         self._home_sent = False
         self._reset_tracking_state()
+        if lockout_was_active:
+            self._record_event(
+                "ptz_command_lockout_cleared",
+                source="explicit_restart",
+                previous_reason=lockout_reason,
+                status_available=False,
+            )
         if self.cfg.goto_home_on_start:
             await self.home()
         self._record_event(
@@ -2849,16 +2872,23 @@ class DogTracker:
         self._record_event("tracker_stopping")
         self._stop_reason = None
         self.active = False
+        stopped = await self._stop_hybrid_chase("tracker_stop", force=True)
+        if not stopped:
+            self.logger.error("PTZ tracker stop failed closed; command lockout remains active")
+            return self.status()
         self.state = "OFF"
-        await self._stop_hybrid_chase("tracker_stop", force=True)
         self._reset_tracking_state()
         self._record_event("tracker_stopped")
         self.logger.info("PTZ tracker STOPPED")
         return self.status()
 
     async def _goto_home_with_retry(self, reason: str, generation: int) -> bool:
+        if self._ptz_command_lockout:
+            return False
         attempts = max(1, self.cfg.home_retry_attempts)
         for attempt in range(1, attempts + 1):
+            if self._ptz_command_lockout:
+                return False
             ok = await asyncio.to_thread(self.ptz.goto_preset, self.cfg.home_preset)
             if generation != self._session_generation or self._shutdown:
                 return False
@@ -2880,9 +2910,22 @@ class DogTracker:
         return False
 
     async def home(self) -> dict:
+        if self._ptz_command_lockout and not await self._ensure_ptz_command_unlocked("home"):
+            self._record_event(
+                "home_command_blocked",
+                reason=self._ptz_command_lockout_reason,
+            )
+            return self.status()
+
         self._session_generation += 1
         generation = self._session_generation
-        await self._stop_hybrid_chase("home", force=True)
+        stopped = await self._stop_hybrid_chase("home", force=True)
+        if not stopped:
+            self._record_event(
+                "home_command_blocked",
+                reason=self._ptz_command_lockout_reason or "continuous_stop_failed",
+            )
+            return self.status()
         self._reset_tracking_state()
         self._home_sent = True
         self.state = "HOME" if self.active else "OFF"
@@ -2973,6 +3016,8 @@ class DogTracker:
             "active": self.active,
             "session_started": self._session_started_wall,
             "stop_reason": self._stop_reason,
+            "ptz_command_lockout": self._ptz_command_lockout,
+            "ptz_command_lockout_reason": self._ptz_command_lockout_reason,
             "tracker_task_running": bool(self._task is not None and not self._task.done()),
             "tracker_task_error": self._last_task_error,
             "session_generation": self._session_generation,
@@ -3114,6 +3159,8 @@ class DogTracker:
                 "acquisition_zones": self._acquisition_zones.public_dict(),
                 "motion_masks": self._motion_masks.public_dict(),
                 "scene_stability": self._scene_stability.public_dict(),
+                "velocity_learning_ready": self._velocity_learning_ready,
+                "velocity_stable_frames": self._velocity_stable_frames,
                 "velocity_geometry": self._last_velocity_geometry,
                 "calibrating": self._calibrating,
             },
@@ -3145,7 +3192,10 @@ class DogTracker:
         }
 
     async def camera_status(self) -> dict:
-        return await asyncio.to_thread(self.ptz.get_status)
+        status = await asyncio.to_thread(self.ptz.get_status)
+        if self._ptz_command_lockout:
+            self._clear_ptz_command_lockout_from_status(status, source="camera_status")
+        return status
 
     @staticmethod
     def _move_distance_from_center(point: Tuple[float, float], frame_shape: Tuple[int, ...]) -> float:
@@ -3639,6 +3689,79 @@ class DogTracker:
         speed = max(self.cfg.hybrid_chase_min_speed, min(zoom_max, speed))
         return speed if error > 0 else -speed
 
+    def _enter_ptz_command_lockout(
+        self,
+        reason: str,
+        *,
+        operation: str,
+        actuator: str,
+        error: Optional[str],
+    ) -> None:
+        """Fail closed when continuous PTZ motion cannot be proven stopped."""
+        self._ptz_command_lockout = True
+        self._ptz_command_lockout_reason = reason
+        self.active = False
+        self.state = "PTZ_ERROR"
+        self._stop_reason = reason
+        self._record_event(
+            "ptz_command_lockout",
+            reason=reason,
+            operation=operation,
+            actuator=actuator,
+            error=error,
+        )
+        self.logger.error("PTZ command lockout engaged: %s", reason)
+
+    def _clear_ptz_command_lockout_from_status(
+        self,
+        status: Optional[Dict[str, str]],
+        *,
+        source: str,
+    ) -> bool:
+        if not self._ptz_command_lockout:
+            return True
+        if not status or self.ptz.pan_tilt_reported_idle(status) is not True:
+            return False
+
+        previous_reason = self._ptz_command_lockout_reason
+        self._last_camera_status = status
+        self._last_camera_status_at = time.monotonic()
+        position = self.ptz.position_from_status(status)
+        if position is not None:
+            self._last_camera_position = position
+            self._last_zoom_position = position[2]
+
+        self._ptz_command_lockout = False
+        self._ptz_command_lockout_reason = None
+        self._stop_reason = None
+        self._reset_tracking_state()
+        self.state = "SEARCHING" if self.active else "OFF"
+        self._record_event(
+            "ptz_command_lockout_cleared",
+            source=source,
+            previous_reason=previous_reason,
+            move_status=status.get("status.MoveStatus"),
+            pan_tilt_status=status.get("status.PanTiltStatus"),
+        )
+        self.logger.warning("PTZ command lockout cleared after camera reported Idle (%s)", source)
+        return True
+
+    async def _ensure_ptz_command_unlocked(self, source: str) -> bool:
+        if not self._ptz_command_lockout:
+            return True
+        status = await asyncio.to_thread(self.ptz.get_status)
+        if self._clear_ptz_command_lockout_from_status(status, source=source):
+            return True
+        self._record_event(
+            "ptz_command_blocked",
+            source=source,
+            reason=self._ptz_command_lockout_reason,
+            status_available=bool(status),
+            move_status=status.get("status.MoveStatus") if status else None,
+            pan_tilt_status=status.get("status.PanTiltStatus") if status else None,
+        )
+        return False
+
     async def _pause_hybrid_actuator(self, reason: str) -> bool:
         actuator = self._hybrid_actuator
         moving = (
@@ -3658,22 +3781,36 @@ class DogTracker:
         else:
             ok = await asyncio.to_thread(self.ptz.continuous_stop)
         t1 = time.monotonic()
-        if ok:
-            self.ptz_commands += 1
-        self._hybrid_pan_speed = 0
-        self._hybrid_tilt_speed = 0
-        self._hybrid_pan_velocity = 0.0
-        self._hybrid_tilt_velocity = 0.0
-        self._hybrid_last_command_at = t1
-        self._reset_servo_feedback()
+        error = (
+            self._onvif_motion.last_error
+            if actuator == "onvif_fractional"
+            else self.ptz.last_error
+        )
         self._record_event(
             "hybrid_actuator_pause",
             reason=reason,
             actuator=actuator,
             success=bool(ok),
             http_ms=int((t1 - t0) * 1000),
+            error=None if ok else error,
         )
-        return bool(ok)
+        if not ok:
+            self._enter_ptz_command_lockout(
+                f"Continuous PTZ stop failed while pausing '{reason}'.",
+                operation="continuous_pause",
+                actuator=actuator,
+                error=error,
+            )
+            return False
+
+        self.ptz_commands += 1
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
+        self._hybrid_last_command_at = t1
+        self._reset_servo_feedback()
+        return True
 
     async def _stop_hybrid_chase(
         self,
@@ -3700,6 +3837,32 @@ class DogTracker:
         else:
             ok = await asyncio.to_thread(self.ptz.continuous_stop)
         t1 = time.monotonic()
+
+        if not ok:
+            error = (
+                self._onvif_motion.last_error
+                if actuator == "onvif_fractional"
+                else self.ptz.last_error
+            )
+            self._record_event(
+                "hybrid_chase_stop_failed",
+                reason=reason,
+                actuator=actuator,
+                error=error,
+            )
+            # A failed precautionary force-stop while no motion is believed active
+            # is diagnostic only. If motion is active, however, the physical camera
+            # state is unknown and every later PTZ command must be blocked.
+            if was_active:
+                self._enter_ptz_command_lockout(
+                    f"Continuous PTZ stop failed while ending chase '{reason}'.",
+                    operation="continuous_stop",
+                    actuator=actuator,
+                    error=error,
+                )
+                return False
+            return True
+
         self._hybrid_chase_active = False
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
@@ -3729,27 +3892,17 @@ class DogTracker:
         if was_active:
             self._scene_stability.reset(t1)
             self._scene_stable_ready = False
-            if ok:
-                self.ptz_commands += 1
-                self.hybrid_chase_stops += 1
-                self._record_event(
-                    "hybrid_chase_stop",
-                    reason=reason,
-                    actuator=actuator,
-                    http_ms=int((t1 - t0) * 1000),
-                    settle_ms=int(self._servo_post_stop_settle_s * 1000),
-                )
-            else:
-                self._record_event(
-                    "hybrid_chase_stop_failed",
-                    reason=reason,
-                    actuator=actuator,
-                    error=(
-                        self._onvif_motion.last_error
-                        if actuator == "onvif_fractional"
-                        else self.ptz.last_error
-                    ),
-                )
+            self._velocity_learning_ready = False
+            self._velocity_stable_frames = 0
+            self.ptz_commands += 1
+            self.hybrid_chase_stops += 1
+            self._record_event(
+                "hybrid_chase_stop",
+                reason=reason,
+                actuator=actuator,
+                http_ms=int((t1 - t0) * 1000),
+                settle_ms=int(self._servo_post_stop_settle_s * 1000),
+            )
 
             if self.target is not None:
                 self.target.clear_velocity()
@@ -3761,7 +3914,7 @@ class DogTracker:
                     self._post_motion_release_seq,
                     seq + self.cfg.hybrid_chase_settle_frames,
                 )
-        return bool(ok)
+        return True
 
     def _apply_axis_reversal_holdoff(
         self,
@@ -3810,6 +3963,8 @@ class DogTracker:
         target_span: float,
         force_command: bool = False,
     ) -> bool:
+        if self._ptz_command_lockout:
+            return False
         if self._hybrid_actuator == "onvif_fractional":
             if not await self._pause_hybrid_actuator("switch_to_native"):
                 return False
@@ -3913,6 +4068,10 @@ class DogTracker:
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
         self.state = "ESCAPE_CHASE"
+        self._velocity_learning_ready = False
+        self._velocity_stable_frames = 0
+        self._velocity_learning_ready = False
+        self._velocity_stable_frames = 0
         if self.target is not None:
             self.target.clear_velocity()
             self._velocity_rebase_required = True
@@ -3946,6 +4105,8 @@ class DogTracker:
         target_span: float,
         force_command: bool = False,
     ) -> bool:
+        if self._ptz_command_lockout:
+            return False
         if not self._servo_onvif_available:
             return False
         if self._hybrid_actuator == "native_discrete":
@@ -4208,6 +4369,8 @@ class DogTracker:
         self._post_motion_release_seq = max(self._post_motion_release_seq, seq + 1)
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        self._velocity_learning_ready = False
+        self._velocity_stable_frames = 0
         # Any physical camera action breaks the run of stationary observations
         # required before another zoom-in is allowed.
         self._zoom_in_candidate_frames = 0
@@ -4318,6 +4481,8 @@ class DogTracker:
         self._sharpness_wait_logged = False
         self._scene_stability.reset(now)
         self._scene_stable_ready = False
+        self._velocity_learning_ready = False
+        self._velocity_stable_frames = 0
 
         # PTZ movement itself must never count as target-loss time. Always restart
         # the loss clock when the camera finishes, even if YOLO briefly saw the
@@ -4596,12 +4761,14 @@ class DogTracker:
             or self._hybrid_chase_active
             or seq < self._post_motion_release_seq
             or not self._scene_stable_ready
+            or not self._velocity_learning_ready
         )
         motion_boxes = [d.bbox for d in detections] + self._motion_masks.boxes(frame.shape)
         self._camera_motion = self._smart_motion.update(
             frame, motion_boxes, active=motion_active, use_homography=self._ptz_operation == "zoom"
         )
         self._update_frame_quality(frame, now)
+        released_by_timeout = False
         if self._ptz_operation is None and not self._scene_stable_ready:
             observed_ready = self._scene_stability.observe(
                 now, self._camera_motion, self._frame_sharpness_ok, frame.shape
@@ -4614,14 +4781,58 @@ class DogTracker:
                 observed_ready = False
             self._scene_stable_ready = observed_ready
             if self._scene_stable_ready:
+                released_by_timeout = bool(self._scene_stability.timed_out)
+                if released_by_timeout:
+                    # The bounded timeout releases acquisition/control so tracking
+                    # cannot wedge forever, but it is not proof that the image is
+                    # stationary enough to learn subject velocity/feed-forward.
+                    self._velocity_learning_ready = False
+                    self._velocity_stable_frames = 0
+                else:
+                    self._velocity_learning_ready = True
+                    self._velocity_stable_frames = self._scene_stability.required_frames
                 self._record_event(
                     "post_move_scene_stable",
                     reason=self._scene_stability.last_reason,
                     flow_norm=self._scene_stability.last_flow_norm,
                     timed_out=self._scene_stability.timed_out,
+                    velocity_learning_ready=self._velocity_learning_ready,
                     post_stop_quiet_ms=max(
                         0, int((now - self._last_ptz_stopped_at) * 1000)
                     ),
+                )
+
+        if (
+            self._scene_stable_ready
+            and not self._velocity_learning_ready
+            and not released_by_timeout
+            and self._ptz_operation is None
+            and not self._hybrid_chase_active
+            and now >= self._continuous_settle_until
+        ):
+            h, w = frame.shape[:2]
+            diag = max(1.0, math.hypot(w, h))
+            flow_norm = (
+                0.0
+                if self._camera_motion is None
+                else math.hypot(
+                    float(self._camera_motion.dx),
+                    float(self._camera_motion.dy),
+                ) / diag
+            )
+            if (
+                self._frame_sharpness_ok
+                and flow_norm <= self._scene_stability.flow_threshold_norm
+            ):
+                self._velocity_stable_frames += 1
+            else:
+                self._velocity_stable_frames = 0
+            if self._velocity_stable_frames >= self._scene_stability.required_frames:
+                self._velocity_learning_ready = True
+                self._record_event(
+                    "velocity_learning_resumed",
+                    stable_frames=self._velocity_stable_frames,
+                    flow_norm=round(flow_norm, 6),
                 )
 
         # Never acquire a new target while a home preset is still moving, or from
@@ -4711,6 +4922,7 @@ class DogTracker:
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and self._velocity_rebase_required
+                and self._velocity_learning_ready
                 and self._frame_sharpness_ok
             )
             geometry_valid = True
@@ -4719,6 +4931,7 @@ class DogTracker:
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
+                and self._velocity_learning_ready
                 and self._frame_sharpness_ok
             ):
                 geometry = self._bbox_motion.validate(matched.bbox, now, frame.shape)
@@ -4738,6 +4951,7 @@ class DogTracker:
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
+                and self._velocity_learning_ready
                 and self._frame_sharpness_ok
             )
             velocity_learning_allowed = stationary_observation and geometry_valid
@@ -5059,12 +5273,6 @@ class DogTracker:
         outside_deadzone = abs(err_x) > deadzone_x or abs(err_y) > deadzone_y
 
         if outside_deadzone:
-            if not self.cfg.move_directly_enabled:
-                return
-            if now < self._move_retry_after:
-                self.state = "PTZ_BACKOFF"
-                return
-
             x1, y1, x2, y2 = self.target.bbox
             margin_x = w * self.cfg.lead_edge_margin
             margin_y = h * self.cfg.lead_edge_margin
@@ -5233,6 +5441,15 @@ class DogTracker:
                     error_y=err_y,
                     target_span=target_span,
                 )
+                return
+
+            # Continuous tracking is independent of moveDirectly. Disabling the
+            # positional precision controller must not disable Rev 6 servo handoff.
+            if not self.cfg.move_directly_enabled:
+                self.state = "MOTION_HOLD" if bool(control_decision["moving_target"]) else "TRACK"
+                return
+            if now < self._move_retry_after:
+                self.state = "PTZ_BACKOFF"
                 return
 
             dominant_error = max(abs(err_x), abs(err_y))
