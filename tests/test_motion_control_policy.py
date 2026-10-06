@@ -104,9 +104,9 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertNotIn("set_spatial_scales", block)
         self.assertIn("Live-target telemetry is observational only", block)
 
-    def test_rev4_precision_contracts_are_present(self):
-        self.assertIn('"controller_revision": 4', TRACKER)
-        self.assertIn('"persistent_velocity_continuous_servo_precision"', TRACKER)
+    def test_rev5_precision_contracts_are_present(self):
+        self.assertIn('"controller_revision": 5', TRACKER)
+        self.assertIn('"damped_feedback_servo_semantic_continuity"', TRACKER)
         self.assertIn('"adaptive_hybrid_current_center"', TRACKER)
         self.assertIn("self._precision_hold_until", TRACKER)
         self.assertIn("hybrid_chase_confidence_grace", TRACKER)
