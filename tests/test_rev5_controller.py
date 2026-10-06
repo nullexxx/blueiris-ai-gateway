@@ -97,6 +97,13 @@ class Rev5ServoTests(unittest.TestCase):
         self.assertIn('"last_decision": self._servo_last_decision or None', TRACKER)
         self.assertIn('"semantic_continuity": {', TRACKER)
 
+    def test_low_confidence_grace_brakes_without_weak_bbox_steering(self):
+        self.assertIn('"hybrid_confidence_decelerate"', TRACKER)
+        self.assertIn("force_command=True", TRACKER)
+        self.assertIn("safe_pan", TRACKER)
+        self.assertIn("safe_tilt", TRACKER)
+        self.assertIn('"calibrated_rate"', TRACKER)
+
 
 if __name__ == "__main__":
     unittest.main()
