@@ -3,6 +3,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+from typing import Dict
 import unittest
 
 from ptz_active_calibration import ActivePtzCalibrationStore
@@ -21,7 +22,7 @@ def load_servo_policy():
     )
     module = ast.Module(body=[fn], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"math": math}
+    namespace = {"math": math, "Dict": Dict}
     exec(compile(module, "tracker.py", "exec"), namespace)
     return namespace["_servo_axis_decision"]
 
