@@ -5244,28 +5244,10 @@ class DogTracker:
             )
             base_move_distance = self._move_distance_from_center(base_command_center, frame_shape)
             predicted_move_eta_s = self._predict_move_eta(base_move_distance)
-            lead_horizon_s = (
-                0.0
-                if adaptive_hybrid_available
-                else min(predicted_move_eta_s, self._move_direct_lead_horizon_max)
-            )
-
-            lead_suppressed_reason: Optional[str] = (
-                "adaptive_hybrid_current_center" if adaptive_hybrid_available else None
-            )
-            if lead_suppressed_reason is None:
-                if not self.target.velocity_valid:
-                    lead_suppressed_reason = "velocity_sample"
-                elif self.target.confidence < self.cfg.lead_min_conf:
-                    lead_suppressed_reason = "low_confidence"
-                elif target_span < self.cfg.lead_min_span:
-                    lead_suppressed_reason = "small_target"
-                elif edge_clipped:
-                    lead_suppressed_reason = "edge_clipped"
-                else:
-                    velocity_ok, velocity_reason = self._validate_velocity_for_lead(frame_shape)
-                    if not velocity_ok:
-                        lead_suppressed_reason = velocity_reason
+            # Rev 6 only permits moveDirectly after a mature stationary dwell.
+            # Predictive lead therefore adds stale-motion risk without benefit.
+            lead_horizon_s = 0.0
+            lead_suppressed_reason: Optional[str] = "rev6_stationary_precision"
 
             lead_valid = lead_suppressed_reason is None
             if lead_valid:
