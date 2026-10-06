@@ -3505,6 +3505,41 @@ class DogTracker:
                 )
         return bool(ok)
 
+    def _apply_axis_reversal_holdoff(
+        self,
+        current: Tuple[float, float],
+        desired: Tuple[float, float],
+        now: float,
+    ) -> Tuple[Tuple[float, float], List[str]]:
+        def sign_flip(old: float, new: float) -> bool:
+            return abs(old) > 1e-6 and abs(new) > 1e-6 and ((old > 0) != (new > 0))
+
+        desired_pan, desired_tilt = desired
+        suppressed_axes: List[str] = []
+        if self._hybrid_chase_active:
+            if sign_flip(current[0], desired_pan):
+                self._hybrid_pan_reverse_until = max(
+                    self._hybrid_pan_reverse_until,
+                    now + self._hybrid_axis_reverse_holdoff,
+                )
+                desired_pan = 0.0
+                suppressed_axes.append("pan")
+            elif now < self._hybrid_pan_reverse_until:
+                desired_pan = 0.0
+                suppressed_axes.append("pan")
+
+            if sign_flip(current[1], desired_tilt):
+                self._hybrid_tilt_reverse_until = max(
+                    self._hybrid_tilt_reverse_until,
+                    now + self._hybrid_axis_reverse_holdoff,
+                )
+                desired_tilt = 0.0
+                suppressed_axes.append("tilt")
+            elif now < self._hybrid_tilt_reverse_until:
+                desired_tilt = 0.0
+                suppressed_axes.append("tilt")
+        return (desired_pan, desired_tilt), suppressed_axes
+
     async def _set_hybrid_chase_speed(
         self,
         pan_speed: int,
@@ -3517,83 +3552,57 @@ class DogTracker:
         target_span: float,
         force_command: bool = False,
     ) -> bool:
-        pan_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(pan_speed)))
-        tilt_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(tilt_speed)))
-        if pan_speed == 0 and tilt_speed == 0:
+        if self._hybrid_actuator == "onvif_fractional":
+            if not await self._pause_hybrid_actuator("switch_to_native"):
+                return False
+
+        pan_speed = max(
+            -self.cfg.hybrid_chase_max_speed,
+            min(self.cfg.hybrid_chase_max_speed, int(pan_speed)),
+        )
+        tilt_speed = max(
+            -self.cfg.hybrid_chase_max_speed,
+            min(self.cfg.hybrid_chase_max_speed, int(tilt_speed)),
+        )
+        raw_desired = (float(pan_speed), float(tilt_speed))
+        if raw_desired == (0.0, 0.0):
             return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
 
-        raw_desired = (pan_speed, tilt_speed)
-        current = (self._hybrid_pan_speed, self._hybrid_tilt_speed)
-
-        # Rev 5 preserves Rev 4's independent per-axis center-crossing handling. Motor inertia on
-        # one axis must not cancel useful tracking on the other. A reversing axis
-        # is neutralized briefly, then may reverse only if the error still demands
-        # it after the holdoff.
-        def sign_flip(old: int, new: int) -> bool:
-            return old != 0 and new != 0 and ((old > 0) != (new > 0))
-
-        desired_pan, desired_tilt = raw_desired
-        suppressed_axes = []
-        if self._hybrid_chase_active:
-            if sign_flip(current[0], desired_pan):
-                self._hybrid_pan_reverse_until = max(
-                    self._hybrid_pan_reverse_until,
-                    now + self._hybrid_axis_reverse_holdoff,
-                )
-                desired_pan = 0
-                suppressed_axes.append("pan")
-            elif now < self._hybrid_pan_reverse_until:
-                desired_pan = 0
-                suppressed_axes.append("pan")
-
-            if sign_flip(current[1], desired_tilt):
-                self._hybrid_tilt_reverse_until = max(
-                    self._hybrid_tilt_reverse_until,
-                    now + self._hybrid_axis_reverse_holdoff,
-                )
-                desired_tilt = 0
-                suppressed_axes.append("tilt")
-            elif now < self._hybrid_tilt_reverse_until:
-                desired_tilt = 0
-                suppressed_axes.append("tilt")
-
-        desired = (desired_pan, desired_tilt)
+        current = (
+            float(self._hybrid_pan_speed),
+            float(self._hybrid_tilt_speed),
+        ) if self._hybrid_actuator == "native_discrete" else (0.0, 0.0)
+        desired, suppressed_axes = self._apply_axis_reversal_holdoff(
+            current, raw_desired, now
+        )
+        desired = (float(int(desired[0])), float(int(desired[1])))
         if suppressed_axes:
             self._hybrid_divergence_count = 0
             self._record_event(
                 "hybrid_axis_reversal_suppressed",
                 axes=sorted(set(suppressed_axes)),
-                requested=[raw_desired[0], raw_desired[1]],
-                commanded=[desired[0], desired[1]],
+                actuator="native_discrete",
+                requested=[int(raw_desired[0]), int(raw_desired[1])],
+                commanded=[int(desired[0]), int(desired[1])],
                 holdoff_ms=int(self._hybrid_axis_reverse_holdoff * 1000),
             )
 
-        if desired == (0, 0):
-            if raw_desired == (0, 0):
-                return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
-            # Both axes are in reversal holdoff. Stop motor motion without ending
-            # the chase session or rebasing the target; a subsequent fresh frame
-            # can restart either axis in the new direction.
-            if current != (0, 0):
-                t0 = time.monotonic()
-                ok = await asyncio.to_thread(self.ptz.continuous_stop)
-                t1 = time.monotonic()
-                if not ok:
-                    return await self._stop_hybrid_chase("axis_pause_failed", seq=seq, force=True)
-                self._hybrid_pan_speed = 0
-                self._hybrid_tilt_speed = 0
-                self._hybrid_last_command_at = t1
-                self.ptz_commands += 1
-                self._record_event(
-                    "hybrid_axis_pause",
-                    axes=sorted(set(suppressed_axes)),
-                    http_ms=int((t1 - t0) * 1000),
+        if desired == (0.0, 0.0):
+            if not await self._pause_hybrid_actuator("axis_reversal_holdoff"):
+                return await self._stop_hybrid_chase(
+                    "axis_pause_failed", seq=seq, force=True
                 )
             self.state = "ESCAPE_CHASE"
             return True
 
+        desired_int = (int(desired[0]), int(desired[1]))
+        current_int = (int(current[0]), int(current[1]))
         elapsed = max(0.0, now - self._hybrid_last_command_at)
-        same_speed = self._hybrid_chase_active and desired == current
+        same_speed = (
+            self._hybrid_chase_active
+            and self._hybrid_actuator == "native_discrete"
+            and desired_int == current_int
+        )
         if same_speed and elapsed < self.cfg.hybrid_chase_keepalive and not force_command:
             return True
         if (
@@ -3606,7 +3615,7 @@ class DogTracker:
 
         generation = self._session_generation
         t0 = time.monotonic()
-        command_pan, command_tilt = desired
+        command_pan, command_tilt = desired_int
         ok = await asyncio.to_thread(
             self.ptz.continuous_move,
             command_pan,
@@ -3621,6 +3630,7 @@ class DogTracker:
         if not ok:
             self._record_event(
                 "hybrid_chase_move_failed",
+                actuator="native_discrete",
                 pan_speed=command_pan,
                 tilt_speed=command_tilt,
                 error=self.ptz.last_error,
@@ -3636,8 +3646,11 @@ class DogTracker:
             self._hybrid_divergence_count = 0
             self.hybrid_chase_entries += 1
         self._hybrid_chase_active = True
+        self._hybrid_actuator = "native_discrete"
         self._hybrid_pan_speed = command_pan
         self._hybrid_tilt_speed = command_tilt
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
         self._hybrid_last_command_at = t1
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
@@ -3647,13 +3660,147 @@ class DogTracker:
             self._velocity_rebase_required = True
         self._association_motion_start_center = None
         self._association_motion_end_center = None
-        if entering or desired != current:
+        if entering or desired_int != current_int:
             self._record_event(
                 "hybrid_chase_move",
                 entering=entering,
+                actuator="native_discrete",
                 label=None if self.target is None else self.target.label,
                 pan_speed=command_pan,
                 tilt_speed=command_tilt,
+                error_x=round(error_x, 3),
+                error_y=round(error_y, 3),
+                target_span=round(target_span, 3),
+                confidence=None if self.target is None else round(self.target.confidence, 3),
+                http_ms=int((t1 - t0) * 1000),
+            )
+        return True
+
+    async def _set_hybrid_chase_velocity(
+        self,
+        pan_velocity: float,
+        tilt_velocity: float,
+        *,
+        seq: int,
+        now: float,
+        error_x: float,
+        error_y: float,
+        target_span: float,
+        force_command: bool = False,
+    ) -> bool:
+        if not self._servo_onvif_available:
+            return False
+        if self._hybrid_actuator == "native_discrete":
+            if not await self._pause_hybrid_actuator("switch_to_onvif"):
+                return False
+
+        limit = self._servo_onvif_max_velocity
+        raw_desired = (
+            max(-limit, min(limit, float(pan_velocity))),
+            max(-limit, min(limit, float(tilt_velocity))),
+        )
+        if abs(raw_desired[0]) <= 1e-6 and abs(raw_desired[1]) <= 1e-6:
+            return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
+
+        current = (
+            self._hybrid_pan_velocity,
+            self._hybrid_tilt_velocity,
+        ) if self._hybrid_actuator == "onvif_fractional" else (0.0, 0.0)
+        desired, suppressed_axes = self._apply_axis_reversal_holdoff(
+            current, raw_desired, now
+        )
+        if suppressed_axes:
+            self._hybrid_divergence_count = 0
+            self._record_event(
+                "hybrid_axis_reversal_suppressed",
+                axes=sorted(set(suppressed_axes)),
+                actuator="onvif_fractional",
+                requested=[round(raw_desired[0], 5), round(raw_desired[1], 5)],
+                commanded=[round(desired[0], 5), round(desired[1], 5)],
+                holdoff_ms=int(self._hybrid_axis_reverse_holdoff * 1000),
+            )
+
+        if abs(desired[0]) <= 1e-6 and abs(desired[1]) <= 1e-6:
+            if not await self._pause_hybrid_actuator("axis_reversal_holdoff"):
+                return await self._stop_hybrid_chase(
+                    "axis_pause_failed", seq=seq, force=True
+                )
+            self.state = "ESCAPE_CHASE"
+            return True
+
+        elapsed = max(0.0, now - self._hybrid_last_command_at)
+        same_velocity = (
+            self._hybrid_chase_active
+            and self._hybrid_actuator == "onvif_fractional"
+            and abs(desired[0] - current[0]) <= 0.005
+            and abs(desired[1] - current[1]) <= 0.005
+        )
+        keepalive = min(self.cfg.hybrid_chase_keepalive, 0.40)
+        interval = min(self.cfg.hybrid_chase_command_interval, 0.12)
+        if same_velocity and elapsed < keepalive and not force_command:
+            return True
+        if (
+            self._hybrid_chase_active
+            and not same_velocity
+            and elapsed < interval
+            and not force_command
+        ):
+            return True
+
+        generation = self._session_generation
+        t0 = time.monotonic()
+        ok = await self._onvif_motion.continuous_move(desired[0], desired[1])
+        t1 = time.monotonic()
+        if not self._session_valid(generation):
+            if ok:
+                await self._onvif_motion.stop()
+            return False
+        if not ok:
+            self._servo_onvif_available = False
+            self._servo_onvif_capabilities = {
+                **self._servo_onvif_capabilities,
+                "available": False,
+                "runtime_error": self._onvif_motion.last_error,
+            }
+            self._record_event(
+                "hybrid_chase_move_failed",
+                actuator="onvif_fractional",
+                pan_velocity=round(desired[0], 5),
+                tilt_velocity=round(desired[1], 5),
+                error=self._onvif_motion.last_error,
+            )
+            await self._stop_hybrid_chase("onvif_command_failed", seq=seq, force=True)
+            return False
+
+        entering = not self._hybrid_chase_active
+        if entering:
+            self._hybrid_started_at = t1
+            self._hybrid_last_error = max(abs(error_x), abs(error_y))
+            self._hybrid_divergence_count = 0
+            self.hybrid_chase_entries += 1
+        self._hybrid_chase_active = True
+        self._hybrid_actuator = "onvif_fractional"
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_pan_velocity = float(desired[0])
+        self._hybrid_tilt_velocity = float(desired[1])
+        self._hybrid_last_command_at = t1
+        self.ptz_commands += 1
+        self.hybrid_chase_commands += 1
+        self.state = "ESCAPE_CHASE"
+        if self.target is not None:
+            self.target.clear_velocity()
+            self._velocity_rebase_required = True
+        self._association_motion_start_center = None
+        self._association_motion_end_center = None
+        if entering or not same_velocity:
+            self._record_event(
+                "hybrid_chase_move",
+                entering=entering,
+                actuator="onvif_fractional",
+                label=None if self.target is None else self.target.label,
+                pan_velocity=round(desired[0], 5),
+                tilt_velocity=round(desired[1], 5),
                 error_x=round(error_x, 3),
                 error_y=round(error_y, 3),
                 target_span=round(target_span, 3),
