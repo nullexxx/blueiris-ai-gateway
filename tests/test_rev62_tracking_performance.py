@@ -59,8 +59,9 @@ class Rev62TrackingPerformanceTests(unittest.TestCase):
         self.assertNotIn("self.target.confidence < self.cfg.reacquire_conf", chase)
         self.assertIn("threshold=round(chase_confidence_threshold, 3)", chase)
 
-    def test_rev62_status_exposes_runtime_policy(self):
-        self.assertIn('"controller_patch": "6.2"', TRACKER)
+    def test_rev62_policy_remains_present_in_newer_patch(self):
+        self.assertIn('"controller_revision": 6', TRACKER)
+        self.assertIn('"controller_patch": "6.3"', TRACKER)
         self.assertIn('"active_chase_confidence_threshold"', TRACKER)
         self.assertIn('"native_max_chase_seconds"', TRACKER)
         self.assertIn('"fractional_max_chase_seconds": None', TRACKER)
