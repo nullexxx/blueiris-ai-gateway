@@ -3030,12 +3030,20 @@ class DogTracker:
         )
         desired_rate = abs(float(decision["desired_rate"]))
         requested_speed = 0
+        selected_calibrated_rate = None
         command = 0
         if desired_rate > 1e-6:
+            zoom_factor = self._current_zoom_factor()
+            calibrated_rates = self._active_calibration.continuous_rates(
+                axis,
+                zoom_factor,
+                min_speed=self.cfg.hybrid_chase_min_speed,
+                max_speed=self.cfg.hybrid_chase_max_speed,
+            )
             calibrated = self._active_calibration.choose_continuous_speed_for_rate(
                 axis,
                 desired_rate,
-                self._current_zoom_factor(),
+                zoom_factor,
                 min_speed=self.cfg.hybrid_chase_min_speed,
                 max_speed=self.cfg.hybrid_chase_max_speed,
             )
@@ -3050,6 +3058,7 @@ class DogTracker:
                 self.cfg.hybrid_chase_min_speed,
                 min(self.cfg.hybrid_chase_max_speed, int(calibrated)),
             )
+            selected_calibrated_rate = calibrated_rates.get(requested_speed)
             current_mag = abs(
                 self._hybrid_pan_speed if axis == "pan" else self._hybrid_tilt_speed
             )
@@ -3073,6 +3082,10 @@ class DogTracker:
             "desired_rate": round(float(decision["desired_rate"]), 4),
             "requested_speed": requested_speed,
             "command_speed": command,
+            "calibrated_rate": (
+                None if selected_calibrated_rate is None
+                else round(float(selected_calibrated_rate), 4)
+            ),
             "phase": str(decision["phase"]),
         }
         return command, meta
@@ -3257,6 +3270,7 @@ class DogTracker:
         error_x: float,
         error_y: float,
         target_span: float,
+        force_command: bool = False,
     ) -> bool:
         pan_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(pan_speed)))
         tilt_speed = max(-self.cfg.hybrid_chase_max_speed, min(self.cfg.hybrid_chase_max_speed, int(tilt_speed)))
@@ -3335,9 +3349,14 @@ class DogTracker:
 
         elapsed = max(0.0, now - self._hybrid_last_command_at)
         same_speed = self._hybrid_chase_active and desired == current
-        if same_speed and elapsed < self.cfg.hybrid_chase_keepalive:
+        if same_speed and elapsed < self.cfg.hybrid_chase_keepalive and not force_command:
             return True
-        if self._hybrid_chase_active and not same_speed and elapsed < self.cfg.hybrid_chase_command_interval:
+        if (
+            self._hybrid_chase_active
+            and not same_speed
+            and elapsed < self.cfg.hybrid_chase_command_interval
+            and not force_command
+        ):
             return True
 
         generation = self._session_generation
@@ -3447,6 +3466,41 @@ class DogTracker:
                     confidence=round(self.target.confidence, 3),
                     grace_ms=int(self._hybrid_confidence_grace * 1000),
                 )
+
+                # Never coast through a detector-confidence gap at a high native
+                # motor speed. Preserve direction only, immediately dropping each
+                # active axis to minimum speed while association gets its grace
+                # window. This is braking, not new steering from a weak bbox.
+                current_pan = self._hybrid_pan_speed
+                current_tilt = self._hybrid_tilt_speed
+                safe_pan = (
+                    int(math.copysign(self.cfg.hybrid_chase_min_speed, current_pan))
+                    if current_pan != 0 else 0
+                )
+                safe_tilt = (
+                    int(math.copysign(self.cfg.hybrid_chase_min_speed, current_tilt))
+                    if current_tilt != 0 else 0
+                )
+                if (
+                    (safe_pan, safe_tilt) != (current_pan, current_tilt)
+                    and (safe_pan != 0 or safe_tilt != 0)
+                ):
+                    self._record_event(
+                        "hybrid_confidence_decelerate",
+                        confidence=round(self.target.confidence, 3),
+                        from_speed=[current_pan, current_tilt],
+                        to_speed=[safe_pan, safe_tilt],
+                    )
+                    await self._set_hybrid_chase_speed(
+                        safe_pan,
+                        safe_tilt,
+                        seq=seq,
+                        now=now,
+                        error_x=err_x,
+                        error_y=err_y,
+                        target_span=target_span,
+                        force_command=True,
+                    )
             if (now - self._hybrid_low_confidence_since) <= self._hybrid_confidence_grace:
                 self.state = "ESCAPE_CHASE"
                 return
