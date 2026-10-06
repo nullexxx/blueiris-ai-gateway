@@ -1078,6 +1078,21 @@ def _servo_large_error_gain(
     return 1.0 + fraction * (ceiling - 1.0)
 
 
+def _servo_dynamic_brake_horizon(
+    current_velocity: float,
+    *,
+    max_velocity: float,
+    base_horizon_s: float,
+    velocity_extension_s: float,
+) -> float:
+    """Extend braking look-ahead as the fractional actuator moves faster."""
+    base = max(0.0, float(base_horizon_s))
+    extension = max(0.0, float(velocity_extension_s))
+    maximum = max(1e-6, abs(float(max_velocity)))
+    fraction = min(1.0, abs(float(current_velocity)) / maximum)
+    return base + extension * fraction
+
+
 def _motion_control_decision(
     *,
     err_x,
@@ -1238,6 +1253,7 @@ class DogTracker:
         )
         self._scene_stable_ready = True
         self._last_velocity_geometry = None
+        self._last_association_diagnostic = None
         self._camera_motion = None
         self._frame_sharpness: Optional[float] = None
         self._sharpness_baseline: Optional[float] = None
@@ -1351,7 +1367,11 @@ class DogTracker:
         )
         self._hybrid_missing_grace = max(
             self.cfg.hybrid_chase_miss_grace,
-            max(0.20, min(0.80, _env_float("TRACKER_HYBRID_MISSING_GRACE", 0.35))),
+            max(0.20, min(0.80, _env_float("TRACKER_HYBRID_MISSING_GRACE", 0.50))),
+        )
+        self._target_release_timeout = max(
+            self.cfg.home_timeout,
+            max(3.0, min(15.0, _env_float("TRACKER_TARGET_RELEASE_TIMEOUT", 5.0))),
         )
         self._motion_velocity_ttl = max(
             0.30, min(1.50, _env_float("TRACKER_MOTION_VELOCITY_TTL", 0.75))
@@ -1388,7 +1408,10 @@ class DogTracker:
             0.20, min(3.0, _env_float("TRACKER_SERVO_FEEDFORWARD_DECAY", 0.80))
         )
         self._servo_brake_horizon = max(
-            0.05, min(0.75, _env_float("TRACKER_SERVO_BRAKE_HORIZON", 0.24))
+            0.05, min(0.75, _env_float("TRACKER_SERVO_BRAKE_HORIZON", 0.30))
+        )
+        self._servo_brake_velocity_extension = max(
+            0.0, min(0.25, _env_float("TRACKER_SERVO_BRAKE_VELOCITY_EXTENSION", 0.08))
         )
         self._servo_derivative_alpha = max(
             0.05, min(1.0, _env_float("TRACKER_SERVO_DERIVATIVE_ALPHA", 0.40))
@@ -1456,6 +1479,7 @@ class DogTracker:
         self._last_processed_seq = -1
         self._last_frame_shape: Optional[Tuple[int, int]] = None
         self._last_debug_detections: List[Detection] = []
+        self._last_association_diagnostic: Optional[dict] = None
 
         self._home_sent = False
         self._last_move_point: Optional[Tuple[int, int]] = None
@@ -1806,6 +1830,7 @@ class DogTracker:
         self._scene_stability.clear()
         self._scene_stable_ready = True
         self._last_velocity_geometry = None
+        self._last_association_diagnostic = None
         self._camera_motion = None
         self._frame_sharpness = None
         self._frame_sharpness_ok = True
@@ -3121,7 +3146,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.2",
+                    "controller_patch": "6.3",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
@@ -3134,6 +3159,7 @@ class DogTracker:
                     "native_max_chase_seconds": round(self.cfg.hybrid_chase_max_seconds, 3),
                     "fractional_max_chase_seconds": None,
                     "missing_grace_s": round(self._hybrid_missing_grace, 3),
+                    "target_release_timeout_s": round(self._target_release_timeout, 3),
                     "retention_detection_conf": round(self._retention_detection_conf, 3),
                     "chase_detection_conf": round(self._chase_detection_conf, 3),
                     "target_retention_grace_s": round(self._target_retention_grace, 3),
@@ -3150,6 +3176,7 @@ class DogTracker:
                         "feedforward_gain": round(self._servo_feedforward_gain, 3),
                         "feedforward_decay_s": round(self._servo_feedforward_decay_s, 3),
                         "brake_horizon_s": round(self._servo_brake_horizon, 3),
+                        "brake_velocity_extension_s": round(self._servo_brake_velocity_extension, 3),
                         "start_speed_max": self._servo_start_speed_max,
                         "accel_step": self._servo_accel_step,
                         "divergence_grace_s": round(self._servo_divergence_grace, 3),
@@ -3199,6 +3226,7 @@ class DogTracker:
                 "velocity_learning_ready": self._velocity_learning_ready,
                 "velocity_stable_frames": self._velocity_stable_frames,
                 "velocity_geometry": self._last_velocity_geometry,
+                "last_association_diagnostic": self._last_association_diagnostic,
                 "calibrating": self._calibrating,
             },
             "counters": {
@@ -3489,6 +3517,17 @@ class DogTracker:
             max_gain=self._servo_large_error_gain,
         )
         effective_kp = self._servo_kp * error_gain
+        current_fractional_velocity = 0.0
+        if self._hybrid_actuator == "onvif_fractional":
+            current_fractional_velocity = (
+                self._hybrid_pan_velocity if axis == "pan" else self._hybrid_tilt_velocity
+            )
+        effective_brake_horizon = _servo_dynamic_brake_horizon(
+            current_fractional_velocity,
+            max_velocity=self._servo_onvif_max_velocity,
+            base_horizon_s=self._servo_brake_horizon,
+            velocity_extension_s=self._servo_brake_velocity_extension,
+        )
         decision = _servo_axis_decision(
             error=error,
             error_rate=filtered_rate,
@@ -3497,7 +3536,7 @@ class DogTracker:
             kp=effective_kp,
             kd=self._servo_kd,
             feedforward_gain=self._servo_feedforward_gain,
-            brake_horizon_s=self._servo_brake_horizon,
+            brake_horizon_s=effective_brake_horizon,
         )
         signed_desired_rate = float(decision["desired_rate"])
         desired_rate = abs(signed_desired_rate)
@@ -3565,6 +3604,7 @@ class DogTracker:
             "desired_rate": round(signed_desired_rate, 4),
             "error_gain": round(error_gain, 3),
             "effective_kp": round(effective_kp, 3),
+            "brake_horizon_s": round(effective_brake_horizon, 3),
             "requested_speed": requested_speed,
             "command_speed": command,
             "calibrated_rate": (
@@ -4958,6 +4998,13 @@ class DogTracker:
                 else self.cfg.reacquire_conf
             )
             if matched.confidence < required_conf:
+                self._last_association_diagnostic = {
+                    **(self._last_association_diagnostic or {}),
+                    "reason": "reacquire_confidence_gate",
+                    "candidate_confidence": round(matched.confidence, 3),
+                    "required_confidence": round(required_conf, 3),
+                    "missing_ms": int(missing_for_match * 1000),
+                }
                 matched = None
 
         if (
@@ -4965,6 +5012,12 @@ class DogTracker:
             and self.target.acquire_hits < self.cfg.acquire_frames
             and matched.confidence < self.cfg.acquire_conf
         ):
+            self._last_association_diagnostic = {
+                **(self._last_association_diagnostic or {}),
+                "reason": "acquire_confidence_gate",
+                "candidate_confidence": round(matched.confidence, 3),
+                "required_confidence": round(self.cfg.acquire_conf, 3),
+            }
             matched = None
 
         if matched is not None:
@@ -5135,6 +5188,12 @@ class DogTracker:
             if hybrid_missing_for <= self._hybrid_missing_grace:
                 self.state = "ESCAPE_CHASE"
                 return
+            self._record_event(
+                "association_miss",
+                phase="hybrid_grace_expired",
+                missing_ms=int(hybrid_missing_for * 1000),
+                association=self._last_association_diagnostic,
+            )
             await self._stop_hybrid_chase("target_missing", seq=seq)
 
         # A temporary detector miss while the camera is moving is not evidence that
@@ -5148,6 +5207,7 @@ class DogTracker:
                     operation=self._ptz_operation,
                     post_move_frames_remaining=max(0, self._post_motion_release_seq - seq),
                     label=self.target.label,
+                    association=self._last_association_diagnostic,
                 )
                 self._loss_pause_logged = True
             return
@@ -5160,6 +5220,7 @@ class DogTracker:
                     phase="coast",
                     missing_ms=int(missing_for * 1000),
                     label=self.target.label,
+                    association=self._last_association_diagnostic,
                 )
             self.state = "COAST"
             return
@@ -5171,17 +5232,19 @@ class DogTracker:
                     phase="reacquire",
                     missing_ms=int(missing_for * 1000),
                     label=self.target.label,
+                    association=self._last_association_diagnostic,
                 )
             self.state = "REACQUIRE"
             return
 
-        if missing_for < self.cfg.home_timeout:
+        if missing_for < self._target_release_timeout:
             if self.state != "LOST":
                 self._record_event(
                     "target_missing",
                     phase="lost",
                     missing_ms=int(missing_for * 1000),
                     label=self.target.label,
+                    association=self._last_association_diagnostic,
                 )
             self.state = "LOST"
             return
@@ -5221,38 +5284,62 @@ class DogTracker:
         self.state = "HOME" if returned_home else "SEARCHING"
 
     def _associate(self, detections: List[Detection], frame_shape: Tuple[int, ...], now: float) -> Optional[Detection]:
-        if self.target is None or not detections:
+        if self.target is None:
+            self._last_association_diagnostic = {
+                "reason": "no_target",
+                "detection_count": len(detections),
+            }
             return None
-        h, w = frame_shape[:2]
-        diag = max(1.0, math.hypot(w, h))
+
         camera_recently_moved = (
             self._hybrid_chase_active
             or self._ptz_operation is not None
             or self._last_processed_seq < self._post_motion_release_seq
         )
+        if not detections:
+            self._last_association_diagnostic = {
+                "reason": "no_detections",
+                "target_label": self.target.label,
+                "detection_count": 0,
+                "same_class_count": 0,
+                "camera_recently_moved": camera_recently_moved,
+            }
+            return None
+
+        h, w = frame_shape[:2]
+        diag = max(1.0, math.hypot(w, h))
         motion_start: Optional[Tuple[float, float]] = None
         motion_end: Optional[Tuple[float, float]] = None
-        motion_point = self._camera_motion.apply_point(self.target.center) if camera_recently_moved and self._camera_motion is not None else None
+        motion_point = (
+            self._camera_motion.apply_point(self.target.center)
+            if camera_recently_moved and self._camera_motion is not None
+            else None
+        )
         if self._hybrid_chase_active:
-            # During continuous rescue the whole frame is translating. Frigate
-            # handles this with camera-motion estimation; our lightweight version
-            # simply follows the latest matched center and uses the wider moving gate.
             px, py = self.target.center
         elif camera_recently_moved:
-            # Approximate the camera-induced image shift from the moveDirectly
-            # command itself. This is a lightweight analogue of Frigate's camera
-            # motion compensation: associate against the whole expected image-motion
-            # corridor, not only the stale pre-move target center.
             motion_start = self._association_motion_start_center or self.target.center
             motion_end = self._association_motion_end_center or self.target.center
             px, py = self.target.center
         else:
             px, py = self.target.predicted_center(now)
-        old_area = max(1.0, (self.target.bbox[2] - self.target.bbox[0]) * (self.target.bbox[3] - self.target.bbox[1]))
 
-        max_dist = self.cfg.association_moving_distance if camera_recently_moved else self.cfg.association_idle_distance
+        old_area = max(
+            1.0,
+            (self.target.bbox[2] - self.target.bbox[0])
+            * (self.target.bbox[3] - self.target.bbox[1]),
+        )
+        max_dist = (
+            self.cfg.association_moving_distance
+            if camera_recently_moved
+            else self.cfg.association_idle_distance
+        )
         best: Optional[Detection] = None
         best_score = -1.0
+        nearest_same_class: Optional[dict] = None
+        same_class_count = 0
+        compatible_count = 0
+
         for det in detections:
             cx, cy = det.center
             if (
@@ -5263,17 +5350,37 @@ class DogTracker:
             ):
                 dist_norm = self._point_segment_distance((cx, cy), motion_start, motion_end) / diag
                 if motion_point is not None:
-                    dist_norm = min(dist_norm, math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag)
+                    dist_norm = min(
+                        dist_norm,
+                        math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag,
+                    )
             elif camera_recently_moved and motion_point is not None:
                 dist_norm = math.hypot(cx - motion_point[0], cy - motion_point[1]) / diag
             else:
                 dist_norm = math.hypot(cx - px, cy - py) / diag
+
+            overlap = _iou(self.target.bbox, det.bbox)
+            size_similarity = min(old_area, det.area) / max(old_area, det.area)
+            if det.class_id == self.target.class_id:
+                same_class_count += 1
+                candidate_diag = {
+                    "label": det.label,
+                    "confidence": round(det.confidence, 3),
+                    "distance_norm": round(dist_norm, 4),
+                    "iou": round(overlap, 3),
+                    "size_similarity": round(size_similarity, 3),
+                    "inside_distance_gate": bool(dist_norm <= max_dist),
+                }
+                if (
+                    nearest_same_class is None
+                    or candidate_diag["distance_norm"] < nearest_same_class["distance_norm"]
+                ):
+                    nearest_same_class = candidate_diag
+
             proximity_span = 0.75 if camera_recently_moved else 0.45
             proximity = max(0.0, 1.0 - (dist_norm / proximity_span))
-            overlap = _iou(self.target.bbox, det.bbox)
             if dist_norm > max_dist and overlap < 0.30:
                 continue
-            size_similarity = min(old_area, det.area) / max(old_area, det.area)
             if not self._class_mismatch_compatible(
                 det,
                 dist_norm=dist_norm,
@@ -5281,6 +5388,8 @@ class DogTracker:
                 size_similarity=size_similarity,
             ):
                 continue
+
+            compatible_count += 1
             class_penalty = 0.0 if det.class_id == self.target.class_id else 0.12
             score = (
                 0.35 * overlap
@@ -5294,7 +5403,32 @@ class DogTracker:
                 best = det
 
         if best is not None and best_score >= 0.20:
+            self._last_association_diagnostic = {
+                "reason": "matched",
+                "target_label": self.target.label,
+                "detection_count": len(detections),
+                "same_class_count": same_class_count,
+                "compatible_count": compatible_count,
+                "camera_recently_moved": camera_recently_moved,
+                "max_distance_norm": round(max_dist, 3),
+                "best_score": round(best_score, 3),
+                "matched_label": best.label,
+                "matched_confidence": round(best.confidence, 3),
+                "nearest_same_class": nearest_same_class,
+            }
             return best
+
+        self._last_association_diagnostic = {
+            "reason": "score_below_threshold" if best is not None else "distance_or_class_gate",
+            "target_label": self.target.label,
+            "detection_count": len(detections),
+            "same_class_count": same_class_count,
+            "compatible_count": compatible_count,
+            "camera_recently_moved": camera_recently_moved,
+            "max_distance_norm": round(max_dist, 3),
+            "best_score": None if best_score < 0.0 else round(best_score, 3),
+            "nearest_same_class": nearest_same_class,
+        }
         return None
 
     async def _drive_to_target(self, frame_shape: Tuple[int, ...], seq: int, now: float, generation: int) -> None:

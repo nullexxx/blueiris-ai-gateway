@@ -118,7 +118,7 @@ Normal pan/tilt tracking uses Dahua/Amcrest `moveDirectly` 3D positioning. The t
 
 Predictive target velocity is learned only while the camera is stationary. It is suppressed for immature/noisy velocity samples, low-confidence or tiny detections, and edge-clipped detections. A one-shot **edge rescue** can use a stronger positional gain when the target is already near escape.
 
-For moving targets, Rev 6 prefers a **fractional ONVIF feedback servo** when the camera proves during active calibration that its ONVIF ContinuousMove velocity is genuinely proportional below native speed 1. Rev 6.2 lets that closed-loop fractional servo run continuously instead of forcing a 2.5-second brake/restart cycle, uses the established-target hold-confidence threshold while actively chasing, and progressively adds proportional authority only when the target is far off-center. The controller maps desired image-space correction rate into the measured fractional velocity, brakes on genuine confidence loss, and waits for both a minimum physical quiet interval and optical-flow stability before learning subject velocity again. If fractional ONVIF is unavailable or quantized, native Dahua continuous movement is reserved for clipped/hard-edge rescue rather than used for fine servo tracking. `moveDirectly` is a stationary-target precision tool and no longer uses predictive lead.
+For moving targets, Rev 6 prefers a **fractional ONVIF feedback servo** when the camera proves during active calibration that its ONVIF ContinuousMove velocity is genuinely proportional below native speed 1. Rev 6.2 lets that closed-loop fractional servo run continuously instead of forcing a 2.5-second brake/restart cycle, uses the established-target hold-confidence threshold while actively chasing, and progressively adds proportional authority only when the target is far off-center. Rev 6.3 adds velocity-aware earlier braking for fast fractional moves, a 0.50-second chase miss grace, a 5-second target-release window before returning home, and association-miss diagnostics so rejected detections can be distinguished from true detector dropouts. The controller maps desired image-space correction rate into the measured fractional velocity, brakes on genuine confidence loss, and waits for both a minimum physical quiet interval and optical-flow stability before learning subject velocity again. If fractional ONVIF is unavailable or quantized, native Dahua continuous movement is reserved for clipped/hard-edge rescue rather than used for fine servo tracking. `moveDirectly` is a stationary-target precision tool and no longer uses predictive lead.
 
 PTZ completion is fail-closed. At the operation deadline the tracker performs a final status read. If status remains unavailable, or the camera still cannot be established as safely idle, tracking stops with `state=PTZ_ERROR` rather than issuing another movement command. A later `/v1/tracker/start` can resume tracking; if the tracker task itself crashed, `start` recreates it.
 
@@ -160,6 +160,8 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_SERVO_ACTUATOR` | `auto` | Rev 6 servo actuator: `auto`, `onvif`, or `native`. `auto` uses ONVIF only after a usable fractional response has been calibrated. |
 | `TRACKER_ONVIF_SERVO_MAX_VELOCITY` | `0.35` | Maximum normalized ONVIF velocity the feedback servo may request. |
 | `TRACKER_SERVO_KP` | `0.70` | Base proportional gain used near center. |
+| `TRACKER_SERVO_BRAKE_HORIZON` | `0.30` | Base look-ahead used to brake the fractional servo before crossing center. |
+| `TRACKER_SERVO_BRAKE_VELOCITY_EXTENSION` | `0.08` | Additional brake look-ahead added proportionally as current fractional ONVIF velocity approaches its configured ceiling. |
 | `TRACKER_SERVO_LARGE_ERROR_START` | `0.45` | Absolute normalized axis error where Rev 6.2 begins adding proportional authority. |
 | `TRACKER_SERVO_LARGE_ERROR_FULL` | `0.75` | Axis error where the full large-error gain is reached. |
 | `TRACKER_SERVO_LARGE_ERROR_GAIN` | `1.45` | Maximum multiplier applied to the proportional term for large off-center errors. |
@@ -225,6 +227,7 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 | `TRACKER_HYBRID_CHASE_MOTION_ERROR` | `0.55` | Lower error threshold used for fast outward-motion entry. |
 | `TRACKER_HYBRID_CHASE_MOTION_SPEED_NORM` | `0.03` | Minimum normalized target speed for motion-based entry. |
 | `TRACKER_HYBRID_CHASE_MISS_GRACE` | `0.15` | Brief detector-miss grace during motion blur. |
+| `TRACKER_HYBRID_MISSING_GRACE` | `0.50` | Effective Rev 6.3 active-chase detector-miss grace. |
 | `TRACKER_HYBRID_CHASE_MIN_SPEED` | `1` | Minimum continuous PTZ speed. |
 | `TRACKER_HYBRID_CHASE_MAX_SPEED` | `6` | Maximum continuous PTZ speed. |
 | `TRACKER_HYBRID_CHASE_FULL_SPEED_ERROR` | `0.90` | Error at which maximum continuous speed is reached. |
@@ -272,6 +275,7 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 | `TRACKER_COAST_TIME` | `0.20` | Short detector-miss coast interval. |
 | `TRACKER_REACQUIRE_TIME` | `1.25` | Reacquisition interval before target is considered lost. |
 | `TRACKER_HOME_TIMEOUT` | `3.0` | Lost duration before releasing target / returning home. |
+| `TRACKER_TARGET_RELEASE_TIMEOUT` | `5.0` | Effective Rev 6.3 lost-target window before release/home; never shorter than `TRACKER_HOME_TIMEOUT`. |
 | `TRACKER_HOME_PRESET` | `5` | Camera preset used as home. |
 | `TRACKER_GOTO_HOME_ON_START` | `true` | Return to home preset when tracking starts. |
 | `TRACKER_RETURN_HOME_ON_LOST` | `true` | Return to home after the target is lost. |
