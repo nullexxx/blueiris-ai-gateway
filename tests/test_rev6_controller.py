@@ -122,6 +122,23 @@ class Rev6ControllerTests(unittest.TestCase):
         self.assertIn('"fractional_onvif_available"', TRACKER)
         self.assertIn('"post_stop_settle_remaining_ms"', TRACKER)
 
+    def test_startup_migrates_missing_fractional_profile_without_full_motion_recalibration(self):
+        self.assertIn(
+            "def _startup_calibration_requirements(self) -> Tuple[bool, bool, bool]:",
+            TRACKER,
+        )
+        self.assertIn("fractional_missing = bool(", TRACKER)
+        self.assertIn(
+            "not self._active_calibration.has_onvif_fractional_continuous()",
+            TRACKER,
+        )
+        self.assertIn(
+            "zoom_needed, motion_needed, fractional_needed = self._startup_calibration_requirements()",
+            TRACKER,
+        )
+        self.assertIn('elif fractional_needed:', TRACKER)
+        self.assertIn('mode = "continuous"', TRACKER)
+
 
 if __name__ == "__main__":
     unittest.main()
