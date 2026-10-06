@@ -899,12 +899,14 @@ class TargetTrack:
     velocity_reference_time: Optional[float] = None
     velocity_sample_ms: int = 0
     velocity_valid: bool = False
+    velocity_estimate_time: Optional[float] = None
 
     def rebase_velocity(self, now: float) -> None:
         self.velocity_reference_center = self.center
         self.velocity_reference_time = now
         self.velocity_sample_ms = 0
         self.velocity_valid = False
+        self.velocity_estimate_time = None
         self.vx = 0.0
         self.vy = 0.0
 
@@ -913,6 +915,7 @@ class TargetTrack:
         self.velocity_reference_time = None
         self.velocity_sample_ms = 0
         self.velocity_valid = False
+        self.velocity_estimate_time = None
         self.vx = 0.0
         self.vy = 0.0
 
@@ -923,6 +926,7 @@ class TargetTrack:
         *,
         update_velocity: bool = True,
         min_velocity_sample_s: float = 0.10,
+        preserve_velocity: bool = False,
     ) -> None:
         if det.class_id != self.class_id:
             raise ValueError("TargetTrack.update received a different object class")
@@ -934,7 +938,10 @@ class TargetTrack:
                 self.velocity_reference_time = self.last_update
 
             sample_s = max(0.0, now - self.velocity_reference_time)
-            self.velocity_sample_ms = int(sample_s * 1000)
+            # Keep the last mature estimate usable while the next sample window
+            # accumulates. Rev 3 accidentally rewrote velocity_sample_ms to
+            # 50-70 ms on every intervening frame, making motion state alternate
+            # between mature/immature at camera FPS.
             if sample_s >= max(0.001, min_velocity_sample_s):
                 ref_x, ref_y = self.velocity_reference_center
                 inst_vx = (new_center[0] - ref_x) / sample_s
@@ -947,12 +954,14 @@ class TargetTrack:
                     self.vx = inst_vx
                     self.vy = inst_vy
                 self.velocity_valid = True
+                self.velocity_estimate_time = now
                 self.velocity_reference_center = new_center
                 self.velocity_reference_time = now
                 self.velocity_sample_ms = int(sample_s * 1000)
-        else:
-            # Follow the bbox for association, but never learn global
-            # image motion as target velocity while the PTZ is moving.
+        elif not preserve_velocity:
+            # PTZ motion invalidates image-space target velocity. A rejected
+            # detector-geometry sample while the camera is stationary is
+            # different: the last trusted estimate may be preserved briefly.
             self.clear_velocity()
 
         self.bbox = det.bbox
@@ -963,6 +972,12 @@ class TargetTrack:
         self.acquire_hits += 1
 
     def predicted_center(self, now: float) -> Tuple[float, float]:
+        if (
+            not self.velocity_valid
+            or self.velocity_estimate_time is None
+            or (now - self.velocity_estimate_time) > 0.75
+        ):
+            return self.center
         dt = min(0.6, max(0.0, now - self.last_update))
         return (self.center[0] + self.vx * dt, self.center[1] + self.vy * dt)
 
@@ -1007,7 +1022,7 @@ def _motion_control_decision(
 ):
     """Choose continuous chase vs slow/stationary precision positioning.
 
-    Rev 3 treats moveDirectly as a precision controller, not a predictor. A
+    Rev 4 treats moveDirectly as a precision controller, not a predictor. A
     moving target either receives continuous PTZ (when sufficiently displaced)
     or is intentionally held until its motion settles. This avoids committing
     the camera to a 1.3-1.8 second move based on a target that will be somewhere
@@ -1231,7 +1246,35 @@ class DogTracker:
             0.0, min(1.5, _env_float("TRACKER_POST_CHASE_PRECISION_HOLDOFF", 0.35))
         )
         self._hybrid_confidence_grace = max(
-            0.0, min(1.0, _env_float("TRACKER_HYBRID_CHASE_CONFIDENCE_GRACE", 0.25))
+            0.0, min(1.0, _env_float("TRACKER_HYBRID_CHASE_CONFIDENCE_GRACE", 0.40))
+        )
+        self._retention_detection_conf = max(
+            0.05,
+            min(self.cfg.hold_conf, _env_float("TRACKER_RETENTION_DETECTION_CONF", 0.20)),
+        )
+        self._chase_detection_conf = max(
+            0.05,
+            min(self._retention_detection_conf, _env_float("TRACKER_CHASE_DETECTION_CONF", 0.18)),
+        )
+        self._target_retention_grace = max(
+            0.20, min(1.50, _env_float("TRACKER_TARGET_RETENTION_GRACE", 0.65))
+        )
+        self._hybrid_missing_grace = max(
+            self.cfg.hybrid_chase_miss_grace,
+            max(0.20, min(0.80, _env_float("TRACKER_HYBRID_MISSING_GRACE", 0.35))),
+        )
+        self._motion_velocity_ttl = max(
+            0.30, min(1.50, _env_float("TRACKER_MOTION_VELOCITY_TTL", 0.75))
+        )
+        self._precision_min_error = max(
+            max(self.cfg.move_deadzone_x, self.cfg.move_deadzone_y),
+            min(0.55, _env_float("TRACKER_PRECISION_MIN_ERROR", 0.28)),
+        )
+        self._precision_settle_s = max(
+            0.20, min(1.50, _env_float("TRACKER_PRECISION_SETTLE_TIME", 0.45))
+        )
+        self._hybrid_axis_reverse_holdoff = max(
+            0.10, min(0.75, _env_float("TRACKER_HYBRID_AXIS_REVERSE_HOLDOFF", 0.25))
         )
 
         self.active = False
@@ -1336,8 +1379,11 @@ class DogTracker:
         self._hybrid_divergence_count = 0
         self._hybrid_low_confidence_since: Optional[float] = None
         self._precision_hold_until = 0.0
+        self._precision_slow_since: Optional[float] = None
         self._precision_defer_reason: Optional[str] = None
         self._precision_defer_last_event_at = 0.0
+        self._hybrid_pan_reverse_until = 0.0
+        self._hybrid_tilt_reverse_until = 0.0
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -1498,8 +1544,11 @@ class DogTracker:
         self._hybrid_divergence_count = 0
         self._hybrid_low_confidence_since = None
         self._precision_hold_until = 0.0
+        self._precision_slow_since = None
         self._precision_defer_reason = None
         self._precision_defer_last_event_at = 0.0
+        self._hybrid_pan_reverse_until = 0.0
+        self._hybrid_tilt_reverse_until = 0.0
         self._move_failure_count = 0
         self._move_retry_after = 0.0
         self._smart_history.clear()
@@ -2320,7 +2369,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev3 continuous-moving + stationary-precision control)")
+        self.logger.info("PTZ tracker STARTED (Rev4 persistent-motion + continuous-servo control)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -2422,6 +2471,11 @@ class DogTracker:
                 "velocity_px_s": [round(self.target.vx, 1), round(self.target.vy, 1)],
                 "velocity_sample_ms": self.target.velocity_sample_ms,
                 "velocity_valid": self.target.velocity_valid,
+                "velocity_age_ms": (
+                    None
+                    if self.target.velocity_estimate_time is None
+                    else int(max(0.0, now - self.target.velocity_estimate_time) * 1000)
+                ),
                 "acquire_hits": self.target.acquire_hits,
                 "span": None if self._last_target_span is None else round(self._last_target_span, 3),
             }
@@ -2514,8 +2568,8 @@ class DogTracker:
                 "move_quality_samples": len(self._quality_improvements),
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
-                    "controller_revision": 3,
-                    "strategy": "continuous_moving_precision_stationary",
+                    "controller_revision": 4,
+                    "strategy": "persistent_velocity_continuous_servo_precision",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -2523,6 +2577,14 @@ class DogTracker:
                     "continuous_exit_error": round(self._motion_control_continuous_exit_error, 3),
                     "post_chase_precision_holdoff_s": round(self._post_chase_precision_holdoff, 3),
                     "confidence_grace_s": round(self._hybrid_confidence_grace, 3),
+                    "missing_grace_s": round(self._hybrid_missing_grace, 3),
+                    "retention_detection_conf": round(self._retention_detection_conf, 3),
+                    "chase_detection_conf": round(self._chase_detection_conf, 3),
+                    "target_retention_grace_s": round(self._target_retention_grace, 3),
+                    "velocity_ttl_s": round(self._motion_velocity_ttl, 3),
+                    "precision_min_error": round(self._precision_min_error, 3),
+                    "precision_settle_s": round(self._precision_settle_s, 3),
+                    "axis_reverse_holdoff_s": round(self._hybrid_axis_reverse_holdoff, 3),
                     "precision_hold_until_ms": max(0, int((self._precision_hold_until - now) * 1000)),
                     "move_direct_predictive_lead": False,
                     "live_spatial_learning": False,
@@ -2713,7 +2775,7 @@ class DogTracker:
         motion_scale = (
             1.35 if speed_norm > self._motion_control_stationary_speed_norm else 1.0
         )
-        # Rev 3 never makes the precision deadzone smaller than the configured
+        # Rev 4 never makes the precision deadzone smaller than the configured
         # base. A 1+ second positional move for ~0.11 normalized error was a
         # measurable regression in Rev 2.
         scale = max(1.0, min(1.75, zoom_scale * size_scale * motion_scale))
@@ -2820,6 +2882,9 @@ class DogTracker:
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
         self._hybrid_low_confidence_since = None
+        self._hybrid_pan_reverse_until = 0.0
+        self._hybrid_tilt_reverse_until = 0.0
+        self._precision_slow_since = None
         if ok and was_active:
             self.ptz_commands += 1
             self.hybrid_chase_stops += 1
@@ -2859,16 +2924,75 @@ class DogTracker:
         if pan_speed == 0 and tilt_speed == 0:
             return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
 
-        desired = (pan_speed, tilt_speed)
+        raw_desired = (pan_speed, tilt_speed)
         current = (self._hybrid_pan_speed, self._hybrid_tilt_speed)
 
-        # Escape chase never reverses through center. A sign flip means we have
-        # recovered enough (or inertia carried us through); stop and let the
-        # slower camera-managed moveDirectly controller take over after settling.
+        # Rev 4 handles center crossings independently per axis. Motor inertia on
+        # one axis must not cancel useful tracking on the other. A reversing axis
+        # is neutralized briefly, then may reverse only if the error still demands
+        # it after the holdoff.
         def sign_flip(old: int, new: int) -> bool:
             return old != 0 and new != 0 and ((old > 0) != (new > 0))
-        if self._hybrid_chase_active and (sign_flip(current[0], desired[0]) or sign_flip(current[1], desired[1])):
-            return await self._stop_hybrid_chase("direction_reversal", seq=seq)
+
+        desired_pan, desired_tilt = raw_desired
+        suppressed_axes = []
+        if self._hybrid_chase_active:
+            if sign_flip(current[0], desired_pan):
+                self._hybrid_pan_reverse_until = max(
+                    self._hybrid_pan_reverse_until,
+                    now + self._hybrid_axis_reverse_holdoff,
+                )
+                desired_pan = 0
+                suppressed_axes.append("pan")
+            elif now < self._hybrid_pan_reverse_until:
+                desired_pan = 0
+                suppressed_axes.append("pan")
+
+            if sign_flip(current[1], desired_tilt):
+                self._hybrid_tilt_reverse_until = max(
+                    self._hybrid_tilt_reverse_until,
+                    now + self._hybrid_axis_reverse_holdoff,
+                )
+                desired_tilt = 0
+                suppressed_axes.append("tilt")
+            elif now < self._hybrid_tilt_reverse_until:
+                desired_tilt = 0
+                suppressed_axes.append("tilt")
+
+        desired = (desired_pan, desired_tilt)
+        if suppressed_axes:
+            self._hybrid_divergence_count = 0
+            self._record_event(
+                "hybrid_axis_reversal_suppressed",
+                axes=sorted(set(suppressed_axes)),
+                requested=[raw_desired[0], raw_desired[1]],
+                commanded=[desired[0], desired[1]],
+                holdoff_ms=int(self._hybrid_axis_reverse_holdoff * 1000),
+            )
+
+        if desired == (0, 0):
+            if raw_desired == (0, 0):
+                return await self._stop_hybrid_chase("safe_inner_region", seq=seq)
+            # Both axes are in reversal holdoff. Stop motor motion without ending
+            # the chase session or rebasing the target; a subsequent fresh frame
+            # can restart either axis in the new direction.
+            if current != (0, 0):
+                t0 = time.monotonic()
+                ok = await asyncio.to_thread(self.ptz.continuous_stop)
+                t1 = time.monotonic()
+                if not ok:
+                    return await self._stop_hybrid_chase("axis_pause_failed", seq=seq, force=True)
+                self._hybrid_pan_speed = 0
+                self._hybrid_tilt_speed = 0
+                self._hybrid_last_command_at = t1
+                self.ptz_commands += 1
+                self._record_event(
+                    "hybrid_axis_pause",
+                    axes=sorted(set(suppressed_axes)),
+                    http_ms=int((t1 - t0) * 1000),
+                )
+            self.state = "ESCAPE_CHASE"
+            return True
 
         elapsed = max(0.0, now - self._hybrid_last_command_at)
         same_speed = self._hybrid_chase_active and desired == current
@@ -3323,9 +3447,14 @@ class DogTracker:
 
                 self._last_processed_seq = seq
                 self._last_frame_shape = frame.shape[:2]
+                inference_conf = self.cfg.hold_conf
+                if self.target is not None:
+                    inference_conf = min(inference_conf, self._retention_detection_conf)
+                if self._hybrid_chase_active:
+                    inference_conf = min(inference_conf, self._chase_detection_conf)
                 outcome, raw_detections, infer_ms = await self.inference_cb(
                     frame,
-                    self.cfg.hold_conf,
+                    inference_conf,
                     self.cfg.model_name,
                     self.cfg.target_class_ids,
                 )
@@ -3353,7 +3482,7 @@ class DogTracker:
                         bbox=(float(d["x_min"]), float(d["y_min"]), float(d["x_max"]), float(d["y_max"])),
                     )
                     for d in raw_detections
-                    if float(d.get("confidence", 0.0)) >= self.cfg.hold_conf
+                    if float(d.get("confidence", 0.0)) >= inference_conf
                 ]
                 self._last_detection_count = len(detections)
                 self._last_debug_detections = detections
@@ -3468,12 +3597,15 @@ class DogTracker:
             return
 
         matched = self._associate(detections, frame.shape, now)
-        if (
-            matched is not None
-            and self.state in ("COAST", "REACQUIRE", "LOST")
-            and matched.confidence < self.cfg.reacquire_conf
-        ):
-            matched = None
+        if matched is not None and self.state in ("COAST", "REACQUIRE", "LOST"):
+            missing_for_match = max(0.0, now - self.target.last_seen)
+            required_conf = (
+                self._retention_detection_conf
+                if missing_for_match <= self._target_retention_grace
+                else self.cfg.reacquire_conf
+            )
+            if matched.confidence < required_conf:
+                matched = None
 
         if (
             matched is not None
@@ -3513,13 +3645,24 @@ class DogTracker:
             else:
                 self._bbox_motion.reset(matched.bbox, now)
                 self._last_velocity_geometry = None
-            velocity_learning_allowed = (
+            stationary_observation = (
                 self._ptz_operation is None
                 and not self._hybrid_chase_active
                 and ptz_ready
                 and not self._velocity_rebase_required
                 and self._frame_sharpness_ok
-                and geometry_valid
+            )
+            velocity_learning_allowed = stationary_observation and geometry_valid
+            velocity_age_s = (
+                float("inf")
+                if self.target.velocity_estimate_time is None
+                else max(0.0, now - self.target.velocity_estimate_time)
+            )
+            preserve_velocity = bool(
+                stationary_observation
+                and not geometry_valid
+                and self.target.velocity_valid
+                and velocity_age_s <= self._motion_velocity_ttl
             )
             self.target.update(
                 matched,
@@ -3529,6 +3672,7 @@ class DogTracker:
                     self.cfg.velocity_min_sample_ms,
                     self._motion_control_min_sample_ms,
                 ) / 1000.0,
+                preserve_velocity=preserve_velocity,
             )
             self._smart_history.add(now, matched.bbox, matched.confidence, frame.shape)
             if self._ptz_operation is None and ptz_ready and not self._frame_sharpness_ok:
@@ -3615,9 +3759,12 @@ class DogTracker:
             return
 
         if self._hybrid_chase_active:
-            # Keep the bounded chase alive across one or two blurred YOLO misses.
+            # Keep continuous steering alive through a short burst of motion blur.
+            # The lower retention threshold is association-only; no new target can
+            # be acquired at this confidence. The camera still stops at a bounded
+            # grace interval if the detector does not recover.
             hybrid_missing_for = max(0.0, now - self.target.last_seen)
-            if hybrid_missing_for <= self.cfg.hybrid_chase_miss_grace:
+            if hybrid_missing_for <= self._hybrid_missing_grace:
                 self.state = "ESCAPE_CHASE"
                 return
             await self._stop_hybrid_chase("target_missing", seq=seq)
@@ -3847,12 +3994,22 @@ class DogTracker:
                 (abs(err_x) + abs(err_y)) * self.cfg.move_gain,
             )
             handoff_eta_s = self._predict_move_eta(rough_move_distance)
+            velocity_age_s = (
+                float("inf")
+                if self.target.velocity_estimate_time is None
+                else max(0.0, now - self.target.velocity_estimate_time)
+            )
+            control_velocity_valid = bool(
+                self.target.velocity_valid and velocity_age_s <= self._motion_velocity_ttl
+            )
+            control_vx = self.target.vx if control_velocity_valid else 0.0
+            control_vy = self.target.vy if control_velocity_valid else 0.0
             control_decision = _motion_control_decision(
                 err_x=err_x,
                 err_y=err_y,
-                vx=self.target.vx,
-                vy=self.target.vy,
-                velocity_valid=self.target.velocity_valid,
+                vx=control_vx,
+                vy=control_vy,
+                velocity_valid=control_velocity_valid,
                 velocity_sample_ms=self.target.velocity_sample_ms,
                 frame_shape=frame_shape,
                 move_eta_s=handoff_eta_s,
@@ -3876,6 +4033,7 @@ class DogTracker:
             deadline_escape = bool(control_decision["deadline_escape"])
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
+                self._precision_slow_since = None
                 pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
                 tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
                 pan_speed = pan_sign * self._hybrid_axis_speed(err_x, "pan")
@@ -3911,18 +4069,33 @@ class DogTracker:
             adaptive_hybrid_available = (
                 self.cfg.hybrid_chase_enabled and not self._hybrid_disabled_for_session
             )
+            dominant_error = max(abs(err_x), abs(err_y))
             precision_hold_reason = None
             if adaptive_hybrid_available and now < self._precision_hold_until:
+                self._precision_slow_since = None
                 precision_hold_reason = "post_chase_holdoff"
             elif adaptive_hybrid_available and not bool(control_decision["precision_move_allowed"]):
+                self._precision_slow_since = None
                 precision_hold_reason = str(control_decision["precision_hold_reason"] or "moving_target")
+            elif adaptive_hybrid_available and dominant_error < self._precision_min_error:
+                self._precision_slow_since = None
+                precision_hold_reason = "precision_deadband"
+            elif adaptive_hybrid_available:
+                if self._precision_slow_since is None:
+                    self._precision_slow_since = now
+                if (now - self._precision_slow_since) < self._precision_settle_s:
+                    precision_hold_reason = "stationary_settle"
 
             if precision_hold_reason is not None:
                 next_state = (
                     "VELOCITY_SAMPLE"
                     if precision_hold_reason == "velocity_sample"
                     else "PRECISION_HOLD"
-                    if precision_hold_reason == "post_chase_holdoff"
+                    if precision_hold_reason in (
+                        "post_chase_holdoff",
+                        "precision_deadband",
+                        "stationary_settle",
+                    )
                     else "MOTION_HOLD"
                 )
                 if (
@@ -3943,6 +4116,10 @@ class DogTracker:
                 return
 
             self._precision_defer_reason = None
+
+            # A precision move consumes the stationary dwell. A second positional
+            # correction must earn a new stable observation window after settling.
+            self._precision_slow_since = None
 
             # moveDirectly centers the CURRENT measured point. In adaptive hybrid
             # move takes long enough that the instantaneous YOLO point is stale by

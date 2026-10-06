@@ -180,7 +180,28 @@ class BBoxMotionValidator:
         elif delta > diag * 0.80:
             reason = "edge_velocity_disagreement"
         elif abs(width_rate) > 2.5 or abs(height_rate) > 2.5:
-            reason = "bbox_scale_jump"
+            # Rapid scale change by itself is not bad velocity evidence. A person
+            # walking toward/away from the camera legitimately changes bbox size
+            # several times per second. Reject only when edge deformation clearly
+            # dominates coherent translation (Frigate-style edge consensus).
+            center_vx = 0.5 * (vx1 + vx2)
+            center_vy = 0.5 * (vy1 + vy2)
+            deform_x = 0.5 * abs(vx2 - vx1)
+            deform_y = 0.5 * abs(vy2 - vy1)
+            width_bad = (
+                abs(width_rate) > 2.5
+                and deform_x > max(120.0, abs(center_vx) * 1.75)
+            )
+            height_bad = (
+                abs(height_rate) > 2.5
+                and deform_y > max(120.0, abs(center_vy) * 1.75)
+            )
+            extreme_scale = (
+                (abs(width_rate) > 6.0 and deform_x > 80.0)
+                or (abs(height_rate) > 6.0 and deform_y > 80.0)
+            )
+            if width_bad or height_bad or extreme_scale:
+                reason = "bbox_scale_jump"
         elif speed_a > 40.0 and speed_b > 40.0:
             cosine = (vx1 * vx2 + vy1 * vy2) / max(1e-6, speed_a * speed_b)
             if cosine < -0.20 and delta > diag * 0.30:
