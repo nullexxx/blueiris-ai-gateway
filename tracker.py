@@ -3147,10 +3147,12 @@ class DogTracker:
             feedforward_gain=self._servo_feedforward_gain,
             brake_horizon_s=self._servo_brake_horizon,
         )
-        desired_rate = abs(float(decision["desired_rate"]))
+        signed_desired_rate = float(decision["desired_rate"])
+        desired_rate = abs(signed_desired_rate)
         requested_speed = 0
         selected_calibrated_rate = None
         command = 0
+        onvif_velocity = 0.0 if desired_rate <= 1e-6 else None
         if desired_rate > 1e-6:
             zoom_factor = self._current_zoom_factor()
             calibrated_rates = self._active_calibration.continuous_rates(
@@ -3189,7 +3191,17 @@ class DogTracker:
             command_mag = min(requested_speed, allowed_mag)
             if abs(error) <= axis_exit_error + 0.16:
                 command_mag = min(command_mag, self.cfg.hybrid_chase_min_speed)
-            command = command_mag if float(decision["desired_rate"]) > 0.0 else -command_mag
+            command = command_mag if signed_desired_rate > 0.0 else -command_mag
+
+            mapped_velocity = self._active_calibration.onvif_velocity_for_rate(
+                axis,
+                desired_rate,
+                max_velocity=self._servo_onvif_max_velocity,
+            )
+            if mapped_velocity is not None:
+                onvif_velocity = (
+                    mapped_velocity if signed_desired_rate > 0.0 else -mapped_velocity
+                )
 
         meta = {
             "axis": axis,
@@ -3198,31 +3210,77 @@ class DogTracker:
             "feedforward_rate": round(ff, 4),
             "predicted_error": round(float(decision["predicted_error"]), 4),
             "closing_rate": round(float(decision["closing_rate"]), 4),
-            "desired_rate": round(float(decision["desired_rate"]), 4),
+            "desired_rate": round(signed_desired_rate, 4),
             "requested_speed": requested_speed,
             "command_speed": command,
             "calibrated_rate": (
                 None if selected_calibrated_rate is None
                 else round(float(selected_calibrated_rate), 4)
             ),
+            "onvif_velocity": (
+                None if onvif_velocity is None else round(float(onvif_velocity), 5)
+            ),
             "phase": str(decision["phase"]),
         }
         return command, meta
+
+    def _servo_camera_command(
+        self,
+        pan_control: int,
+        tilt_control: int,
+        pan_meta: dict,
+        tilt_meta: dict,
+    ) -> Tuple[str, float, float]:
+        pan_rate_active = abs(float(pan_meta.get("desired_rate") or 0.0)) > 1e-6
+        tilt_rate_active = abs(float(tilt_meta.get("desired_rate") or 0.0)) > 1e-6
+        pan_onvif = pan_meta.get("onvif_velocity")
+        tilt_onvif = tilt_meta.get("onvif_velocity")
+        onvif_mappable = (
+            (not pan_rate_active or pan_onvif is not None)
+            and (not tilt_rate_active or tilt_onvif is not None)
+        )
+        if (
+            self._servo_actuator_mode != "native"
+            and self._servo_onvif_available
+            and onvif_mappable
+        ):
+            pan_sign = self._active_calibration.onvif_continuous_sign("pan", 1)
+            tilt_sign = self._active_calibration.onvif_continuous_sign("tilt", 1)
+            return (
+                "onvif_fractional",
+                pan_sign * float(pan_onvif or 0.0),
+                tilt_sign * float(tilt_onvif or 0.0),
+            )
+
+        pan_sign = self._active_calibration.continuous_sign(
+            "pan", self.cfg.hybrid_chase_pan_sign
+        )
+        tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
+        return (
+            "native_discrete",
+            float(pan_sign * pan_control),
+            float(tilt_sign * tilt_control),
+        )
 
     def _record_servo_telemetry(
         self,
         now: float,
         pan_meta: dict,
         tilt_meta: dict,
-        pan_command: int,
-        tilt_command: int,
+        actuator: str,
+        pan_command: float,
+        tilt_command: float,
         *,
         force: bool = False,
     ) -> None:
         payload = {
             "pan": pan_meta,
             "tilt": tilt_meta,
-            "camera_command": [int(pan_command), int(tilt_command)],
+            "actuator": actuator,
+            "camera_command": [
+                round(float(pan_command), 5),
+                round(float(tilt_command), 5),
+            ],
         }
         self._servo_last_decision = payload
         if force or (now - self._servo_last_telemetry_at) >= self._servo_telemetry_interval:
