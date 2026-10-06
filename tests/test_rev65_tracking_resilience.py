@@ -48,6 +48,11 @@ class Rev65TrackingResilienceTests(unittest.TestCase):
         self.assertIn('"native_edge_rescue_enter"',chase)
         self.assertIn('"native_edge_rescue_exit"',chase)
         self.assertIn("self._native_edge_rescue_cooldown_until",chase)
+        self.assertIn("self._native_edge_rescue_started_at <= 0.0",chase)
+        self.assertLess(
+            chase.index('reason="duration_expired"'),
+            chase.index("pan_rescue_requested = ("),
+        )
 
     def test_association_diagnostics_expose_nonmatching_candidates(self):
         associate=block("    def _associate(","    async def _drive_to_target")

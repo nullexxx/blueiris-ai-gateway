@@ -4639,7 +4639,7 @@ class DogTracker:
 
         if (
             self._hybrid_actuator != "onvif_fractional"
-            and now >= self._native_edge_rescue_until
+            and self._native_edge_rescue_started_at <= 0.0
             and (now - self._hybrid_started_at) >= self.cfg.hybrid_chase_max_seconds
         ):
             await self._stop_hybrid_chase("max_duration", seq=seq)
@@ -4719,6 +4719,17 @@ class DogTracker:
             pan_control, tilt_control, pan_meta, tilt_meta
         )
         self._record_servo_telemetry(now, pan_meta, tilt_meta, actuator, pan_command, tilt_command)
+
+        if self._native_edge_rescue_until > 0.0 and now >= self._native_edge_rescue_until:
+            self._record_event(
+                "native_edge_rescue_exit",
+                reason="duration_expired",
+                elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
+                error=[round(err_x, 3), round(err_y, 3)],
+            )
+            self._native_edge_rescue_until = 0.0
+            self._native_edge_rescue_started_at = 0.0
+            self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
 
         pan_rescue_requested = (
             self._native_edge_rescue_enabled
@@ -4820,17 +4831,6 @@ class DogTracker:
                         force_command=rescue_entering,
                     )
                     return
-
-        if self._native_edge_rescue_until > 0.0 and now >= self._native_edge_rescue_until:
-            self._record_event(
-                "native_edge_rescue_exit",
-                reason="duration_expired",
-                elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
-                error=[round(err_x, 3), round(err_y, 3)],
-            )
-            self._native_edge_rescue_until = 0.0
-            self._native_edge_rescue_started_at = 0.0
-            self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
 
         if (now - self._hybrid_started_at) >= self._servo_divergence_grace:
             pan_state = self._hybrid_axis_divergence["pan"]
