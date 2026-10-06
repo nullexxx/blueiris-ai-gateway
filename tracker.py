@@ -3381,6 +3381,42 @@ class DogTracker:
         speed = max(self.cfg.hybrid_chase_min_speed, min(zoom_max, speed))
         return speed if error > 0 else -speed
 
+    async def _pause_hybrid_actuator(self, reason: str) -> bool:
+        actuator = self._hybrid_actuator
+        moving = (
+            self._hybrid_pan_speed != 0
+            or self._hybrid_tilt_speed != 0
+            or abs(self._hybrid_pan_velocity) > 1e-6
+            or abs(self._hybrid_tilt_velocity) > 1e-6
+        )
+        if not moving:
+            return True
+        t0 = time.monotonic()
+        if actuator == "onvif_fractional":
+            ok = await self._onvif_motion.stop()
+            if not ok:
+                # Native CGI stop is a last-resort global PTZ brake on Dahua.
+                ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        else:
+            ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        t1 = time.monotonic()
+        if ok:
+            self.ptz_commands += 1
+        self._hybrid_pan_speed = 0
+        self._hybrid_tilt_speed = 0
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
+        self._hybrid_last_command_at = t1
+        self._reset_servo_feedback()
+        self._record_event(
+            "hybrid_actuator_pause",
+            reason=reason,
+            actuator=actuator,
+            success=bool(ok),
+            http_ms=int((t1 - t0) * 1000),
+        )
+        return bool(ok)
+
     async def _stop_hybrid_chase(
         self,
         reason: str,
@@ -3392,15 +3428,26 @@ class DogTracker:
             self._hybrid_chase_active
             or self._hybrid_pan_speed != 0
             or self._hybrid_tilt_speed != 0
+            or abs(self._hybrid_pan_velocity) > 1e-6
+            or abs(self._hybrid_tilt_velocity) > 1e-6
         )
         if not was_active and not force:
             return True
+        actuator = self._hybrid_actuator
         t0 = time.monotonic()
-        ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        if actuator == "onvif_fractional":
+            ok = await self._onvif_motion.stop()
+            if not ok:
+                ok = await asyncio.to_thread(self.ptz.continuous_stop)
+        else:
+            ok = await asyncio.to_thread(self.ptz.continuous_stop)
         t1 = time.monotonic()
         self._hybrid_chase_active = False
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
+        self._hybrid_pan_velocity = 0.0
+        self._hybrid_tilt_velocity = 0.0
+        self._hybrid_actuator = "none"
         self._hybrid_started_at = 0.0
         self._hybrid_last_command_at = t1
         self._hybrid_last_stopped_at = t1
@@ -3422,9 +3469,6 @@ class DogTracker:
         self._reset_servo_feedback()
 
         if was_active:
-            # Continuous PTZ is not represented by _ptz_operation, so Rev 5
-            # could rebase velocity only a few milliseconds after Stop. Force
-            # the same optical-flow settle discipline used after positional PTZ.
             self._scene_stability.reset(t1)
             self._scene_stable_ready = False
             if ok:
@@ -3433,6 +3477,7 @@ class DogTracker:
                 self._record_event(
                     "hybrid_chase_stop",
                     reason=reason,
+                    actuator=actuator,
                     http_ms=int((t1 - t0) * 1000),
                     settle_ms=int(self._servo_post_stop_settle_s * 1000),
                 )
@@ -3440,7 +3485,12 @@ class DogTracker:
                 self._record_event(
                     "hybrid_chase_stop_failed",
                     reason=reason,
-                    error=self.ptz.last_error,
+                    actuator=actuator,
+                    error=(
+                        self._onvif_motion.last_error
+                        if actuator == "onvif_fractional"
+                        else self.ptz.last_error
+                    ),
                 )
 
             if self.target is not None:
@@ -3453,7 +3503,7 @@ class DogTracker:
                     self._post_motion_release_seq,
                     seq + self.cfg.hybrid_chase_settle_frames,
                 )
-        return ok
+        return bool(ok)
 
     async def _set_hybrid_chase_speed(
         self,
