@@ -4070,8 +4070,6 @@ class DogTracker:
         self.state = "ESCAPE_CHASE"
         self._velocity_learning_ready = False
         self._velocity_stable_frames = 0
-        self._velocity_learning_ready = False
-        self._velocity_stable_frames = 0
         if self.target is not None:
             self.target.clear_velocity()
             self._velocity_rebase_required = True
@@ -4207,6 +4205,8 @@ class DogTracker:
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
         self.state = "ESCAPE_CHASE"
+        self._velocity_learning_ready = False
+        self._velocity_stable_frames = 0
         if self.target is not None:
             self.target.clear_velocity()
             self._velocity_rebase_required = True
