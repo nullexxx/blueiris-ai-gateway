@@ -71,7 +71,10 @@ services:
       TRACKER_EDGE_RESCUE_ERROR: "0.75"
       TRACKER_EDGE_RESCUE_GAIN: "0.85"
 
-      # Escape-only continuous chase. Normal tracking remains moveDirectly.
+      # Rev 6 moving-target control. Calibrated fractional ONVIF ContinuousMove
+      # handles normal servo corrections; native continuous PTZ is edge rescue.
+      TRACKER_SERVO_ACTUATOR: "auto"
+      TRACKER_ONVIF_SERVO_MAX_VELOCITY: "0.35"
       TRACKER_HYBRID_CHASE_ENABLED: "true"
       TRACKER_HYBRID_CHASE_PAN_SIGN: "-1"
       TRACKER_HYBRID_CHASE_ENTRY_ERROR: "0.82"
@@ -90,6 +93,10 @@ services:
       TRACKER_HYBRID_CHASE_SETTLE_FRAMES: "2"
       TRACKER_HYBRID_DIVERGENCE_FRAMES: "3"
       TRACKER_HYBRID_DIVERGENCE_GROWTH: "0.05"
+      TRACKER_SERVO_POST_STOP_SETTLE: "0.35"
+      TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT: "3"
+      TRACKER_SERVO_DIVERGENCE_WINDOW: "30"
+      TRACKER_SERVO_DIVERGENCE_COOLDOWN: "0.75"
 
       # Camera status drives completion; no fixed movement sleep is used.
       TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.12"
@@ -135,6 +142,8 @@ services:
       TRACKER_CALIBRATION_CONTINUOUS_SPEEDS: "1,3,6"
       TRACKER_CALIBRATION_CONTINUOUS_DURATION: "0.22"
       TRACKER_CALIBRATION_ONVIF_BENCHMARK: "true"
+      TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES: "0.04,0.08,0.16"
+      TRACKER_ONVIF_SERVO_CALIBRATION_DURATION: "0.22"
 
       # Frigate-inspired acquisition/motion filtering. JSON polygon coordinates are normalized 0..1.
       # Empty arrays preserve the existing behavior. These gates apply only to initial target acquisition.
