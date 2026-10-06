@@ -1,6 +1,6 @@
 name: Build and Push to GHCR
 
-# Runtime image includes Rev 5 damped feedback PTZ servo (final hardened tree).
+# Runtime image includes Rev 6 fractional settled-velocity PTZ servo (final hardened tree).
 on:
   push:
     branches: [ "main" ]
