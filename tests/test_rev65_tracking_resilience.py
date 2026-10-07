@@ -1,4 +1,5 @@
 import ast
+import math
 from pathlib import Path
 import unittest
 
@@ -10,7 +11,7 @@ def load_functions(*names):
     nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
     module=ast.Module(body=nodes,type_ignores=[])
     ast.fix_missing_locations(module)
-    ns={}
+    ns={"math": math}
     exec(compile(module,"tracker.py","exec"),ns)
     return [ns[name] for name in names]
 
