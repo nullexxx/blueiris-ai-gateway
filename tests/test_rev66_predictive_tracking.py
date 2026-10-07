@@ -81,6 +81,11 @@ class Rev66PredictiveTrackingTests(unittest.TestCase):
         self.assertIn("self._static_hotspot_motion_threshold", TRACKER)
         self.assertIn("self._static_hotspot_block_s", TRACKER)
 
+    def test_hotspot_guard_preserves_home_context_until_confirmation(self):
+        self.assertIn("self._active_acquire_home_context = home_context", TRACKER)
+        self.assertIn("if self._active_acquire_home_context and self._ptz_operation is None:", TRACKER)
+        self.assertIn("self._home_sent = True", TRACKER)
+
     def test_status_identifies_rev66(self):
         self.assertIn('"controller_patch": "6.6"', TRACKER)
         self.assertIn('"fast_follow_speed_norm"', TRACKER)
