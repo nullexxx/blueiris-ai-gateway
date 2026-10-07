@@ -73,7 +73,7 @@ class Rev4ControllerTests(unittest.TestCase):
 
     def test_rev6_status_contract(self):
         self.assertIn('"controller_revision": 6', TRACKER)
-        self.assertIn('"fractional_servo_axis_latched_rescue_frozen_loss_clock"', TRACKER)
+        self.assertIn('"fractional_servo_response_armed_divergence_frozen_loss_clock"', TRACKER)
         self.assertIn('"missing_grace_s"', TRACKER)
         self.assertIn('"velocity_ttl_s"', TRACKER)
         self.assertIn('"axis_reverse_holdoff_s"', TRACKER)
