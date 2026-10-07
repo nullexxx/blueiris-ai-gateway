@@ -1277,9 +1277,9 @@ def _motion_control_decision(
     deadline_travel_norm,
     stationary_speed_norm,
     moving_error,
-    fast_follow_speed_norm,
-    fast_follow_horizon_s,
-    fast_follow_error,
+    fast_follow_speed_norm=0.10,
+    fast_follow_horizon_s=0.45,
+    fast_follow_error=0.22,
 ):
     """Choose continuous chase vs slow/stationary precision positioning.
 
