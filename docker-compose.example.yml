@@ -87,6 +87,23 @@ services:
       TRACKER_SERVO_HOLD_SECONDS: "0.30"
       TRACKER_SERVO_HOLD_MIN_FRAMES: "3"
       TRACKER_SERVO_HOLD_RESUME_GROWTH: "0.06"
+      # Rev 6.6: follow genuinely fast targets before they cross center and
+      # escape out the opposite side of the frame.
+      TRACKER_FAST_FOLLOW_SPEED_NORM: "0.10"
+      TRACKER_FAST_FOLLOW_HORIZON: "0.45"
+      TRACKER_FAST_FOLLOW_ERROR: "0.22"
+      TRACKER_CLASS_CONTINUITY_LABELS: "dog,cat,bird,bear"
+      # Learn recurring home-view false-positive fingerprints per session.
+      TRACKER_STATIC_HOTSPOT_GUARD_ENABLED: "true"
+      TRACKER_STATIC_HOTSPOT_WINDOW: "43200"
+      TRACKER_STATIC_HOTSPOT_MIN_SEPARATION: "30"
+      TRACKER_STATIC_HOTSPOT_BURSTS: "3"
+      TRACKER_STATIC_HOTSPOT_EXTRA_FRAMES: "3"
+      TRACKER_STATIC_HOTSPOT_MOTION_NORM: "0.025"
+      TRACKER_STATIC_HOTSPOT_OVERRIDE_CONF: "0.70"
+      TRACKER_STATIC_HOTSPOT_BLOCK_SECONDS: "12"
+      # History/status use local DST-aware time; time_utc stays alongside it.
+      TRACKER_EVENT_TIMEZONE: "America/New_York"
       # Rev 6.5: brief native PTZ burst only when fractional ONVIF is near
       # saturation and the target is still escaping at the frame edge.
       TRACKER_NATIVE_EDGE_RESCUE_ENABLED: "true"
