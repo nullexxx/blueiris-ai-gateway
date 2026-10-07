@@ -41,6 +41,15 @@ class PtzPhase2Behavior(unittest.TestCase):
         self.assertEqual(gate.last_reason, "stable")
         self.assertFalse(gate.timed_out)
 
+    def test_scene_stability_frame_at_timeout_boundary_can_complete_stability(self):
+        gate = SceneStabilityGate(stable_frames=2, max_wait_s=0.2, flow_threshold_norm=0.01)
+        gate.reset(1.0)
+        shape = (100, 100, 3)
+        self.assertFalse(gate.observe(1.1, DummyMotion(0.1, 0.1), True, shape))
+        self.assertTrue(gate.observe(1.21, DummyMotion(0.1, 0.1), True, shape))
+        self.assertEqual(gate.last_reason, "stable")
+        self.assertFalse(gate.timed_out)
+
     def test_scene_stability_has_bounded_timeout(self):
         gate = SceneStabilityGate(stable_frames=3, max_wait_s=0.2, flow_threshold_norm=0.001)
         gate.reset(1.0)
