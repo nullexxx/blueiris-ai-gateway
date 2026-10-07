@@ -171,6 +171,15 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_SERVO_HOLD_SECONDS` | `0.30` | Duration a predicted stop preserves chase identity before settling out. |
 | `TRACKER_SERVO_HOLD_MIN_FRAMES` | `3` | Minimum stopped observations before servo hold becomes a full stop. |
 | `TRACKER_SERVO_HOLD_RESUME_GROWTH` | `0.06` | Dominant-error growth that immediately resumes a held chase. |
+| `TRACKER_FAST_FOLLOW_SPEED_NORM` | `0.10` | Minimum mature normalized target speed for Rev 6.6 predictive follow. |
+| `TRACKER_FAST_FOLLOW_HORIZON` | `0.45` | Seconds ahead used to predict a fast center crossing. |
+| `TRACKER_FAST_FOLLOW_ERROR` | `0.22` | Future/current per-axis error that makes a fast target eligible for early continuous follow. |
+| `TRACKER_CLASS_CONTINUITY_LABELS` | `dog,cat,bird,bear` | Animal labels that may remain one physical track while class evidence votes on the label. |
+| `TRACKER_STATIC_HOTSPOT_GUARD_ENABLED` | `true` | Learn recurring home-view acquisition fingerprints and require extra evidence before they can drive PTZ. |
+| `TRACKER_STATIC_HOTSPOT_BURSTS` | `3` | Distinct separated bursts before a home-view box is considered suspicious. |
+| `TRACKER_STATIC_HOTSPOT_EXTRA_FRAMES` | `3` | Extra acquisition hits required at a suspicious hotspot. |
+| `TRACKER_STATIC_HOTSPOT_OVERRIDE_CONF` | `0.70` | Strong confidence that overrides the hotspot motion requirement. |
+| `TRACKER_EVENT_TIMEZONE` | `America/New_York` | Primary history/status timezone; every event also retains `time_utc`. |
 | `TRACKER_NATIVE_EDGE_RESCUE_ENABLED` | `true` | Permit a brief native PTZ burst when fractional ONVIF is near saturation and the target is still escaping near an edge. |
 | `TRACKER_NATIVE_EDGE_RESCUE_ERROR` | `0.75` | Per-axis error required before native rescue can trigger. |
 | `TRACKER_NATIVE_EDGE_RESCUE_EXIT_ERROR` | `0.65` | Exit native rescue once the target is pulled back inside this dominant-error region. |
@@ -333,3 +342,13 @@ The RTSP reader uses OpenCV/FFmpeg open and read timeouts (`TRACKER_RTSP_OPEN_TI
 `POST /v1/tracker/calibrate?mode=all` now calibrates the optical zoom map, native Dahua `moveDirectly` response/timing, native continuous pan/tilt speed response, and ONVIF pan/tilt capabilities. The motion calibration always runs with tracking stopped, repeatedly returns to the configured home preset, uses settled video frames to measure actual scene displacement, and returns home before releasing the camera.
 
 With `TRACKER_AUTOSTART=true` and the default `TRACKER_CALIBRATE_ON_START=if_missing`, the API and health endpoint come up normally while a guarded startup calibration runs. Autotracking starts only after calibration completes. Persisted calibration prevents that full camera exercise from repeating on ordinary restarts. Use `if_stale` to refresh it after `TRACKER_CALIBRATION_MAX_AGE_DAYS`, `always` to recalibrate every startup, or `off` to disable startup calibration.
+
+
+### Rev 6.6 tracking refinements
+
+Rev 6.6 is based on correlated Rev 6.5 history/BVR evidence.
+
+- **Predictive fast follow:** a mature fast target can enter fractional continuous tracking before the old 0.35 moving-error threshold when a 0.45 s projection crosses center and exits the 0.22 safe region.
+- **Animal semantic continuity:** the default continuity group is now `dog,cat,bird,bear`; `person` remains intentionally excluded.
+- **Static hotspot guard:** repeated home-view acquisition boxes are learned within the tracker session. After three separated bursts, that fingerprint needs extra confirmation plus either meaningful motion or stronger confidence. It is not a permanent ignore zone.
+- **Local timestamps:** history `time`, status `status_time`, and `session_started` use a DST-aware local timezone. UTC companions remain available for precise BVR/tool correlation.
