@@ -61,7 +61,7 @@ class Rev62TrackingPerformanceTests(unittest.TestCase):
 
     def test_rev62_policy_remains_present_in_newer_patch(self):
         self.assertIn('"controller_revision": 6', TRACKER)
-        self.assertIn('"controller_patch": "6.6"', TRACKER)
+        self.assertIn('"controller_patch": "6.6.1"', TRACKER)
         self.assertIn('"active_chase_confidence_threshold"', TRACKER)
         self.assertIn('"native_max_chase_seconds"', TRACKER)
         self.assertIn('"fractional_max_chase_seconds": None', TRACKER)

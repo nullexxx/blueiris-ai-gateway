@@ -86,8 +86,48 @@ class Rev66PredictiveTrackingTests(unittest.TestCase):
         self.assertIn("if self._active_acquire_home_context and self._ptz_operation is None:", TRACKER)
         self.assertIn("self._home_sent = True", TRACKER)
 
+    def test_motion_aware_hold_keeps_chase_identity_when_projection_leaves_center(self):
+        hold, = load_functions("_servo_hold_action")
+        action = hold(
+            0.375, -0.083,
+            0.10, -0.04,
+            exit_error=0.22,
+            resume_growth=0.06,
+            elapsed_s=0.33,
+            hold_seconds=0.30,
+            frames=5,
+            min_frames=3,
+            projected_error_x=-0.31,
+            projected_error_y=-0.02,
+            max_hold_seconds=0.75,
+        )
+        self.assertEqual(action, "wait_motion")
+
+    def test_motion_aware_hold_still_settles_when_projection_remains_centered(self):
+        hold, = load_functions("_servo_hold_action")
+        action = hold(
+            0.24, 0.04,
+            0.10, 0.03,
+            exit_error=0.22,
+            resume_growth=0.06,
+            elapsed_s=0.33,
+            hold_seconds=0.30,
+            frames=5,
+            min_frames=3,
+            projected_error_x=0.15,
+            projected_error_y=0.04,
+            max_hold_seconds=0.75,
+        )
+        self.assertEqual(action, "settled")
+
+    def test_hold_resume_renews_divergence_grace(self):
+        self.assertIn("self._hybrid_divergence_grace_started_at = now", TRACKER)
+        self.assertIn("divergence_grace_anchor = max(", TRACKER)
+        self.assertIn('"servo_hold_motion_guard"', TRACKER)
+        self.assertIn('"divergence_grace_reset_ms"', TRACKER)
+
     def test_status_identifies_rev66(self):
-        self.assertIn('"controller_patch": "6.6"', TRACKER)
+        self.assertIn('"controller_patch": "6.6.1"', TRACKER)
         self.assertIn('"fast_follow_speed_norm"', TRACKER)
         self.assertIn('"static_acquisition_guard"', TRACKER)
 

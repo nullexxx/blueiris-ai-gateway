@@ -1195,8 +1195,16 @@ def _servo_hold_action(
     hold_seconds: float,
     frames: int,
     min_frames: int,
+    projected_error_x: float | None = None,
+    projected_error_y: float | None = None,
+    max_hold_seconds: float | None = None,
 ) -> str:
-    """Keep chase identity unless the target is genuinely settled near center."""
+    """Keep chase identity unless the target is genuinely settled near center.
+
+    Rev 6.6.1 adds a motion-aware hold guard. A target that is momentarily
+    centered but projected to leave the continuous-exit region remains in the
+    paused chase instead of paying a full stop/settle/velocity-relearn cycle.
+    """
     hx, hy = float(held_error_x), float(held_error_y)
     cx, cy = float(current_error_x), float(current_error_y)
     exit_mag = max(0.0, float(exit_error))
@@ -1212,6 +1220,21 @@ def _servo_hold_action(
         return "resume_growth"
     if float(elapsed_s) < float(hold_seconds) or int(frames) < int(min_frames):
         return "wait"
+
+    px = cx if projected_error_x is None else float(projected_error_x)
+    py = cy if projected_error_y is None else float(projected_error_y)
+    projected_dom = max(abs(px), abs(py))
+    hold_limit = (
+        float(hold_seconds)
+        if max_hold_seconds is None
+        else max(float(hold_seconds), float(max_hold_seconds))
+    )
+    if (
+        current_dom <= exit_mag
+        and projected_dom > exit_mag
+        and float(elapsed_s) < hold_limit
+    ):
+        return "wait_motion"
     if current_dom <= exit_mag:
         return "settled"
     return "resume_outside_exit"
@@ -1838,6 +1861,7 @@ class DogTracker:
         self._hybrid_pan_velocity = 0.0
         self._hybrid_tilt_velocity = 0.0
         self._hybrid_started_at = 0.0
+        self._hybrid_divergence_grace_started_at = 0.0
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_stopped_at = 0.0
 
@@ -1870,6 +1894,7 @@ class DogTracker:
         self._servo_hold_since: Optional[float] = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
+        self._servo_hold_motion_guard_logged = False
         self._native_edge_rescue_until = 0.0
         self._native_edge_rescue_started_at = 0.0
         self._native_edge_rescue_cooldown_until = 0.0
@@ -2163,6 +2188,7 @@ class DogTracker:
         self._hybrid_pan_velocity = 0.0
         self._hybrid_tilt_velocity = 0.0
         self._hybrid_started_at = 0.0
+        self._hybrid_divergence_grace_started_at = 0.0
         self._hybrid_last_command_at = 0.0
         self._hybrid_last_error = None
         self._hybrid_divergence_count = 0
@@ -2180,6 +2206,7 @@ class DogTracker:
         self._servo_hold_since = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
+        self._servo_hold_motion_guard_logged = False
         self._native_edge_rescue_until = 0.0
         self._native_edge_rescue_started_at = 0.0
         self._native_edge_rescue_cooldown_until = 0.0
@@ -3300,7 +3327,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.6 predictive follow + semantic continuity)")
+        self.logger.info("PTZ tracker STARTED (Rev6.6.1 motion-aware hold + renewed divergence grace)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3532,7 +3559,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.6",
+                    "controller_patch": "6.6.1",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
@@ -4400,6 +4427,7 @@ class DogTracker:
         self._hybrid_tilt_velocity = 0.0
         self._hybrid_actuator = "none"
         self._hybrid_started_at = 0.0
+        self._hybrid_divergence_grace_started_at = 0.0
         self._hybrid_last_command_at = t1
         self._hybrid_last_stopped_at = t1
         self._last_ptz_stopped_at = t1
@@ -4427,6 +4455,7 @@ class DogTracker:
         self._servo_hold_since = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
+        self._servo_hold_motion_guard_logged = False
         self._hybrid_pan_reverse_until = 0.0
         self._hybrid_tilt_reverse_until = 0.0
         self._precision_slow_since = None
@@ -4598,6 +4627,7 @@ class DogTracker:
         entering = not self._hybrid_chase_active
         if entering:
             self._hybrid_started_at = t1
+            self._hybrid_divergence_grace_started_at = t1
             self._hybrid_last_error = max(abs(error_x), abs(error_y))
             self._hybrid_divergence_count = 0
             self.hybrid_chase_entries += 1
@@ -4735,6 +4765,7 @@ class DogTracker:
         entering = not self._hybrid_chase_active
         if entering:
             self._hybrid_started_at = t1
+            self._hybrid_divergence_grace_started_at = t1
             self._hybrid_last_error = max(abs(error_x), abs(error_y))
             self._hybrid_divergence_count = 0
             self.hybrid_chase_entries += 1
@@ -4790,6 +4821,29 @@ class DogTracker:
             if self.target is not None and self.target.confidence < self._chase_detection_conf:
                 await self._stop_hybrid_chase("confidence_floor", seq=seq)
                 return
+
+            # During hold the actuator is paused, so bbox drift becomes a useful
+            # short-window estimate of subject motion. Use the same Rev 6.6
+            # fast-follow horizon to ask whether a currently centered target is
+            # likely to leave the inner region again before declaring it settled.
+            hold_rate_x = 0.0
+            hold_rate_y = 0.0
+            hold_speed_norm = 0.0
+            projected_hold_x = err_x
+            projected_hold_y = err_y
+            if hold_elapsed >= 0.10:
+                hold_rate_x = (err_x - self._servo_hold_error[0]) / hold_elapsed
+                hold_rate_y = (err_y - self._servo_hold_error[1]) / hold_elapsed
+                h, w = frame_shape[:2]
+                frame_diag = max(1.0, math.hypot(w, h))
+                hold_speed_norm = math.hypot(
+                    hold_rate_x * (float(w) / 2.0),
+                    hold_rate_y * (float(h) / 2.0),
+                ) / frame_diag
+                if hold_speed_norm >= self._fast_follow_speed_norm:
+                    projected_hold_x = err_x + hold_rate_x * self._fast_follow_horizon_s
+                    projected_hold_y = err_y + hold_rate_y * self._fast_follow_horizon_s
+
             hold_action = _servo_hold_action(
                 self._servo_hold_error[0],
                 self._servo_hold_error[1],
@@ -4801,6 +4855,9 @@ class DogTracker:
                 hold_seconds=self._servo_hold_seconds,
                 frames=self._servo_hold_frames,
                 min_frames=self._servo_hold_min_frames,
+                projected_error_x=projected_hold_x,
+                projected_error_y=projected_hold_y,
+                max_hold_seconds=self._servo_hold_seconds + self._fast_follow_horizon_s,
             )
             if hold_action.startswith("resume_"):
                 self._record_event(
@@ -4810,10 +4867,14 @@ class DogTracker:
                     frames=self._servo_hold_frames,
                     held_error=[round(self._servo_hold_error[0], 3), round(self._servo_hold_error[1], 3)],
                     current_error=[round(err_x, 3), round(err_y, 3)],
+                    projected_error=[round(projected_hold_x, 3), round(projected_hold_y, 3)],
+                    hold_speed_norm=round(hold_speed_norm, 4),
+                    divergence_grace_reset_ms=int(self._servo_divergence_grace * 1000),
                 )
                 self._servo_hold_since = None
                 self._servo_hold_frames = 0
                 self._servo_hold_error = (0.0, 0.0)
+                self._servo_hold_motion_guard_logged = False
                 self._seed_servo_feedback(frame_shape, now, err_x, err_y)
                 self._hybrid_last_error = dominant_error
                 self._hybrid_divergence_count = 0
@@ -4821,7 +4882,20 @@ class DogTracker:
                     "pan": {"last_error": err_x, "count": 0},
                     "tilt": {"last_error": err_y, "count": 0},
                 }
-            elif hold_action == "wait":
+                self._hybrid_divergence_grace_started_at = now
+            elif hold_action in ("wait", "wait_motion"):
+                if hold_action == "wait_motion" and not self._servo_hold_motion_guard_logged:
+                    self._servo_hold_motion_guard_logged = True
+                    self._record_event(
+                        "servo_hold_motion_guard",
+                        hold_ms=int(hold_elapsed * 1000),
+                        current_error=[round(err_x, 3), round(err_y, 3)],
+                        projected_error=[round(projected_hold_x, 3), round(projected_hold_y, 3)],
+                        hold_speed_norm=round(hold_speed_norm, 4),
+                        max_hold_ms=int(
+                            (self._servo_hold_seconds + self._fast_follow_horizon_s) * 1000
+                        ),
+                    )
                 self.state = "ESCAPE_CHASE"
                 return
             else:
@@ -5023,7 +5097,11 @@ class DogTracker:
                     )
                     return
 
-        if (now - self._hybrid_started_at) >= self._servo_divergence_grace:
+        divergence_grace_anchor = max(
+            self._hybrid_started_at,
+            self._hybrid_divergence_grace_started_at,
+        )
+        if (now - divergence_grace_anchor) >= self._servo_divergence_grace:
             pan_state = self._hybrid_axis_divergence["pan"]
             tilt_state = self._hybrid_axis_divergence["tilt"]
             pan_state["count"] = _servo_axis_divergence_count(
@@ -5079,6 +5157,7 @@ class DogTracker:
                 self._servo_hold_since = now
                 self._servo_hold_frames = 1
                 self._servo_hold_error = (err_x, err_y)
+                self._servo_hold_motion_guard_logged = False
                 self._hybrid_divergence_count = 0
                 self._hybrid_axis_divergence = {
                     "pan": {"last_error": err_x, "count": 0},
