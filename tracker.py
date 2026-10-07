@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import math
 import os
 import threading
@@ -111,6 +112,35 @@ def _env_int_list(name: str, default: List[int], low: int, high: int) -> List[in
             continue
         values.append(max(low, min(high, value)))
     return sorted(set(values or [max(low, min(high, int(v))) for v in default]))
+
+
+def _event_timezone(name: str):
+    requested = (name or "").strip() or "America/New_York"
+    try:
+        return requested, ZoneInfo(requested)
+    except ZoneInfoNotFoundError:
+        return "UTC", timezone.utc
+
+
+def _acquisition_hotspot_key(
+    bbox: Tuple[float, float, float, float],
+    frame_shape: Tuple[int, ...],
+    quantum: float = 0.025,
+) -> Tuple[int, int, int, int]:
+    """Quantize a box by normalized center and size for recurring-scene fingerprints."""
+    h, w = frame_shape[:2]
+    width = max(1.0, float(w))
+    height = max(1.0, float(h))
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    values = (
+        ((x1 + x2) * 0.5) / width,
+        ((y1 + y2) * 0.5) / height,
+        max(0.0, x2 - x1) / width,
+        max(0.0, y2 - y1) / height,
+    )
+    q = max(0.005, float(quantum))
+    return tuple(int(round(v / q)) for v in values)
+
 
 
 @dataclass
@@ -1247,6 +1277,9 @@ def _motion_control_decision(
     deadline_travel_norm,
     stationary_speed_norm,
     moving_error,
+    fast_follow_speed_norm,
+    fast_follow_horizon_s,
+    fast_follow_error,
 ):
     """Choose continuous chase vs slow/stationary precision positioning.
 
@@ -1285,11 +1318,33 @@ def _motion_control_decision(
     )
 
     projected_travel_norm = 0.0
+    future_error_x = float(err_x)
+    future_error_y = float(err_y)
     if velocity_mature:
         projected_travel_norm = max(
             abs(vx) * max(0.0, move_eta_s) / half_w,
             abs(vy) * max(0.0, move_eta_s) / half_h,
         )
+        future_error_x = float(err_x) + (float(vx) / half_w) * max(0.0, fast_follow_horizon_s)
+        future_error_y = float(err_y) + (float(vy) / half_h) * max(0.0, fast_follow_horizon_s)
+
+    fast_x = bool(
+        velocity_mature
+        and target_speed_norm >= fast_follow_speed_norm
+        and (
+            (err_x * future_error_x <= 0.0 and abs(future_error_x) >= fast_follow_error)
+            or (abs(err_x) >= fast_follow_error and err_x * vx > 0.0)
+        )
+    )
+    fast_y = bool(
+        velocity_mature
+        and target_speed_norm >= fast_follow_speed_norm
+        and (
+            (err_y * future_error_y <= 0.0 and abs(future_error_y) >= fast_follow_error)
+            or (abs(err_y) >= fast_follow_error and err_y * vy > 0.0)
+        )
+    )
+    fast_predictive_follow = bool(moving_target and (fast_x or fast_y))
 
     motion_escape = (
         moving_target
@@ -1317,11 +1372,13 @@ def _motion_control_decision(
         hybrid_enabled
         and not hybrid_disabled
         and cooldown_ready
-        and (edge_escape or hard_escape or motion_escape or deadline_escape)
+        and (fast_predictive_follow or edge_escape or hard_escape or motion_escape or deadline_escape)
     )
     reason = None
     if use_continuous:
-        if motion_escape:
+        if fast_predictive_follow:
+            reason = "fast_predictive_follow"
+        elif motion_escape:
             reason = "motion_escape"
         elif deadline_escape:
             reason = "deadline_motion"
@@ -1349,6 +1406,9 @@ def _motion_control_decision(
         "moving_target": moving_target,
         "target_speed_norm": target_speed_norm,
         "projected_travel_norm": projected_travel_norm,
+        "future_error_x": future_error_x,
+        "future_error_y": future_error_y,
+        "fast_predictive_follow": fast_predictive_follow,
         "moving_outward": moving_outward,
         "moving_inward_dominant": moving_inward_dominant,
         "motion_escape": motion_escape,
@@ -1476,6 +1536,15 @@ class DogTracker:
         )
         self._motion_control_moving_error = max(
             0.18, min(0.60, _env_float("TRACKER_MOTION_CONTROL_MOVING_ERROR", 0.35))
+        )
+        self._fast_follow_speed_norm = max(
+            0.04, min(0.50, _env_float("TRACKER_FAST_FOLLOW_SPEED_NORM", 0.10))
+        )
+        self._fast_follow_horizon_s = max(
+            0.20, min(1.00, _env_float("TRACKER_FAST_FOLLOW_HORIZON", 0.45))
+        )
+        self._fast_follow_error = max(
+            0.15, min(0.40, _env_float("TRACKER_FAST_FOLLOW_ERROR", 0.22))
         )
         self._motion_control_continuous_exit_error = max(
             0.12, min(0.45, _env_float("TRACKER_MOTION_CONTROL_CONTINUOUS_EXIT_ERROR", 0.22))
@@ -1639,7 +1708,7 @@ class DogTracker:
             min(0.45, _env_float("TRACKER_ONVIF_SERVO_CALIBRATION_DURATION", 0.22)),
         )
 
-        continuity_default = "dog,cat,bird"
+        continuity_default = "dog,cat,bird,bear"
         self._class_continuity_labels = {
             token.strip().lower()
             for token in os.getenv("TRACKER_CLASS_CONTINUITY_LABELS", continuity_default).split(",")
@@ -1653,6 +1722,30 @@ class DogTracker:
         )
         self._class_switch_min_hits = max(
             2, min(8, _env_int("TRACKER_CLASS_SWITCH_MIN_HITS", 2))
+        )
+
+        self._static_hotspot_guard_enabled = _env_bool("TRACKER_STATIC_HOTSPOT_GUARD_ENABLED", True)
+        self._static_hotspot_window_s = max(
+            300.0, min(86400.0, _env_float("TRACKER_STATIC_HOTSPOT_WINDOW", 43200.0))
+        )
+        self._static_hotspot_min_separation_s = max(
+            5.0, min(600.0, _env_float("TRACKER_STATIC_HOTSPOT_MIN_SEPARATION", 30.0))
+        )
+        self._static_hotspot_bursts = max(
+            2, min(8, _env_int("TRACKER_STATIC_HOTSPOT_BURSTS", 3))
+        )
+        self._static_hotspot_extra_frames = max(
+            1, min(8, _env_int("TRACKER_STATIC_HOTSPOT_EXTRA_FRAMES", 3))
+        )
+        self._static_hotspot_motion_threshold = max(
+            0.005, min(0.10, _env_float("TRACKER_STATIC_HOTSPOT_MOTION_NORM", 0.025))
+        )
+        self._static_hotspot_override_conf = max(
+            self.cfg.acquire_conf,
+            min(0.95, _env_float("TRACKER_STATIC_HOTSPOT_OVERRIDE_CONF", 0.70)),
+        )
+        self._static_hotspot_block_s = max(
+            1.0, min(60.0, _env_float("TRACKER_STATIC_HOTSPOT_BLOCK_SECONDS", 12.0))
         )
 
         self.active = False
@@ -1795,6 +1888,17 @@ class DogTracker:
         self._servo_last_telemetry_at = 0.0
         self._servo_last_decision: Dict[str, object] = {}
         self._class_evidence: Deque[Tuple[float, str, int, float]] = deque(maxlen=32)
+        self._acquisition_hotspot_bursts: Deque[Tuple[float, Tuple[int, int, int, int]]] = deque(maxlen=128)
+        self._static_hotspot_blocked_until: Dict[Tuple[int, int, int, int], float] = {}
+        self._active_acquire_required_hits = self.cfg.acquire_frames
+        self._active_acquire_hotspot_key: Optional[Tuple[int, int, int, int]] = None
+        self._active_acquire_hotspot_suspicious = False
+        self._active_acquire_start_center: Optional[Tuple[float, float]] = None
+        self._active_acquire_prior_bursts = 0
+        self._event_timezone_name, self._event_tz = _event_timezone(
+            os.getenv("TRACKER_EVENT_TIMEZONE", os.getenv("TZ", "America/New_York"))
+        )
+        self._session_started_utc: Optional[str] = None
 
         self.total_inferences = 0
         self.frames_skipped_gpu_busy = 0
@@ -1810,8 +1914,10 @@ class DogTracker:
         self.home_returns = 0
 
     def _record_event(self, event: str, **fields) -> None:
+        wall_utc = datetime.now(timezone.utc)
         item = {
-            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "time": wall_utc.astimezone(self._event_tz).isoformat(timespec="milliseconds"),
+            "time_utc": wall_utc.isoformat(timespec="milliseconds"),
             "event": event,
             "state": self.state,
         }
@@ -1820,6 +1926,60 @@ class DogTracker:
         item.update(fields)
         self._history.append(item)
 
+    def _clear_active_acquisition_guard(self) -> None:
+        self._active_acquire_required_hits = self.cfg.acquire_frames
+        self._active_acquire_hotspot_key = None
+        self._active_acquire_hotspot_suspicious = False
+        self._active_acquire_start_center = None
+        self._active_acquire_prior_bursts = 0
+
+    def _begin_acquisition_guard(self, det: Detection, frame_shape: Tuple[int, ...], now: float) -> None:
+        self._clear_active_acquisition_guard()
+        self._active_acquire_start_center = det.center
+        if not self._static_hotspot_guard_enabled or not self._home_sent:
+            return
+        key = _acquisition_hotspot_key(det.bbox, frame_shape)
+        cutoff = now - self._static_hotspot_window_s
+        while self._acquisition_hotspot_bursts and self._acquisition_hotspot_bursts[0][0] < cutoff:
+            self._acquisition_hotspot_bursts.popleft()
+        same = [t for t, k in self._acquisition_hotspot_bursts if k == key]
+        if not same or (now - same[-1]) >= self._static_hotspot_min_separation_s:
+            self._acquisition_hotspot_bursts.append((now, key))
+            same.append(now)
+        self._active_acquire_hotspot_key = key
+        self._active_acquire_prior_bursts = max(0, len(same) - 1)
+        if len(same) >= self._static_hotspot_bursts:
+            self._active_acquire_hotspot_suspicious = True
+            self._active_acquire_required_hits = self.cfg.acquire_frames + self._static_hotspot_extra_frames
+            self._record_event(
+                "acquire_static_hotspot_suspected",
+                label=det.label,
+                confidence=round(det.confidence, 3),
+                hotspot_key=list(key),
+                distinct_bursts=len(same),
+                required_hits=self._active_acquire_required_hits,
+            )
+
+    def _static_hotspot_candidate_blocked(self, det: Detection, frame_shape: Tuple[int, ...], now: float) -> bool:
+        if not self._static_hotspot_guard_enabled or not self._home_sent:
+            return False
+        key = _acquisition_hotspot_key(det.bbox, frame_shape)
+        until = self._static_hotspot_blocked_until.get(key, 0.0)
+        if until <= now:
+            self._static_hotspot_blocked_until.pop(key, None)
+            return False
+        return det.confidence < self._static_hotspot_override_conf
+
+    def _static_hotspot_observed_motion(self, current_center: Tuple[float, float], frame_shape: Tuple[int, ...]) -> float:
+        if self._active_acquire_start_center is None:
+            return 0.0
+        h, w = frame_shape[:2]
+        diag = max(1.0, math.hypot(w, h))
+        return math.hypot(
+            current_center[0] - self._active_acquire_start_center[0],
+            current_center[1] - self._active_acquire_start_center[1],
+        ) / diag
+
     def history(self, limit: int = 200) -> dict:
         limit = max(1, min(int(limit), self.cfg.history_size))
         events = list(self._history)[-limit:]
@@ -1827,6 +1987,8 @@ class DogTracker:
             "active": self.active,
             "state": self.state,
             "session_started": self._session_started_wall,
+            "session_started_utc": self._session_started_utc,
+            "event_timezone": self._event_timezone_name,
             "event_count": len(self._history),
             "returned": len(events),
             "events": events,
@@ -2032,6 +2194,7 @@ class DogTracker:
         self._servo_last_telemetry_at = 0.0
         self._servo_last_decision = {}
         self._class_evidence.clear()
+        self._clear_active_acquisition_guard()
         self._move_failure_count = 0
         self._move_retry_after = 0.0
         self._smart_history.clear()
@@ -3099,7 +3262,11 @@ class DogTracker:
         lockout_reason = self._ptz_command_lockout_reason
         self._session_generation += 1
         self._history.clear()
-        self._session_started_wall = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._acquisition_hotspot_bursts.clear()
+        self._static_hotspot_blocked_until.clear()
+        started_utc = datetime.now(timezone.utc)
+        self._session_started_wall = started_utc.astimezone(self._event_tz).isoformat(timespec="seconds")
+        self._session_started_utc = started_utc.isoformat(timespec="seconds")
         self._session_started_mono = time.monotonic()
         self._stop_reason = None
         self._last_task_error = None
@@ -3129,7 +3296,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6 fractional servo + settled velocity rebase)")
+        self.logger.info("PTZ tracker STARTED (Rev6.6 predictive follow + semantic continuity)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3276,10 +3443,15 @@ class DogTracker:
             op_timeout_remaining_ms = max(0, int((self._ptz_operation_deadline - now) * 1000))
 
         post_frames_remaining = max(0, self._post_motion_release_seq - seq)
+        status_utc = datetime.now(timezone.utc)
         return {
             "enabled": self.cfg.enabled,
             "active": self.active,
+            "status_time": status_utc.astimezone(self._event_tz).isoformat(timespec="milliseconds"),
+            "status_time_utc": status_utc.isoformat(timespec="milliseconds"),
+            "event_timezone": self._event_timezone_name,
             "session_started": self._session_started_wall,
+            "session_started_utc": self._session_started_utc,
             "stop_reason": self._stop_reason,
             "ptz_command_lockout": self._ptz_command_lockout,
             "ptz_command_lockout_reason": self._ptz_command_lockout_reason,
@@ -3356,12 +3528,15 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.5",
+                    "controller_patch": "6.6",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
                     "moving_entry_error": round(self._motion_control_moving_error, 3),
+                    "fast_follow_speed_norm": round(self._fast_follow_speed_norm, 4),
+                    "fast_follow_horizon_s": round(self._fast_follow_horizon_s, 3),
+                    "fast_follow_error": round(self._fast_follow_error, 3),
                     "continuous_exit_error": round(self._motion_control_continuous_exit_error, 3),
                     "post_chase_precision_holdoff_s": round(self._post_chase_precision_holdoff, 3),
                     "confidence_grace_s": round(self._hybrid_confidence_grace, 3),
@@ -3440,6 +3615,18 @@ class DogTracker:
                         "vote_window_s": round(self._class_vote_window, 3),
                         "switch_ratio": round(self._class_switch_ratio, 3),
                         "switch_min_hits": self._class_switch_min_hits,
+                    },
+                    "static_acquisition_guard": {
+                        "enabled": self._static_hotspot_guard_enabled,
+                        "window_s": round(self._static_hotspot_window_s, 1),
+                        "min_separation_s": round(self._static_hotspot_min_separation_s, 1),
+                        "bursts_required": self._static_hotspot_bursts,
+                        "extra_frames": self._static_hotspot_extra_frames,
+                        "motion_norm": round(self._static_hotspot_motion_threshold, 4),
+                        "override_confidence": round(self._static_hotspot_override_conf, 3),
+                        "block_seconds": round(self._static_hotspot_block_s, 1),
+                        "learned_bursts": len(self._acquisition_hotspot_bursts),
+                        "active_suspicious": self._active_acquire_hotspot_suspicious,
                     },
                     "precision_hold_until_ms": max(0, int((self._precision_hold_until - now) * 1000)),
                     "move_direct_predictive_lead": False,
@@ -5408,10 +5595,12 @@ class DogTracker:
             return
 
         if self.target is None:
+            h, w = frame.shape[:2]
             candidates = [
                 d for d in detections
                 if d.confidence >= self.cfg.acquire_conf
                 and self._acquisition_zones.allows(d.center, frame.shape)
+                and not self._static_hotspot_candidate_blocked(d, frame.shape, now)
             ]
             if not candidates:
                 self.state = "HOME" if self._home_sent else "SEARCHING"
@@ -5419,7 +5608,6 @@ class DogTracker:
                 self._last_error_y = None
                 return
 
-            h, w = frame.shape[:2]
             frame_area = max(1.0, float(h * w))
 
             def acquisition_key(det: Detection) -> Tuple[int, float]:
@@ -5428,6 +5616,7 @@ class DogTracker:
                 return (-rank, quality)
 
             chosen = max(candidates, key=acquisition_key)
+            self._begin_acquisition_guard(chosen, frame.shape, now)
             self._trusted_velocity = None
             self._association_motion_start_center = None
             self._association_motion_end_center = None
@@ -5477,7 +5666,7 @@ class DogTracker:
 
         if (
             matched is not None
-            and self.target.acquire_hits < self.cfg.acquire_frames
+            and self.target.acquire_hits < self._active_acquire_required_hits
             and matched.confidence < self.cfg.acquire_conf
         ):
             self._last_association_diagnostic = {
@@ -5491,7 +5680,7 @@ class DogTracker:
         if matched is not None:
             self._hybrid_missing_coast_since = None
             self._hybrid_missing_coast_velocity = (0.0, 0.0)
-            was_acquiring = self.target.acquire_hits < self.cfg.acquire_frames
+            was_acquiring = self.target.acquire_hits < self._active_acquire_required_hits
 
             ptz_ready = self._ptz_action_ready(seq)
             rebasing_velocity = (
@@ -5579,11 +5768,33 @@ class DogTracker:
             if self._ptz_operation is not None:
                 self._target_seen_during_ptz_operation = True
 
-            if was_acquiring and self.target.acquire_hits < self.cfg.acquire_frames:
+            if was_acquiring and self.target.acquire_hits < self._active_acquire_required_hits:
                 self.state = "ACQUIRE"
                 return
 
-            if was_acquiring and self.target.acquire_hits == self.cfg.acquire_frames:
+            if was_acquiring and self.target.acquire_hits == self._active_acquire_required_hits:
+                if self._active_acquire_hotspot_suspicious:
+                    motion_norm = self._static_hotspot_observed_motion(self.target.center, frame.shape)
+                    if (
+                        self.target.confidence < self._static_hotspot_override_conf
+                        and motion_norm < self._static_hotspot_motion_threshold
+                    ):
+                        key = self._active_acquire_hotspot_key
+                        if key is not None:
+                            self._static_hotspot_blocked_until[key] = now + self._static_hotspot_block_s
+                        self._record_event(
+                            "acquire_static_hotspot_rejected",
+                            label=self.target.label,
+                            confidence=round(self.target.confidence, 3),
+                            motion_norm=round(motion_norm, 4),
+                            hotspot_key=None if key is None else list(key),
+                            prior_bursts=self._active_acquire_prior_bursts,
+                            blocked_ms=int(self._static_hotspot_block_s * 1000),
+                        )
+                        self.target = None
+                        self.state = "SEARCHING"
+                        self._clear_active_acquisition_guard()
+                        return
                 self.targets_acquired += 1
                 self._record_event(
                     "target_acquired",
@@ -5597,6 +5808,7 @@ class DogTracker:
                     self.target.confidence,
                     tuple(round(v, 1) for v in self.target.bbox),
                 )
+                self._clear_active_acquisition_guard()
 
             self.state = "ESCAPE_CHASE" if self._hybrid_chase_active else (
                 "PTZ_MOVING" if self._ptz_operation is not None else (
@@ -5641,11 +5853,24 @@ class DogTracker:
             await self._drive_to_target(frame.shape, seq, now, generation)
             return
 
-        if self.target.acquire_hits < self.cfg.acquire_frames:
+        if self.target.acquire_hits < self._active_acquire_required_hits:
             if self._hybrid_chase_active:
                 await self._stop_hybrid_chase("acquire_dropped", seq=seq, force=True)
             self._record_event("acquire_dropped", label=self.target.label, hits=self.target.acquire_hits)
+            if self._active_acquire_hotspot_suspicious and self._active_acquire_hotspot_key is not None:
+                block_s = min(5.0, self._static_hotspot_block_s)
+                self._static_hotspot_blocked_until[self._active_acquire_hotspot_key] = now + block_s
+                self._record_event(
+                    "acquire_static_hotspot_rejected",
+                    label=self.target.label,
+                    confidence=round(self.target.confidence, 3),
+                    reason="unstable_confirmation",
+                    hotspot_key=list(self._active_acquire_hotspot_key),
+                    prior_bursts=self._active_acquire_prior_bursts,
+                    blocked_ms=int(block_s * 1000),
+                )
             self.target = None
+            self._clear_active_acquisition_guard()
             self.state = "SEARCHING"
             return
 
@@ -6061,12 +6286,16 @@ class DogTracker:
                 deadline_travel_norm=self._motion_control_deadline_travel,
                 stationary_speed_norm=self._motion_control_stationary_speed_norm,
                 moving_error=self._motion_control_moving_error,
+                fast_follow_speed_norm=self._fast_follow_speed_norm,
+                fast_follow_horizon_s=self._fast_follow_horizon_s,
+                fast_follow_error=self._fast_follow_error,
             )
             target_speed_norm = float(control_decision["target_speed_norm"])
             moving_outward = bool(control_decision["moving_outward"])
             moving_inward_dominant = bool(control_decision["moving_inward_dominant"])
             motion_escape = bool(control_decision["motion_escape"])
             deadline_escape = bool(control_decision["deadline_escape"])
+            fast_predictive_follow = bool(control_decision["fast_predictive_follow"])
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
                 self._precision_slow_since = None
@@ -6114,6 +6343,11 @@ class DogTracker:
                     target_speed_norm=round(target_speed_norm, 4),
                     velocity_mature=bool(control_decision["velocity_mature"]),
                     projected_travel_norm=round(float(control_decision["projected_travel_norm"]), 4),
+                    future_error=[
+                        round(float(control_decision["future_error_x"]), 3),
+                        round(float(control_decision["future_error_y"]), 3),
+                    ],
+                    fast_predictive_follow=fast_predictive_follow,
                     deadline_escape=deadline_escape,
                     moving_outward=bool(moving_outward),
                     moving_inward_dominant=bool(moving_inward_dominant),
