@@ -64,7 +64,7 @@ class Rev63TrackingRefinementTests(unittest.TestCase):
         self.assertIn('"reacquire_confidence_gate"', process)
 
     def test_rev63_policy_remains_present_in_newer_patch(self):
-        self.assertIn('"controller_patch": "6.6.1"', TRACKER)
+        self.assertIn('"controller_patch": "6.6.2"', TRACKER)
         self.assertIn('"target_release_timeout_s"', TRACKER)
         self.assertIn('"brake_velocity_extension_s"', TRACKER)
         self.assertIn('"last_association_diagnostic"', TRACKER)
