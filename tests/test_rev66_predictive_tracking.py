@@ -127,9 +127,10 @@ class Rev66PredictiveTrackingTests(unittest.TestCase):
         self.assertIn("divergence_grace_reset_ms=", TRACKER)
 
     def test_status_identifies_rev66(self):
-        self.assertIn('"controller_patch": "6.6.1"', TRACKER)
+        self.assertIn('"controller_patch": "6.6.2"', TRACKER)
         self.assertIn('"fast_follow_speed_norm"', TRACKER)
         self.assertIn('"static_acquisition_guard"', TRACKER)
+        self.assertIn('"divergence_min_camera_shift_px"', TRACKER)
 
 
 if __name__ == "__main__":

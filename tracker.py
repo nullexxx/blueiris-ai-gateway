@@ -1163,8 +1163,18 @@ def _servo_axis_divergence_count(
     desired_rate: float,
     previous_count: int,
     growth: float,
+    *,
+    camera_shift: float | None = None,
+    min_camera_shift: float = 0.75,
 ) -> int:
-    """Count only same-side worsening while this axis is actively correcting."""
+    """Count only proven wrong-direction camera response while error worsens.
+
+    A fast subject can legitimately make image error grow even while the camera
+    is correcting in the right direction. Global background motion is masked
+    around detections and gives the missing physical evidence: calibration
+    defines image-space correction as -scene_shift, so a correct camera response
+    has scene shift opposite the controller's desired image-space rate.
+    """
     if previous_error is None:
         return 0
     prev = float(previous_error)
@@ -1175,6 +1185,13 @@ def _servo_axis_divergence_count(
     if prev == 0.0 or cur == 0.0 or ((prev > 0.0) != (cur > 0.0)):
         return 0
     if cur * desired <= 0.0:
+        return 0
+    if camera_shift is None:
+        return 0
+    shift = float(camera_shift)
+    if not math.isfinite(shift) or abs(shift) < max(0.0, float(min_camera_shift)):
+        return 0
+    if shift * desired <= 0.0:
         return 0
     if abs(cur) > abs(prev) + max(0.0, float(growth)):
         return max(0, int(previous_count)) + 1
@@ -1698,6 +1715,9 @@ class DogTracker:
         self._servo_accel_step = max(1, min(3, _env_int("TRACKER_SERVO_ACCEL_STEP", 1)))
         self._servo_divergence_grace = max(
             0.20, min(2.0, _env_float("TRACKER_SERVO_DIVERGENCE_GRACE", 0.80))
+        )
+        self._servo_divergence_min_camera_shift_px = max(
+            0.10, min(5.0, _env_float("TRACKER_SERVO_DIVERGENCE_MIN_CAMERA_SHIFT_PX", 0.75))
         )
         self._servo_post_stop_settle_s = max(
             0.15, min(1.50, _env_float("TRACKER_SERVO_POST_STOP_SETTLE", 0.35))
@@ -3327,7 +3347,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.6.1 motion-aware hold + renewed divergence grace)")
+        self.logger.info("PTZ tracker STARTED (Rev6.6.2 camera-response divergence + rescue handoff)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3559,7 +3579,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.6.1",
+                    "controller_patch": "6.6.2",
                     "strategy": "fractional_servo_settled_velocity_semantic_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
@@ -3624,6 +3644,9 @@ class DogTracker:
                         "start_speed_max": self._servo_start_speed_max,
                         "accel_step": self._servo_accel_step,
                         "divergence_grace_s": round(self._servo_divergence_grace, 3),
+                        "divergence_min_camera_shift_px": round(
+                            self._servo_divergence_min_camera_shift_px, 3
+                        ),
                         "post_stop_settle_s": round(self._servo_post_stop_settle_s, 3),
                         "post_stop_settle_remaining_ms": max(
                             0, int((self._continuous_settle_until - now) * 1000)
@@ -4680,9 +4703,15 @@ class DogTracker:
             return False
         if not self._servo_onvif_available:
             return False
-        if self._hybrid_actuator == "native_discrete":
+        switching_from_native = self._hybrid_actuator == "native_discrete"
+        if switching_from_native:
             if not await self._pause_hybrid_actuator("switch_to_onvif"):
                 return False
+            # The native->ONVIF rescue handoff must bypass the normal command
+            # interval. The pause refreshed _hybrid_last_command_at; throttling
+            # here would leave the chase marked native for one more frame and
+            # allow the native max-duration watchdog to kill a fractional chase.
+            force_command = True
 
         limit = self._servo_onvif_max_velocity
         raw_desired = (
@@ -5104,13 +5133,23 @@ class DogTracker:
         if (now - divergence_grace_anchor) >= self._servo_divergence_grace:
             pan_state = self._hybrid_axis_divergence["pan"]
             tilt_state = self._hybrid_axis_divergence["tilt"]
+            camera_pan_shift = (
+                None if self._camera_motion is None else float(self._camera_motion.dx)
+            )
+            camera_tilt_shift = (
+                None if self._camera_motion is None else float(self._camera_motion.dy)
+            )
             pan_state["count"] = _servo_axis_divergence_count(
                 pan_state["last_error"], err_x, float(pan_meta.get("desired_rate") or 0.0),
                 pan_state["count"], self.cfg.hybrid_divergence_growth,
+                camera_shift=camera_pan_shift,
+                min_camera_shift=self._servo_divergence_min_camera_shift_px,
             )
             tilt_state["count"] = _servo_axis_divergence_count(
                 tilt_state["last_error"], err_y, float(tilt_meta.get("desired_rate") or 0.0),
                 tilt_state["count"], self.cfg.hybrid_divergence_growth,
+                camera_shift=camera_tilt_shift,
+                min_camera_shift=self._servo_divergence_min_camera_shift_px,
             )
             pan_state["last_error"] = err_x
             tilt_state["last_error"] = err_y
@@ -5137,6 +5176,22 @@ class DogTracker:
                     session_disabled=trip,
                     actuator=self._hybrid_actuator,
                     pan_sign=self.cfg.hybrid_chase_pan_sign,
+                    desired_rate=round(
+                        float(
+                            (pan_meta if axis == "pan" else tilt_meta).get("desired_rate")
+                            or 0.0
+                        ),
+                        4,
+                    ),
+                    camera_shift_px=round(
+                        float(camera_pan_shift if axis == "pan" else camera_tilt_shift),
+                        3,
+                    ),
+                    camera_motion=(
+                        None if self._camera_motion is None
+                        else self._camera_motion.public_dict()
+                    ),
+                    divergence_evidence="wrong_direction_camera_motion",
                 )
                 await self._stop_hybrid_chase(
                     "repeated_divergence" if trip else "diverging", seq=seq, force=True
