@@ -65,7 +65,7 @@ class Rev65TrackingResilienceTests(unittest.TestCase):
         self.assertIn("self._native_edge_rescue_cooldown_until",chase)
         self.assertIn("self._native_edge_rescue_started_at <= 0.0",chase)
         self.assertIn("camera_shift=camera_pan_shift",chase)
-        self.assertIn('divergence_evidence="wrong_direction_camera_motion"',chase)
+        self.assertIn('divergence_evidence="armed_wrong_direction_camera_motion"',chase)
         self.assertLess(
             chase.index('reason="duration_expired"'),
             chase.index("pan_rescue_requested = ("),
