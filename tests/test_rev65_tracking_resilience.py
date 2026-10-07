@@ -77,7 +77,7 @@ class Rev65TrackingResilienceTests(unittest.TestCase):
             self.assertIn(token,associate)
 
     def test_status_identifies_rev65(self):
-        self.assertIn('"controller_patch": "6.6.2"',TRACKER)
+        self.assertIn('"controller_patch": "6.7.0"',TRACKER)
         self.assertIn('"axis_divergence_counts"',TRACKER)
         self.assertIn('"native_edge_rescue"',TRACKER)
 
