@@ -1737,6 +1737,13 @@ class DogTracker:
         self._servo_divergence_cooldown_s = max(
             0.25, min(5.0, _env_float("TRACKER_SERVO_DIVERGENCE_COOLDOWN", 0.75))
         )
+        self._servo_divergence_escalated_cooldown_s = max(
+            self._servo_divergence_cooldown_s,
+            min(
+                10.0,
+                _env_float("TRACKER_SERVO_DIVERGENCE_ESCALATED_COOLDOWN", 2.0),
+            ),
+        )
         self._servo_telemetry_interval = max(
             0.10, min(1.0, _env_float("TRACKER_SERVO_TELEMETRY_INTERVAL", 0.20))
         )
@@ -1911,6 +1918,34 @@ class DogTracker:
         self._hybrid_axis_divergence = {
             "pan": {"last_error": None, "count": 0},
             "tilt": {"last_error": None, "count": 0},
+        }
+        self._servo_axis_response = {
+            "pan": {
+                "correction_sign": 0,
+                "changed_at": 0.0,
+                "armed": False,
+                "confirmed_at": 0.0,
+            },
+            "tilt": {
+                "correction_sign": 0,
+                "changed_at": 0.0,
+                "armed": False,
+                "confirmed_at": 0.0,
+            },
+        }
+        self._servo_axis_response = {
+            "pan": {
+                "correction_sign": 0,
+                "changed_at": 0.0,
+                "armed": False,
+                "confirmed_at": 0.0,
+            },
+            "tilt": {
+                "correction_sign": 0,
+                "changed_at": 0.0,
+                "armed": False,
+                "confirmed_at": 0.0,
+            },
         }
         self._hybrid_divergence_strikes: Deque[float] = deque(maxlen=16)
         self._hybrid_recover_after = 0.0
@@ -3363,7 +3398,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.7.0 axis-latched rescue + frozen loss clock)")
+        self.logger.info("PTZ tracker STARTED (Rev6.7.1 response-armed divergence + frozen loss clock)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3595,8 +3630,8 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.7.0",
-                    "strategy": "fractional_servo_axis_latched_rescue_frozen_loss_clock",
+                    "controller_patch": "6.7.1",
+                    "strategy": "fractional_servo_response_armed_divergence_frozen_loss_clock",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -3683,6 +3718,41 @@ class DogTracker:
                         ),
                         "divergence_strikes": len(self._hybrid_divergence_strikes),
                         "divergence_trip_limit": self._servo_divergence_trip_limit,
+                        "divergence_session_disable": False,
+                        "divergence_escalated_cooldown_s": round(
+                            self._servo_divergence_escalated_cooldown_s, 3
+                        ),
+                        "axis_response": {
+                            axis: {
+                                "correction_sign": int(
+                                    state.get("correction_sign", 0) or 0
+                                ),
+                                "armed": bool(state.get("armed")),
+                                "command_age_ms": (
+                                    0
+                                    if float(state.get("changed_at", 0.0)) <= 0.0
+                                    else int(
+                                        max(
+                                            0.0,
+                                            now - float(state.get("changed_at", now)),
+                                        )
+                                        * 1000
+                                    )
+                                ),
+                                "confirmed_age_ms": (
+                                    None
+                                    if float(state.get("confirmed_at", 0.0)) <= 0.0
+                                    else int(
+                                        max(
+                                            0.0,
+                                            now - float(state.get("confirmed_at", now)),
+                                        )
+                                        * 1000
+                                    )
+                                ),
+                            }
+                            for axis, state in self._servo_axis_response.items()
+                        },
                         "divergence_recovery_remaining_ms": max(
                             0, int((self._hybrid_recover_after - now) * 1000)
                         ),
@@ -4462,6 +4532,7 @@ class DogTracker:
         self._hybrid_pan_velocity = 0.0
         self._hybrid_tilt_velocity = 0.0
         self._hybrid_last_command_at = t1
+        self._reset_servo_response_monitor()
         self._reset_servo_feedback()
         return True
 
@@ -4554,9 +4625,12 @@ class DogTracker:
         self._hybrid_pan_reverse_until = 0.0
         self._hybrid_tilt_reverse_until = 0.0
         self._precision_slow_since = None
+        self._reset_servo_response_monitor()
         self._reset_servo_feedback()
 
         if was_active:
+            if reason in ("safe_inner_region", "servo_hold_settled"):
+                self._hybrid_divergence_strikes.clear()
             self._scene_stability.reset(t1)
             self._scene_stable_ready = False
             self._velocity_learning_ready = False
@@ -4582,6 +4656,95 @@ class DogTracker:
                     seq + self.cfg.hybrid_chase_settle_frames,
                 )
         return True
+
+    @staticmethod
+    def _servo_command_sign(value: float) -> int:
+        if not math.isfinite(float(value)) or abs(float(value)) <= 1e-6:
+            return 0
+        return 1 if float(value) > 0.0 else -1
+
+    def _reset_servo_response_monitor(self) -> None:
+        for axis in ("pan", "tilt"):
+            state = self._servo_axis_response[axis]
+            state["correction_sign"] = 0
+            state["changed_at"] = 0.0
+            state["armed"] = False
+            state["confirmed_at"] = 0.0
+
+    def _note_servo_applied_command(
+        self,
+        axis: str,
+        camera_command: float,
+        now: float,
+    ) -> int:
+        state = self._servo_axis_response[axis]
+        mapping_sign = self._active_calibration.onvif_continuous_sign(axis, 1)
+        command_sign = self._servo_command_sign(camera_command)
+        correction_sign = command_sign * mapping_sign
+        previous_sign = int(state.get("correction_sign", 0) or 0)
+        if correction_sign != previous_sign:
+            state["correction_sign"] = correction_sign
+            state["changed_at"] = float(now)
+            state["armed"] = False
+            state["confirmed_at"] = 0.0
+            self._hybrid_axis_divergence[axis] = {"last_error": None, "count": 0}
+            self._record_event(
+                "servo_axis_command_direction",
+                axis=axis,
+                previous_correction_sign=previous_sign,
+                correction_sign=correction_sign,
+                camera_command=round(float(camera_command), 5),
+                response_armed=False,
+            )
+        return correction_sign
+
+    def _servo_axis_response_ready(
+        self,
+        axis: str,
+        camera_shift: Optional[float],
+        now: float,
+    ) -> bool:
+        state = self._servo_axis_response[axis]
+        correction_sign = int(state.get("correction_sign", 0) or 0)
+        if correction_sign == 0:
+            return False
+        if bool(state.get("armed")):
+            return True
+        if camera_shift is None:
+            return False
+        shift = float(camera_shift)
+        if (
+            not math.isfinite(shift)
+            or abs(shift) < self._servo_divergence_min_camera_shift_px
+        ):
+            return False
+
+        # A correct camera response moves the background opposite the desired
+        # image-space correction. After a reversal, residual inertia can keep
+        # the scene moving in the old direction for several frames. Do not arm
+        # divergence monitoring until the estimator proves the new command has
+        # physically taken effect.
+        if shift * correction_sign >= 0.0:
+            return False
+
+        state["armed"] = True
+        state["confirmed_at"] = float(now)
+        self._hybrid_axis_divergence[axis] = {"last_error": None, "count": 0}
+        self._record_event(
+            "servo_axis_response_armed",
+            axis=axis,
+            correction_sign=correction_sign,
+            camera_shift_px=round(shift, 3),
+            takeup_ms=int(
+                max(
+                    0.0,
+                    float(now) - float(state.get("changed_at", now)),
+                )
+                * 1000
+            ),
+        )
+        # The confirmation sample itself is not divergence evidence.
+        return False
 
     def _apply_axis_reversal_holdoff(
         self,
@@ -4888,6 +5051,8 @@ class DogTracker:
         self._hybrid_tilt_speed = 0
         self._hybrid_pan_velocity = float(desired[0])
         self._hybrid_tilt_velocity = float(desired[1])
+        self._note_servo_applied_command("pan", desired[0], t1)
+        self._note_servo_applied_command("tilt", desired[1], t1)
         self._hybrid_last_command_at = t1
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
@@ -5309,67 +5474,142 @@ class DogTracker:
             camera_tilt_shift = (
                 None if self._camera_motion is None else float(self._camera_motion.dy)
             )
-            pan_state["count"] = _servo_axis_divergence_count(
-                pan_state["last_error"], err_x, float(pan_meta.get("desired_rate") or 0.0),
-                pan_state["count"], self.cfg.hybrid_divergence_growth,
-                camera_shift=camera_pan_shift,
-                min_camera_shift=self._servo_divergence_min_camera_shift_px,
+
+            pan_ready = self._servo_axis_response_ready(
+                "pan", camera_pan_shift, now
             )
-            tilt_state["count"] = _servo_axis_divergence_count(
-                tilt_state["last_error"], err_y, float(tilt_meta.get("desired_rate") or 0.0),
-                tilt_state["count"], self.cfg.hybrid_divergence_growth,
-                camera_shift=camera_tilt_shift,
-                min_camera_shift=self._servo_divergence_min_camera_shift_px,
+            tilt_ready = self._servo_axis_response_ready(
+                "tilt", camera_tilt_shift, now
+            )
+            pan_applied_sign = int(
+                self._servo_axis_response["pan"].get("correction_sign", 0) or 0
+            )
+            tilt_applied_sign = int(
+                self._servo_axis_response["tilt"].get("correction_sign", 0) or 0
+            )
+
+            pan_state["count"] = (
+                _servo_axis_divergence_count(
+                    pan_state["last_error"],
+                    err_x,
+                    float(pan_applied_sign),
+                    pan_state["count"],
+                    self.cfg.hybrid_divergence_growth,
+                    camera_shift=camera_pan_shift,
+                    min_camera_shift=self._servo_divergence_min_camera_shift_px,
+                )
+                if pan_ready else 0
+            )
+            tilt_state["count"] = (
+                _servo_axis_divergence_count(
+                    tilt_state["last_error"],
+                    err_y,
+                    float(tilt_applied_sign),
+                    tilt_state["count"],
+                    self.cfg.hybrid_divergence_growth,
+                    camera_shift=camera_tilt_shift,
+                    min_camera_shift=self._servo_divergence_min_camera_shift_px,
+                )
+                if tilt_ready else 0
             )
             pan_state["last_error"] = err_x
             tilt_state["last_error"] = err_y
-            self._hybrid_divergence_count = max(int(pan_state["count"]), int(tilt_state["count"]))
+            self._hybrid_divergence_count = max(
+                int(pan_state["count"]), int(tilt_state["count"])
+            )
             if self._hybrid_divergence_count >= self.cfg.hybrid_divergence_frames:
-                axis = "pan" if int(pan_state["count"]) >= int(tilt_state["count"]) else "tilt"
+                axis = (
+                    "pan"
+                    if int(pan_state["count"]) >= int(tilt_state["count"])
+                    else "tilt"
+                )
                 count = int(self._hybrid_axis_divergence[axis]["count"])
                 cutoff = now - self._servo_divergence_window_s
-                while self._hybrid_divergence_strikes and self._hybrid_divergence_strikes[0] < cutoff:
+                while (
+                    self._hybrid_divergence_strikes
+                    and self._hybrid_divergence_strikes[0] < cutoff
+                ):
                     self._hybrid_divergence_strikes.popleft()
                 self._hybrid_divergence_strikes.append(now)
                 strikes = len(self._hybrid_divergence_strikes)
-                trip = strikes >= self._servo_divergence_trip_limit
-                self._hybrid_disabled_for_session = trip
-                self._hybrid_recover_after = max(self._hybrid_recover_after, now + self._servo_divergence_cooldown_s)
+                repeated = strikes >= self._servo_divergence_trip_limit
+                cooldown_s = (
+                    self._servo_divergence_escalated_cooldown_s
+                    if repeated
+                    else self._servo_divergence_cooldown_s
+                )
+                self._hybrid_recover_after = max(
+                    self._hybrid_recover_after, now + cooldown_s
+                )
+                response_state = self._servo_axis_response[axis]
                 self._record_event(
                     "hybrid_chase_diverging",
                     axis=axis,
                     error=round(err_x if axis == "pan" else err_y, 3),
-                    axis_counts={"pan": int(pan_state["count"]), "tilt": int(tilt_state["count"])},
+                    axis_counts={
+                        "pan": int(pan_state["count"]),
+                        "tilt": int(tilt_state["count"]),
+                    },
                     consecutive_growth_frames=count,
                     strikes_in_window=strikes,
                     trip_limit=self._servo_divergence_trip_limit,
-                    session_disabled=trip,
+                    repeated=repeated,
+                    session_disabled=False,
+                    recovery_cooldown_ms=int(cooldown_s * 1000),
                     actuator=self._hybrid_actuator,
                     pan_sign=self.cfg.hybrid_chase_pan_sign,
+                    applied_correction_sign=int(
+                        response_state.get("correction_sign", 0) or 0
+                    ),
+                    response_armed=bool(response_state.get("armed")),
+                    command_age_ms=int(
+                        max(
+                            0.0,
+                            now - float(response_state.get("changed_at", now)),
+                        )
+                        * 1000
+                    ),
                     desired_rate=round(
                         float(
-                            (pan_meta if axis == "pan" else tilt_meta).get("desired_rate")
+                            (pan_meta if axis == "pan" else tilt_meta).get(
+                                "desired_rate"
+                            )
                             or 0.0
                         ),
                         4,
                     ),
                     camera_shift_px=round(
-                        float(camera_pan_shift if axis == "pan" else camera_tilt_shift),
+                        float(
+                            camera_pan_shift
+                            if axis == "pan"
+                            else camera_tilt_shift
+                        ),
                         3,
                     ),
                     camera_motion=(
-                        None if self._camera_motion is None
+                        None
+                        if self._camera_motion is None
                         else self._camera_motion.public_dict()
                     ),
-                    divergence_evidence="wrong_direction_camera_motion",
+                    divergence_evidence="armed_wrong_direction_camera_motion",
                 )
                 await self._stop_hybrid_chase(
-                    "repeated_divergence" if trip else "diverging", seq=seq, force=True
+                    "repeated_divergence_cooldown"
+                    if repeated
+                    else "diverging",
+                    seq=seq,
+                    force=True,
                 )
                 return
         else:
-            self._hybrid_axis_divergence["pan"] = {"last_error": err_x, "count": 0}
-            self._hybrid_axis_divergence["tilt"] = {"last_error": err_y, "count": 0}
+            self._hybrid_axis_divergence["pan"] = {
+                "last_error": err_x,
+                "count": 0,
+            }
+            self._hybrid_axis_divergence["tilt"] = {
+                "last_error": err_y,
+                "count": 0,
+            }
             self._hybrid_divergence_count = 0
 
         self._hybrid_last_error = dominant_error
