@@ -1685,6 +1685,12 @@ class DogTracker:
         self._native_edge_rescue_cooldown = max(
             0.0, min(1.0, _env_float("TRACKER_NATIVE_EDGE_RESCUE_COOLDOWN", 0.25))
         )
+        self._native_edge_rescue_progress_check_s = max(
+            0.08, min(0.40, _env_float("TRACKER_NATIVE_EDGE_RESCUE_PROGRESS_CHECK", 0.15))
+        )
+        self._native_edge_rescue_min_improvement = max(
+            0.0, min(0.15, _env_float("TRACKER_NATIVE_EDGE_RESCUE_MIN_IMPROVEMENT", 0.01))
+        )
         self._native_edge_rescue_min_speed = max(
             self.cfg.hybrid_chase_min_speed,
             min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_EDGE_RESCUE_MIN_SPEED", 3)),
@@ -1742,7 +1748,7 @@ class DogTracker:
         )
         self._servo_onvif_calibration_velocities = _env_float_list(
             "TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES",
-            [0.04, 0.08, 0.16],
+            [0.04, 0.08, 0.12, 0.16, 0.24, 0.32],
             0.02,
             0.50,
         )
@@ -1829,6 +1835,8 @@ class DogTracker:
         self._post_motion_release_seq = -1
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        self._loss_clock_pause_started_at = None
+        self._loss_clock_paused_s = 0.0
         self._velocity_rebase_required = False
         self._velocity_learning_ready = True
         self._velocity_stable_frames = self._scene_stability.required_frames
@@ -1918,6 +1926,9 @@ class DogTracker:
         self._native_edge_rescue_until = 0.0
         self._native_edge_rescue_started_at = 0.0
         self._native_edge_rescue_cooldown_until = 0.0
+        self._native_edge_rescue_axes = set()
+        self._native_edge_rescue_start_errors = {"pan": 0.0, "tilt": 0.0}
+        self._native_edge_rescue_last_progress_at = 0.0
         self._precision_hold_until = 0.0
         self._precision_slow_since: Optional[float] = None
         self._precision_defer_reason: Optional[str] = None
@@ -2194,6 +2205,8 @@ class DogTracker:
         self._post_motion_release_seq = -1
         self._target_seen_during_ptz_operation = False
         self._loss_pause_logged = False
+        self._loss_clock_pause_started_at = None
+        self._loss_clock_paused_s = 0.0
         self._velocity_rebase_required = False
         self._velocity_learning_ready = True
         self._velocity_stable_frames = self._scene_stability.required_frames
@@ -2230,6 +2243,9 @@ class DogTracker:
         self._native_edge_rescue_until = 0.0
         self._native_edge_rescue_started_at = 0.0
         self._native_edge_rescue_cooldown_until = 0.0
+        self._native_edge_rescue_axes = set()
+        self._native_edge_rescue_start_errors = {"pan": 0.0, "tilt": 0.0}
+        self._native_edge_rescue_last_progress_at = 0.0
         self._precision_hold_until = 0.0
         self._precision_slow_since = None
         self._precision_defer_reason = None
@@ -3347,7 +3363,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.6.2 camera-response divergence + rescue handoff)")
+        self.logger.info("PTZ tracker STARTED (Rev6.7.0 axis-latched rescue + frozen loss clock)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3579,8 +3595,8 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.6.2",
-                    "strategy": "fractional_servo_settled_velocity_semantic_continuity",
+                    "controller_patch": "6.7.0",
+                    "strategy": "fractional_servo_axis_latched_rescue_frozen_loss_clock",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -3598,6 +3614,17 @@ class DogTracker:
                     "fractional_max_chase_seconds": None,
                     "missing_grace_s": round(self._hybrid_missing_grace, 3),
                     "target_release_timeout_s": round(self._target_release_timeout, 3),
+                    "loss_clock_paused": self._loss_clock_pause_started_at is not None,
+                    "loss_clock_paused_ms": int(
+                        max(
+                            0.0,
+                            (
+                                (now - self._loss_clock_pause_started_at)
+                                if self._loss_clock_pause_started_at is not None
+                                else 0.0
+                            ) + self._loss_clock_paused_s,
+                        ) * 1000
+                    ),
                     "retention_detection_conf": round(self._retention_detection_conf, 3),
                     "chase_detection_conf": round(self._chase_detection_conf, 3),
                     "target_retention_grace_s": round(self._target_retention_grace, 3),
@@ -3625,8 +3652,11 @@ class DogTracker:
                         "native_edge_rescue": {
                             "enabled": self._native_edge_rescue_enabled,
                             "active": now < self._native_edge_rescue_until,
+                            "active_axes": sorted(self._native_edge_rescue_axes),
                             "remaining_ms": max(0, int((self._native_edge_rescue_until - now) * 1000)),
                             "cooldown_remaining_ms": max(0, int((self._native_edge_rescue_cooldown_until - now) * 1000)),
+                            "progress_check_s": round(self._native_edge_rescue_progress_check_s, 3),
+                            "min_improvement": round(self._native_edge_rescue_min_improvement, 4),
                             "error": round(self._native_edge_rescue_error, 3),
                             "exit_error": round(self._native_edge_rescue_exit_error, 3),
                             "full_error": round(self._native_edge_rescue_full_error, 3),
@@ -3935,6 +3965,49 @@ class DogTracker:
         self._servo_feedforward_started_at = 0.0
         self._servo_last_telemetry_at = 0.0
         self._servo_last_decision = {}
+
+    def _reset_loss_clock(self) -> None:
+        self._loss_clock_pause_started_at = None
+        self._loss_clock_paused_s = 0.0
+
+    def _pause_loss_clock(self, now: float) -> None:
+        if self._loss_clock_pause_started_at is None:
+            self._loss_clock_pause_started_at = float(now)
+
+    def _resume_loss_clock(self, now: float) -> None:
+        if self._loss_clock_pause_started_at is None:
+            return
+        self._loss_clock_paused_s += max(
+            0.0, float(now) - self._loss_clock_pause_started_at
+        )
+        self._loss_clock_pause_started_at = None
+
+    def _target_missing_seconds(self, now: float) -> float:
+        if self.target is None:
+            return 0.0
+        paused_s = self._loss_clock_paused_s
+        if self._loss_clock_pause_started_at is not None:
+            paused_s += max(
+                0.0, float(now) - self._loss_clock_pause_started_at
+            )
+        return max(0.0, float(now) - self.target.last_seen - paused_s)
+
+    def _clear_native_edge_rescue(
+        self,
+        now: Optional[float] = None,
+        *,
+        cooldown: bool = False,
+    ) -> None:
+        self._native_edge_rescue_until = 0.0
+        self._native_edge_rescue_started_at = 0.0
+        self._native_edge_rescue_axes.clear()
+        self._native_edge_rescue_start_errors = {"pan": 0.0, "tilt": 0.0}
+        self._native_edge_rescue_last_progress_at = 0.0
+        if cooldown and now is not None:
+            self._native_edge_rescue_cooldown_until = max(
+                self._native_edge_rescue_cooldown_until,
+                float(now) + self._native_edge_rescue_cooldown,
+            )
 
     def _seed_servo_feedback(
         self,
@@ -4468,8 +4541,7 @@ class DogTracker:
             "pan": {"last_error": None, "count": 0},
             "tilt": {"last_error": None, "count": 0},
         }
-        self._native_edge_rescue_until = 0.0
-        self._native_edge_rescue_started_at = 0.0
+        self._clear_native_edge_rescue()
         self._native_edge_rescue_cooldown_until = 0.0
         self._hybrid_low_confidence_since = None
         self._hybrid_confidence_coast_velocity = (0.0, 0.0)
@@ -4671,6 +4743,18 @@ class DogTracker:
             self._velocity_rebase_required = True
         self._association_motion_start_center = None
         self._association_motion_end_center = None
+        self._record_event(
+            "ptz_command_applied",
+            source=(
+                "native_edge_rescue"
+                if self._native_edge_rescue_axes
+                else "hybrid_chase"
+            ),
+            actuator="native_discrete",
+            command=[command_pan, command_tilt],
+            error=[round(error_x, 3), round(error_y, 3)],
+            http_ms=int((t1 - t0) * 1000),
+        )
         if entering or desired_int != current_int:
             self._record_event(
                 "hybrid_chase_move",
@@ -4815,6 +4899,14 @@ class DogTracker:
             self._velocity_rebase_required = True
         self._association_motion_start_center = None
         self._association_motion_end_center = None
+        self._record_event(
+            "ptz_command_applied",
+            source="hybrid_servo",
+            actuator="onvif_fractional",
+            command=[round(desired[0], 5), round(desired[1], 5)],
+            error=[round(error_x, 3), round(error_y, 3)],
+            http_ms=int((t1 - t0) * 1000),
+        )
         if entering or not same_velocity:
             self._record_event(
                 "hybrid_chase_move",
@@ -4986,12 +5078,7 @@ class DogTracker:
                         target_span=target_span,
                     )
                 else:
-                    self._native_edge_rescue_until = 0.0
-                    self._native_edge_rescue_started_at = 0.0
-                    self._native_edge_rescue_cooldown_until = max(
-                        self._native_edge_rescue_cooldown_until,
-                        now + self._native_edge_rescue_cooldown,
-                    )
+                    self._clear_native_edge_rescue(now, cooldown=True)
                     await self._pause_hybrid_actuator("confidence_grace_native")
                 self.state = "ESCAPE_CHASE"
                 return
@@ -5018,12 +5105,11 @@ class DogTracker:
             self._record_event(
                 "native_edge_rescue_exit",
                 reason="duration_expired",
+                axes=sorted(self._native_edge_rescue_axes),
                 elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
                 error=[round(err_x, 3), round(err_y, 3)],
             )
-            self._native_edge_rescue_until = 0.0
-            self._native_edge_rescue_started_at = 0.0
-            self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
+            self._clear_native_edge_rescue(now, cooldown=True)
 
         pan_rescue_requested = (
             self._native_edge_rescue_enabled
@@ -5056,21 +5142,35 @@ class DogTracker:
             )
         )
 
-        rescue_active = now < self._native_edge_rescue_until
+        requested_axes = {
+            axis for axis, requested in (
+                ("pan", pan_rescue_requested),
+                ("tilt", tilt_rescue_requested),
+            ) if requested
+        }
+        axis_errors = {"pan": err_x, "tilt": err_y}
+        rescue_active = (
+            now < self._native_edge_rescue_until
+            and bool(self._native_edge_rescue_axes)
+        )
         rescue_entering = False
-        if (pan_rescue_requested or tilt_rescue_requested) and not rescue_active:
+        added_axes = set()
+        axes_changed = False
+
+        if requested_axes and not rescue_active:
             rescue_entering = True
             rescue_active = True
+            axes_changed = True
+            self._native_edge_rescue_axes = set(requested_axes)
+            self._native_edge_rescue_start_errors = {
+                axis: float(axis_errors[axis]) for axis in ("pan", "tilt")
+            }
             self._native_edge_rescue_started_at = now
+            self._native_edge_rescue_last_progress_at = now
             self._native_edge_rescue_until = now + self._native_edge_rescue_seconds
             self._record_event(
                 "native_edge_rescue_enter",
-                axes=[
-                    axis for axis, requested in (
-                        ("pan", pan_rescue_requested),
-                        ("tilt", tilt_rescue_requested),
-                    ) if requested
-                ],
+                axes=sorted(self._native_edge_rescue_axes),
                 error=[round(err_x, 3), round(err_y, 3)],
                 fractional_velocity=[
                     round(float(pan_meta.get("onvif_velocity") or 0.0), 5),
@@ -5079,32 +5179,100 @@ class DogTracker:
                 saturation=round(self._native_edge_rescue_saturation, 3),
                 duration_ms=int(self._native_edge_rescue_seconds * 1000),
             )
-
-        if rescue_active:
-            if dominant_error <= self._native_edge_rescue_exit_error:
+        elif rescue_active:
+            added_axes = requested_axes - self._native_edge_rescue_axes
+            if added_axes:
+                axes_changed = True
+                for axis in added_axes:
+                    self._native_edge_rescue_axes.add(axis)
+                    self._native_edge_rescue_start_errors[axis] = float(axis_errors[axis])
+                self._native_edge_rescue_last_progress_at = now
                 self._record_event(
-                    "native_edge_rescue_exit",
-                    reason="inside_exit_region",
-                    elapsed_ms=int(max(0.0, now - self._native_edge_rescue_started_at) * 1000),
+                    "native_edge_rescue_axis_added",
+                    axes=sorted(added_axes),
+                    active_axes=sorted(self._native_edge_rescue_axes),
                     error=[round(err_x, 3), round(err_y, 3)],
                 )
-                self._native_edge_rescue_until = 0.0
-                self._native_edge_rescue_started_at = 0.0
-                self._native_edge_rescue_cooldown_until = now + self._native_edge_rescue_cooldown
-            else:
-                rescue_pan = _native_edge_rescue_speed(
-                    err_x,
-                    start_error=self._native_edge_rescue_exit_error,
-                    full_error=self._native_edge_rescue_full_error,
-                    min_speed=self._native_edge_rescue_min_speed,
-                    max_speed=self._native_edge_rescue_max_speed,
+
+        if rescue_active:
+            settled_axes = {
+                axis for axis in self._native_edge_rescue_axes
+                if abs(float(axis_errors[axis])) <= self._native_edge_rescue_exit_error
+            }
+            if settled_axes:
+                axes_changed = True
+                self._native_edge_rescue_axes.difference_update(settled_axes)
+                self._record_event(
+                    "native_edge_rescue_axis_complete",
+                    axes=sorted(settled_axes),
+                    active_axes=sorted(self._native_edge_rescue_axes),
+                    error=[round(err_x, 3), round(err_y, 3)],
                 )
-                rescue_tilt = _native_edge_rescue_speed(
-                    err_y,
-                    start_error=self._native_edge_rescue_exit_error,
-                    full_error=self._native_edge_rescue_full_error,
-                    min_speed=self._native_edge_rescue_min_speed,
-                    max_speed=self._native_edge_rescue_max_speed,
+
+            if (
+                self._native_edge_rescue_axes
+                and (now - self._native_edge_rescue_last_progress_at)
+                    >= self._native_edge_rescue_progress_check_s
+            ):
+                stalled_axes = []
+                improvements = {}
+                for axis in sorted(self._native_edge_rescue_axes):
+                    start_error = float(self._native_edge_rescue_start_errors.get(axis, 0.0))
+                    current_error = float(axis_errors[axis])
+                    improvement = abs(start_error) - abs(current_error)
+                    improvements[axis] = round(improvement, 4)
+                    if improvement < self._native_edge_rescue_min_improvement:
+                        stalled_axes.append(axis)
+                    else:
+                        self._native_edge_rescue_start_errors[axis] = current_error
+                self._native_edge_rescue_last_progress_at = now
+                if stalled_axes:
+                    axes_changed = True
+                    self._native_edge_rescue_axes.difference_update(stalled_axes)
+                    self._record_event(
+                        "native_edge_rescue_progress_abort",
+                        axes=sorted(stalled_axes),
+                        active_axes=sorted(self._native_edge_rescue_axes),
+                        improvements=improvements,
+                        required_improvement=round(
+                            self._native_edge_rescue_min_improvement, 4
+                        ),
+                        elapsed_ms=int(
+                            max(0.0, now - self._native_edge_rescue_started_at) * 1000
+                        ),
+                    )
+
+            if not self._native_edge_rescue_axes:
+                self._record_event(
+                    "native_edge_rescue_exit",
+                    reason="axes_complete_or_stalled",
+                    elapsed_ms=int(
+                        max(0.0, now - self._native_edge_rescue_started_at) * 1000
+                    ),
+                    error=[round(err_x, 3), round(err_y, 3)],
+                )
+                self._clear_native_edge_rescue(now, cooldown=True)
+                rescue_active = False
+            else:
+                rescue_pan = (
+                    _native_edge_rescue_speed(
+                        err_x,
+                        start_error=self._native_edge_rescue_exit_error,
+                        full_error=self._native_edge_rescue_full_error,
+                        min_speed=self._native_edge_rescue_min_speed,
+                        max_speed=self._native_edge_rescue_max_speed,
+                    )
+                    if "pan" in self._native_edge_rescue_axes else 0
+                )
+                rescue_tilt = (
+                    _native_edge_rescue_speed(
+                        err_y,
+                        start_error=self._native_edge_rescue_exit_error,
+                        full_error=self._native_edge_rescue_full_error,
+                        min_speed=self._native_edge_rescue_min_speed,
+                        max_speed=self._native_edge_rescue_max_speed,
+                    )
+                    if "tilt" in self._native_edge_rescue_axes else 0
                 )
                 if rescue_pan != 0 or rescue_tilt != 0:
                     self._hybrid_divergence_count = 0
@@ -5112,7 +5280,9 @@ class DogTracker:
                         "pan": {"last_error": err_x, "count": 0},
                         "tilt": {"last_error": err_y, "count": 0},
                     }
-                    pan_sign = self._active_calibration.continuous_sign("pan", self.cfg.hybrid_chase_pan_sign)
+                    pan_sign = self._active_calibration.continuous_sign(
+                        "pan", self.cfg.hybrid_chase_pan_sign
+                    )
                     tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
                     await self._set_hybrid_chase_speed(
                         pan_sign * rescue_pan,
@@ -5122,7 +5292,7 @@ class DogTracker:
                         error_x=err_x,
                         error_y=err_y,
                         target_span=target_span,
-                        force_command=rescue_entering,
+                        force_command=rescue_entering or axes_changed,
                     )
                     return
 
@@ -5380,6 +5550,7 @@ class DogTracker:
             self.target.last_seen = now
             self.target.last_update = now
             self.target.clear_velocity()
+            self._reset_loss_clock()
             self._velocity_rebase_required = True
 
         self._ptz_operation = None
@@ -5768,6 +5939,7 @@ class DogTracker:
                 last_seen=now,
                 acquire_hits=1,
             )
+            self._reset_loss_clock()
             self._bbox_motion.reset(chosen.bbox, now)
             self._last_velocity_geometry = None
             self._smart_history.clear()
@@ -5786,7 +5958,7 @@ class DogTracker:
 
         matched = self._associate(detections, frame.shape, now)
         if matched is not None and self.state in ("COAST", "REACQUIRE", "LOST"):
-            missing_for_match = max(0.0, now - self.target.last_seen)
+            missing_for_match = self._target_missing_seconds(now)
             required_conf = (
                 self._retention_detection_conf
                 if missing_for_match <= self._target_retention_grace
@@ -5882,6 +6054,7 @@ class DogTracker:
                 preserve_velocity=preserve_velocity,
                 allow_class_mismatch=True,
             )
+            self._reset_loss_clock()
             self._smart_history.add(now, matched.bbox, matched.confidence, frame.shape)
             if self._ptz_operation is None and ptz_ready and not self._frame_sharpness_ok:
                 self.state = "PTZ_SETTLING"
@@ -6022,6 +6195,7 @@ class DogTracker:
             hybrid_missing_for = max(0.0, now - self.target.last_seen)
             if hybrid_missing_for <= self._hybrid_missing_grace:
                 if self._hybrid_missing_coast_since is None:
+                    self._pause_loss_clock(self.target.last_seen)
                     self._hybrid_missing_coast_since = now
                     self._hybrid_missing_coast_velocity = (
                         self._hybrid_pan_velocity,
@@ -6053,12 +6227,7 @@ class DogTracker:
                         target_span=self._last_target_span or 0.0,
                     )
                 else:
-                    self._native_edge_rescue_until = 0.0
-                    self._native_edge_rescue_started_at = 0.0
-                    self._native_edge_rescue_cooldown_until = max(
-                        self._native_edge_rescue_cooldown_until,
-                        now + self._native_edge_rescue_cooldown,
-                    )
+                    self._clear_native_edge_rescue(now, cooldown=True)
                     await self._pause_hybrid_actuator("missing_detection_grace")
                 self.state = "ESCAPE_CHASE"
                 return
@@ -6074,6 +6243,7 @@ class DogTracker:
         # the subject is gone. Pause the loss state machine until PTZ idle + fresh
         # post-move frames, with ptz_operation_timeout as the hard safety bound.
         if self._ptz_operation in ("move", "zoom") or not self._ptz_action_ready(seq):
+            self._pause_loss_clock(now)
             self.state = "PTZ_MOVING" if self._ptz_operation is not None else "PTZ_SETTLING"
             if not self._loss_pause_logged:
                 self._record_event(
@@ -6086,7 +6256,8 @@ class DogTracker:
                 self._loss_pause_logged = True
             return
 
-        missing_for = now - self.target.last_seen
+        self._resume_loss_clock(now)
+        missing_for = self._target_missing_seconds(now)
         if missing_for <= self.cfg.coast_time:
             if self.state != "COAST":
                 self._record_event(
@@ -6124,6 +6295,7 @@ class DogTracker:
             return
 
         old_label = self.target.label
+        self._reset_loss_clock()
         self.target = None
         self._last_error_x = None
         self._last_error_y = None
