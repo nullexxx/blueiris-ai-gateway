@@ -73,3 +73,16 @@ Rev 6.5 fixes two state-machine errors exposed by Rev 6.4 and adds a narrowly ga
 - Servo hold may settle only when current dominant error is inside the normal continuous-exit region. A center crossing that remains off-center, or an expired hold still outside the exit region, resumes the chase without the full settle/velocity-relearn cycle.
 - Association diagnostics include `nearest_any` and up to three candidate records with label, confidence, distance, IoU, size similarity, distance-gate status, and semantic compatibility.
 - Native edge rescue is not a replacement controller. It can start only when a near-edge axis is still escaping and the fractional ONVIF request is near saturation (or projected to the extreme edge). One burst lasts at most 0.35 seconds, is followed by a 0.25-second fractional cooldown, uses native speed 3 normally and speed 6 only at extreme error, and detector loss stops it immediately.
+
+
+## Rev 6.6: predictive follow and detector-noise hardening
+
+Rev 6.6 leaves the Rev 6.5 servo gains, braking, per-axis divergence, hold, and native edge-rescue tuning unchanged.
+
+Fast subjects can now enter fractional ContinuousMove before the normal moving-error threshold. A 0.45-second short-horizon projection detects center crossings that would otherwise put a fast dog near the opposite frame edge before the camera begins following.
+
+The default semantic continuity group is `dog,cat,bird,bear`, matching observed dog↔bear and bird↔dog↔cat classification flicker. Person remains excluded.
+
+A session-local static-hotspot guard fingerprints recurring home-view boxes. Suspicious boxes require extra confirmation and either motion or higher confidence; rejected fingerprints are only temporarily blocked.
+
+Event history and status now use DST-aware local time (default `America/New_York`) while retaining explicit UTC fields.
