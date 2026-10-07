@@ -93,12 +93,13 @@ class Rev6ControllerTests(unittest.TestCase):
         self.assertIn("time.monotonic() >= self._continuous_settle_until", TRACKER)
         self.assertIn('"camera_settling"', TRACKER)
 
-    def test_divergence_uses_strikes_before_session_disable(self):
+    def test_divergence_uses_strikes_for_escalated_cooldown_without_session_disable(self):
         self.assertIn("TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT", TRACKER)
         self.assertIn("self._hybrid_divergence_strikes.append(now)", TRACKER)
-        self.assertIn("trip = strikes >= self._servo_divergence_trip_limit", TRACKER)
-        self.assertIn("self._hybrid_disabled_for_session = trip", TRACKER)
-        self.assertIn('"repeated_divergence" if trip else "diverging"', TRACKER)
+        self.assertIn("repeated = strikes >= self._servo_divergence_trip_limit", TRACKER)
+        self.assertNotIn("self._hybrid_disabled_for_session = trip", TRACKER)
+        self.assertIn("self._servo_divergence_escalated_cooldown_s", TRACKER)
+        self.assertIn('"repeated_divergence_cooldown"', TRACKER)
 
     def test_fractional_onvif_runtime_and_calibration_contracts(self):
         self.assertIn("async def continuous_move(self, pan: float, tilt: float)", ACTIVE_CAL)
