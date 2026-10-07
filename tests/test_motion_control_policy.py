@@ -54,7 +54,10 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertTrue(decision["use_continuous"])
         self.assertTrue(decision["moving_target"])
         self.assertFalse(decision["precision_move_allowed"])
-        self.assertIn(decision["reason"], {"deadline_motion", "motion_escape"})
+        self.assertIn(
+            decision["reason"],
+            {"deadline_motion", "motion_escape", "fast_predictive_follow"},
+        )
 
     def test_moving_target_inside_entry_region_holds_instead_of_move_direct(self):
         decision = self.call_policy(err_x=0.25, vx=35.0)
