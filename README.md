@@ -266,9 +266,10 @@ Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 | `TRACKER_HYBRID_DIVERGENCE_FRAMES` | `3` | Consecutive materially-worsening chase frames before the chase is aborted. |
 | `TRACKER_HYBRID_DIVERGENCE_GROWTH` | `0.05` | Minimum normalized error growth that counts toward divergence. |
 | `TRACKER_SERVO_POST_STOP_SETTLE` | `0.35` | Minimum physical quiet time after continuous PTZ stops before velocity can be rebased. |
-| `TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT` | `3` | Divergence strikes required within the rolling window before continuous tracking is disabled for the session. |
+| `TRACKER_SERVO_DIVERGENCE_TRIP_LIMIT` | `3` | Divergence strikes within the rolling window that trigger the longer recovery cooldown. Rev 6.7.1 no longer disables continuous tracking for the entire session. |
 | `TRACKER_SERVO_DIVERGENCE_WINDOW` | `30` | Seconds in the rolling divergence strike window. |
-| `TRACKER_SERVO_DIVERGENCE_COOLDOWN` | `0.75` | Recovery cooldown after a single aborted divergent chase. |
+| `TRACKER_SERVO_DIVERGENCE_COOLDOWN` | `0.75` | Recovery cooldown after a single proven divergent chase. |
+| `TRACKER_SERVO_DIVERGENCE_ESCALATED_COOLDOWN` | `2.0` | Longer recovery cooldown after the rolling divergence strike limit is reached. |
 
 ### PTZ Operation Settling
 
@@ -334,7 +335,7 @@ GitHub Actions builds `latest` and a commit-SHA-tagged image on every push to `m
 
 ### Additional tracker reliability notes
 
-The RTSP reader uses OpenCV/FFmpeg open and read timeouts (`TRACKER_RTSP_OPEN_TIMEOUT` / `TRACKER_RTSP_READ_TIMEOUT`) so a stalled stream can reconnect instead of blocking forever. Debug JPEGs are rendered only when `/v1/tracker/debug.jpg` is requested. Tracker sessions use a generation token so results from inference or PTZ calls that complete after `/stop` or `/home` are discarded. Lost-target home commands are retried a bounded number of times (`TRACKER_HOME_RETRY_ATTEMPTS`, `TRACKER_HOME_RETRY_DELAY`). Hybrid chase disables itself for the remainder of the session if tracking error grows materially for several consecutive frames, then falls back to normal `moveDirectly`.
+The RTSP reader uses OpenCV/FFmpeg open and read timeouts (`TRACKER_RTSP_OPEN_TIMEOUT` / `TRACKER_RTSP_READ_TIMEOUT`) so a stalled stream can reconnect instead of blocking forever. Debug JPEGs are rendered only when `/v1/tracker/debug.jpg` is requested. Tracker sessions use a generation token so results from inference or PTZ calls that complete after `/stop` or `/home` are discarded. Lost-target home commands are retried a bounded number of times (`TRACKER_HOME_RETRY_ATTEMPTS`, `TRACKER_HOME_RETRY_DELAY`). Rev 6.7.1 arms divergence monitoring per axis only after background motion proves the latest applied camera direction has physically taken effect. A proven divergent chase is stopped and cooled down; repeated strikes extend the cooldown rather than disabling moving-target control for the remainder of the session. A failed PTZ stop remains fail-closed and enters command lockout.
 
 
 ### PTZ active calibration
@@ -352,3 +353,10 @@ Rev 6.6 is based on correlated Rev 6.5 history/BVR evidence.
 - **Animal semantic continuity:** the default continuity group is now `dog,cat,bird,bear`; `person` remains intentionally excluded.
 - **Static hotspot guard:** repeated home-view acquisition boxes are learned within the tracker session. After three separated bursts, that fingerprint needs extra confirmation plus either meaningful motion or stronger confidence. It is not a permanent ignore zone.
 - **Local timestamps:** history `time`, status `status_time`, and `session_started` use a DST-aware local timezone. UTC companions remain available for precise BVR/tool correlation.
+
+
+### Rev 6.7.1 divergence-response hardening
+
+Rev 6.7.1 treats camera inertia during command reversals as a first-class controller state. Each fractional ONVIF axis records the direction of the command that was actually accepted by the camera. After that direction changes, divergence monitoring remains disarmed until background motion is observed in the expected physical direction. This prevents residual motion from the previous command from being misclassified as a new wrong-direction response.
+
+Divergence strikes are now recoverable control events. A proven strike stops the current chase and applies the normal cooldown; repeated strikes inside the rolling window apply the escalated cooldown but do not permanently disable continuous tracking. Successful convergence clears accumulated strikes.
