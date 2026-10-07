@@ -249,11 +249,6 @@ class SceneStabilityGate:
         if not self.active:
             return True
         elapsed = max(0.0, float(now) - self.started_at)
-        if elapsed >= self.max_wait_s:
-            self.active = False
-            self.timed_out = True
-            self.last_reason = "bounded_timeout"
-            return True
         h, w = frame_shape[:2]
         diag = max(1.0, math.hypot(w, h))
         if motion is None:
@@ -270,6 +265,11 @@ class SceneStabilityGate:
         if self.stable_frames >= self.required_frames:
             self.active = False
             self.last_reason = "stable"
+            return True
+        if elapsed >= self.max_wait_s:
+            self.active = False
+            self.timed_out = True
+            self.last_reason = "bounded_timeout"
             return True
         return False
 
