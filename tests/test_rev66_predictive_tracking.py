@@ -124,7 +124,7 @@ class Rev66PredictiveTrackingTests(unittest.TestCase):
         self.assertIn("self._hybrid_divergence_grace_started_at = now", TRACKER)
         self.assertIn("divergence_grace_anchor = max(", TRACKER)
         self.assertIn('"servo_hold_motion_guard"', TRACKER)
-        self.assertIn('"divergence_grace_reset_ms"', TRACKER)
+        self.assertIn("divergence_grace_reset_ms=", TRACKER)
 
     def test_status_identifies_rev66(self):
         self.assertIn('"controller_patch": "6.6.1"', TRACKER)
