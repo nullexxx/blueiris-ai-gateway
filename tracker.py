@@ -1895,6 +1895,7 @@ class DogTracker:
         self._active_acquire_hotspot_suspicious = False
         self._active_acquire_start_center: Optional[Tuple[float, float]] = None
         self._active_acquire_prior_bursts = 0
+        self._active_acquire_home_context = False
         self._event_timezone_name, self._event_tz = _event_timezone(
             os.getenv("TRACKER_EVENT_TIMEZONE", os.getenv("TZ", "America/New_York"))
         )
@@ -1932,11 +1933,14 @@ class DogTracker:
         self._active_acquire_hotspot_suspicious = False
         self._active_acquire_start_center = None
         self._active_acquire_prior_bursts = 0
+        self._active_acquire_home_context = False
 
     def _begin_acquisition_guard(self, det: Detection, frame_shape: Tuple[int, ...], now: float) -> None:
+        home_context = bool(self._home_sent)
         self._clear_active_acquisition_guard()
+        self._active_acquire_home_context = home_context
         self._active_acquire_start_center = det.center
-        if not self._static_hotspot_guard_enabled or not self._home_sent:
+        if not self._static_hotspot_guard_enabled or not home_context:
             return
         key = _acquisition_hotspot_key(det.bbox, frame_shape)
         cutoff = now - self._static_hotspot_window_s
@@ -5792,6 +5796,8 @@ class DogTracker:
                             blocked_ms=int(self._static_hotspot_block_s * 1000),
                         )
                         self.target = None
+                        if self._active_acquire_home_context and self._ptz_operation is None:
+                            self._home_sent = True
                         self.state = "SEARCHING"
                         self._clear_active_acquisition_guard()
                         return
@@ -5870,6 +5876,8 @@ class DogTracker:
                     blocked_ms=int(block_s * 1000),
                 )
             self.target = None
+            if self._active_acquire_home_context and self._ptz_operation is None:
+                self._home_sent = True
             self._clear_active_acquisition_guard()
             self.state = "SEARCHING"
             return
