@@ -76,7 +76,7 @@ class Rev672FastContinuityTests(unittest.TestCase):
         self.assertIn('"native_fast_handoff_exit"', chase)
         self.assertIn('exit_reason = "inner_region"', chase)
         self.assertIn('"native_fast_handoff_inner_region"', chase)
-        self.assertIn("now < self._native_fast_handoff_until", chase)
+        self.assertIn("now >= self._native_fast_handoff_until", chase)
 
     def test_native_takeup_latency_is_instrumented(self):
         helper = block(
