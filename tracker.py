@@ -5387,49 +5387,82 @@ class DogTracker:
         self._update_native_response_monitor(now)
 
         if self._native_fast_handoff_until > 0.0:
+            active_axes = sorted(self._native_fast_handoff_axes)
+            armed = {
+                axis: bool(self._native_axis_response[axis].get("armed"))
+                for axis in active_axes
+            }
             if (
-                now < self._native_fast_handoff_until
-                and dominant_error <= self._motion_control_continuous_exit_error
+                self._native_fast_handoff_response_started_at <= 0.0
+                and any(armed.values())
             ):
+                self._native_fast_handoff_response_started_at = now
                 self._record_event(
-                    "native_fast_handoff_exit",
-                    reason="inner_region",
-                    axes=sorted(self._native_fast_handoff_axes),
-                    elapsed_ms=int(
+                    "native_fast_handoff_response_confirmed",
+                    axes=active_axes,
+                    response_armed=armed,
+                    takeup_ms=int(
                         max(0.0, now - self._native_fast_handoff_started_at) * 1000
                     ),
-                    response_armed={
-                        axis: bool(self._native_axis_response[axis].get("armed"))
-                        for axis in sorted(self._native_fast_handoff_axes)
-                    },
-                    error=[round(err_x, 3), round(err_y, 3)],
+                    response_window_ms=int(
+                        self._native_fast_handoff_response_seconds * 1000
+                    ),
                 )
-                self._native_fast_handoff_started_at = 0.0
-                self._native_fast_handoff_until = 0.0
-                self._native_fast_handoff_axes.clear()
+
+            if dominant_error <= self._motion_control_continuous_exit_error:
+                exit_reason = "inner_region"
+            elif now >= self._native_fast_handoff_until:
+                exit_reason = "hard_max"
+            elif self._native_fast_handoff_response_started_at > 0.0:
+                response_until = (
+                    self._native_fast_handoff_response_started_at
+                    + self._native_fast_handoff_response_seconds
+                )
+                if now < response_until:
+                    self.state = "ESCAPE_CHASE"
+                    return
+                exit_reason = "response_window_complete"
+            elif now < self._native_fast_handoff_takeup_deadline:
+                self.state = "ESCAPE_CHASE"
+                return
+            else:
+                exit_reason = "takeup_timeout"
+
+            self._record_event(
+                "native_fast_handoff_exit",
+                reason=exit_reason,
+                axes=active_axes,
+                elapsed_ms=int(
+                    max(0.0, now - self._native_fast_handoff_started_at) * 1000
+                ),
+                takeup_wait_ms=int(
+                    max(
+                        0.0,
+                        min(
+                            now,
+                            self._native_fast_handoff_takeup_deadline,
+                        )
+                        - self._native_fast_handoff_started_at,
+                    )
+                    * 1000
+                ),
+                response_armed=armed,
+                response_started=(
+                    self._native_fast_handoff_response_started_at > 0.0
+                ),
+                error=[round(err_x, 3), round(err_y, 3)],
+            )
+            self._native_fast_handoff_started_at = 0.0
+            self._native_fast_handoff_takeup_deadline = 0.0
+            self._native_fast_handoff_response_started_at = 0.0
+            self._native_fast_handoff_until = 0.0
+            self._native_fast_handoff_axes.clear()
+
+            if exit_reason == "inner_region":
                 await self._stop_hybrid_chase(
                     "native_fast_handoff_inner_region", seq=seq
                 )
                 return
-            if now < self._native_fast_handoff_until:
-                self.state = "ESCAPE_CHASE"
-                return
-            self._record_event(
-                "native_fast_handoff_exit",
-                reason="duration_expired",
-                axes=sorted(self._native_fast_handoff_axes),
-                elapsed_ms=int(
-                    max(0.0, now - self._native_fast_handoff_started_at) * 1000
-                ),
-                response_armed={
-                    axis: bool(self._native_axis_response[axis].get("armed"))
-                    for axis in sorted(self._native_fast_handoff_axes)
-                },
-                error=[round(err_x, 3), round(err_y, 3)],
-            )
-            self._native_fast_handoff_started_at = 0.0
-            self._native_fast_handoff_until = 0.0
-            self._native_fast_handoff_axes.clear()
 
         if self._servo_hold_since is not None:
             self._servo_hold_frames += 1
