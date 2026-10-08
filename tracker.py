@@ -5273,6 +5273,30 @@ class DogTracker:
         self._update_native_response_monitor(now)
 
         if self._native_fast_handoff_until > 0.0:
+            if (
+                now < self._native_fast_handoff_until
+                and dominant_error <= self._motion_control_continuous_exit_error
+            ):
+                self._record_event(
+                    "native_fast_handoff_exit",
+                    reason="inner_region",
+                    axes=sorted(self._native_fast_handoff_axes),
+                    elapsed_ms=int(
+                        max(0.0, now - self._native_fast_handoff_started_at) * 1000
+                    ),
+                    response_armed={
+                        axis: bool(self._native_axis_response[axis].get("armed"))
+                        for axis in sorted(self._native_fast_handoff_axes)
+                    },
+                    error=[round(err_x, 3), round(err_y, 3)],
+                )
+                self._native_fast_handoff_started_at = 0.0
+                self._native_fast_handoff_until = 0.0
+                self._native_fast_handoff_axes.clear()
+                await self._stop_hybrid_chase(
+                    "native_fast_handoff_inner_region", seq=seq
+                )
+                return
             if now < self._native_fast_handoff_until:
                 self.state = "ESCAPE_CHASE"
                 return
@@ -7269,6 +7293,10 @@ class DogTracker:
                             command=[int(pan_command), int(tilt_command)],
                             duration_ms=int(self._native_fast_handoff_seconds * 1000),
                         )
+                    else:
+                        self._native_fast_handoff_started_at = 0.0
+                        self._native_fast_handoff_until = 0.0
+                        self._native_fast_handoff_axes.clear()
                     return
                 if actuator == "onvif_fractional":
                     ok = await self._set_hybrid_chase_velocity(
