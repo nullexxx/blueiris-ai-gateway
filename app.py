@@ -89,7 +89,7 @@ recovery_timer_handle: Optional[asyncio.TimerHandle] = None
 queue_depth: int = 0
 active_inferences: int = 0
 
-GATEWAY_REVISION = "6.7.3"
+GATEWAY_REVISION = "6.7.4"
 
 is_healthy: bool = True
 health_failure_reason: Optional[str] = None
