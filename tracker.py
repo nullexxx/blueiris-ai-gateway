@@ -5270,6 +5270,28 @@ class DogTracker:
         if not self._hybrid_chase_active:
             return
         dominant_error = max(abs(err_x), abs(err_y))
+        self._update_native_response_monitor(now)
+
+        if self._native_fast_handoff_until > 0.0:
+            if now < self._native_fast_handoff_until:
+                self.state = "ESCAPE_CHASE"
+                return
+            self._record_event(
+                "native_fast_handoff_exit",
+                reason="duration_expired",
+                axes=sorted(self._native_fast_handoff_axes),
+                elapsed_ms=int(
+                    max(0.0, now - self._native_fast_handoff_started_at) * 1000
+                ),
+                response_armed={
+                    axis: bool(self._native_axis_response[axis].get("armed"))
+                    for axis in sorted(self._native_fast_handoff_axes)
+                },
+                error=[round(err_x, 3), round(err_y, 3)],
+            )
+            self._native_fast_handoff_started_at = 0.0
+            self._native_fast_handoff_until = 0.0
+            self._native_fast_handoff_axes.clear()
 
         if self._servo_hold_since is not None:
             self._servo_hold_frames += 1
@@ -6401,6 +6423,16 @@ class DogTracker:
             self._hybrid_missing_coast_since = None
             self._hybrid_missing_coast_velocity = (0.0, 0.0)
             was_acquiring = self.target.acquire_hits < self._active_acquire_required_hits
+            if was_acquiring and self._active_acquire_gap_started_at is not None:
+                self._record_event(
+                    "acquire_gap_recovered",
+                    label=self.target.label,
+                    gap_ms=int(
+                        max(0.0, now - self._active_acquire_gap_started_at) * 1000
+                    ),
+                    hits=self.target.acquire_hits,
+                )
+                self._active_acquire_gap_started_at = None
 
             ptz_ready = self._ptz_action_ready(seq)
             rebasing_velocity = (
@@ -6577,6 +6609,20 @@ class DogTracker:
             return
 
         if self.target.acquire_hits < self._active_acquire_required_hits:
+            acquire_gap_s = max(0.0, now - self.target.last_seen)
+            if acquire_gap_s <= self._acquire_gap_grace_s:
+                if self._active_acquire_gap_started_at is None:
+                    self._active_acquire_gap_started_at = now
+                    self._record_event(
+                        "acquire_gap_grace",
+                        label=self.target.label,
+                        hits=self.target.acquire_hits,
+                        gap_ms=int(acquire_gap_s * 1000),
+                        grace_ms=int(self._acquire_gap_grace_s * 1000),
+                        association=self._last_association_diagnostic,
+                    )
+                self.state = "ACQUIRE"
+                return
             if self._hybrid_chase_active:
                 await self._stop_hybrid_chase("acquire_dropped", seq=seq, force=True)
             self._record_event("acquire_dropped", label=self.target.label, hits=self.target.acquire_hits)
@@ -6600,10 +6646,14 @@ class DogTracker:
             return
 
         if self._hybrid_chase_active:
-            # Rev 6.4 decays the last verified fractional direction during a
-            # detector dropout instead of blindly holding full chase velocity.
+            self._update_native_response_monitor(now)
             hybrid_missing_for = max(0.0, now - self.target.last_seen)
-            if hybrid_missing_for <= self._hybrid_missing_grace:
+            missing_grace = (
+                self._fast_target_missing_grace_s
+                if self._hybrid_fast_target
+                else self._hybrid_missing_grace
+            )
+            if hybrid_missing_for <= missing_grace:
                 if self._hybrid_missing_coast_since is None:
                     self._pause_loss_clock(self.target.last_seen)
                     self._hybrid_missing_coast_since = now
@@ -6611,22 +6661,65 @@ class DogTracker:
                         self._hybrid_pan_velocity,
                         self._hybrid_tilt_velocity,
                     )
+                    coast_policy = (
+                        "servo_hold_pause"
+                        if self._servo_hold_since is not None
+                        else "native_fast_hold"
+                        if (
+                            self._hybrid_actuator == "native_discrete"
+                            and self._native_fast_handoff_started_at > 0.0
+                        )
+                        else "fast_fractional_hold_then_taper"
+                        if self._hybrid_fast_target
+                        else "fractional_taper"
+                    )
                     self._record_event(
                         "hybrid_missing_coast",
                         phase="enter",
+                        policy=coast_policy,
+                        fast_target=self._hybrid_fast_target,
                         missing_ms=int(hybrid_missing_for * 1000),
+                        grace_ms=int(missing_grace * 1000),
                         snapshot_velocity=[
                             round(self._hybrid_missing_coast_velocity[0], 5),
                             round(self._hybrid_missing_coast_velocity[1], 5),
                         ],
                     )
+
+                if self._servo_hold_since is not None:
+                    self.state = "ESCAPE_CHASE"
+                    return
+
                 if self._hybrid_actuator == "onvif_fractional":
-                    scale = _servo_coast_scale(
-                        hybrid_missing_for,
-                        self._hybrid_missing_grace,
-                        start_scale=self._confidence_coast_start_scale,
-                        end_scale=self._confidence_coast_end_scale,
-                    )
+                    if self._hybrid_fast_target:
+                        if hybrid_missing_for <= self._fast_target_coast_hold_s:
+                            scale = 1.0
+                        else:
+                            taper_span = max(
+                                0.05,
+                                missing_grace - self._fast_target_coast_hold_s,
+                            )
+                            taper_progress = max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    (
+                                        hybrid_missing_for
+                                        - self._fast_target_coast_hold_s
+                                    )
+                                    / taper_span,
+                                ),
+                            )
+                            scale = 1.0 - taper_progress * (
+                                1.0 - self._fast_target_coast_end_scale
+                            )
+                    else:
+                        scale = _servo_coast_scale(
+                            hybrid_missing_for,
+                            missing_grace,
+                            start_scale=self._confidence_coast_start_scale,
+                            end_scale=self._confidence_coast_end_scale,
+                        )
                     await self._set_hybrid_chase_velocity(
                         self._hybrid_missing_coast_velocity[0] * scale,
                         self._hybrid_missing_coast_velocity[1] * scale,
@@ -6636,6 +6729,11 @@ class DogTracker:
                         error_y=self._last_error_y or 0.0,
                         target_span=self._last_target_span or 0.0,
                     )
+                elif self._native_fast_handoff_started_at > 0.0:
+                    if now >= self._native_fast_handoff_until:
+                        await self._pause_hybrid_actuator(
+                            "native_fast_handoff_missing_expired"
+                        )
                 else:
                     self._clear_native_edge_rescue(now, cooldown=True)
                     await self._pause_hybrid_actuator("missing_detection_grace")
@@ -6644,7 +6742,9 @@ class DogTracker:
             self._record_event(
                 "association_miss",
                 phase="hybrid_grace_expired",
+                fast_target=self._hybrid_fast_target,
                 missing_ms=int(hybrid_missing_for * 1000),
+                grace_ms=int(missing_grace * 1000),
                 association=self._last_association_diagnostic,
             )
             await self._stop_hybrid_chase("target_missing", seq=seq)
@@ -7020,9 +7120,22 @@ class DogTracker:
             motion_escape = bool(control_decision["motion_escape"])
             deadline_escape = bool(control_decision["deadline_escape"])
             fast_predictive_follow = bool(control_decision["fast_predictive_follow"])
+            projected_travel_norm = float(control_decision["projected_travel_norm"])
+            future_error_x = float(control_decision["future_error_x"])
+            future_error_y = float(control_decision["future_error_y"])
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
                 self._precision_slow_since = None
+                self._hybrid_fast_target = bool(
+                    fast_predictive_follow
+                    and (
+                        target_speed_norm >= self._native_fast_handoff_speed_norm
+                        or projected_travel_norm
+                            >= self._native_fast_handoff_projected_travel
+                    )
+                )
+                self._hybrid_entry_speed_norm = target_speed_norm
+                self._hybrid_projected_travel_norm = projected_travel_norm
                 # Native speed 1 is physically too coarse on this camera for the
                 # normal feedback loop (especially tilt). Without a calibrated
                 # fractional actuator, reserve native continuous movement for a
@@ -7048,6 +7161,50 @@ class DogTracker:
                 actuator, pan_command, tilt_command = self._servo_camera_command(
                     pan_control, tilt_control, pan_meta, tilt_meta
                 )
+
+                fast_native_axes = set()
+                if (
+                    self._native_fast_handoff_enabled
+                    and self._servo_actuator_mode == "auto"
+                    and fast_predictive_follow
+                    and target_speed_norm >= self._native_fast_handoff_speed_norm
+                    and projected_travel_norm
+                        >= self._native_fast_handoff_projected_travel
+                ):
+                    if abs(future_error_x) >= self._native_fast_handoff_future_error:
+                        fast_native_axes.add("pan")
+                    if abs(future_error_y) >= self._native_fast_handoff_future_error:
+                        fast_native_axes.add("tilt")
+
+                if fast_native_axes:
+                    native_pan = (
+                        _native_edge_rescue_speed(
+                            future_error_x,
+                            start_error=self._native_fast_handoff_future_error,
+                            full_error=0.95,
+                            min_speed=self._native_fast_handoff_min_speed,
+                            max_speed=self._native_fast_handoff_max_speed,
+                        )
+                        if "pan" in fast_native_axes else 0
+                    )
+                    native_tilt = (
+                        _native_edge_rescue_speed(
+                            future_error_y,
+                            start_error=self._native_fast_handoff_future_error,
+                            full_error=0.95,
+                            min_speed=self._native_fast_handoff_min_speed,
+                            max_speed=self._native_fast_handoff_max_speed,
+                        )
+                        if "tilt" in fast_native_axes else 0
+                    )
+                    pan_sign = self._active_calibration.continuous_sign(
+                        "pan", self.cfg.hybrid_chase_pan_sign
+                    )
+                    tilt_sign = self._active_calibration.continuous_sign("tilt", -1)
+                    actuator = "native_discrete"
+                    pan_command = float(pan_sign * native_pan)
+                    tilt_command = float(tilt_sign * native_tilt)
+
                 self._record_servo_telemetry(
                     now,
                     pan_meta,
@@ -7066,12 +7223,14 @@ class DogTracker:
                     error_y=round(err_y, 3),
                     target_speed_norm=round(target_speed_norm, 4),
                     velocity_mature=bool(control_decision["velocity_mature"]),
-                    projected_travel_norm=round(float(control_decision["projected_travel_norm"]), 4),
+                    projected_travel_norm=round(projected_travel_norm, 4),
                     future_error=[
-                        round(float(control_decision["future_error_x"]), 3),
-                        round(float(control_decision["future_error_y"]), 3),
+                        round(future_error_x, 3),
+                        round(future_error_y, 3),
                     ],
                     fast_predictive_follow=fast_predictive_follow,
+                    native_fast_handoff=bool(fast_native_axes),
+                    native_fast_axes=sorted(fast_native_axes),
                     deadline_escape=deadline_escape,
                     moving_outward=bool(moving_outward),
                     moving_inward_dominant=bool(moving_inward_dominant),
@@ -7082,6 +7241,34 @@ class DogTracker:
                 )
                 if abs(pan_command) <= 1e-6 and abs(tilt_command) <= 1e-6:
                     self.state = "TRACK"
+                    return
+                if fast_native_axes:
+                    self._native_fast_handoff_started_at = now
+                    self._native_fast_handoff_until = now + self._native_fast_handoff_seconds
+                    self._native_fast_handoff_axes = set(fast_native_axes)
+                    ok = await self._set_hybrid_chase_speed(
+                        int(pan_command),
+                        int(tilt_command),
+                        seq=seq,
+                        now=now,
+                        error_x=err_x,
+                        error_y=err_y,
+                        target_span=target_span,
+                        force_command=True,
+                    )
+                    if ok:
+                        self._record_event(
+                            "native_fast_handoff_enter",
+                            axes=sorted(fast_native_axes),
+                            speed_norm=round(target_speed_norm, 4),
+                            projected_travel_norm=round(projected_travel_norm, 4),
+                            future_error=[
+                                round(future_error_x, 3),
+                                round(future_error_y, 3),
+                            ],
+                            command=[int(pan_command), int(tilt_command)],
+                            duration_ms=int(self._native_fast_handoff_seconds * 1000),
+                        )
                     return
                 if actuator == "onvif_fractional":
                     ok = await self._set_hybrid_chase_velocity(
