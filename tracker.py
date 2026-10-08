@@ -3781,16 +3781,87 @@ class DogTracker:
                         "native_fast_handoff": {
                             "enabled": self._native_fast_handoff_enabled,
                             "active": now < self._native_fast_handoff_until,
+                            "phase": (
+                                "response"
+                                if self._native_fast_handoff_response_started_at > 0.0
+                                else "takeup"
+                                if now < self._native_fast_handoff_until
+                                else "idle"
+                            ),
                             "active_axes": sorted(self._native_fast_handoff_axes),
-                            "remaining_ms": max(0, int((self._native_fast_handoff_until - now) * 1000)),
+                            "remaining_ms": max(
+                                0, int((self._native_fast_handoff_until - now) * 1000)
+                            ),
+                            "takeup_remaining_ms": max(
+                                0,
+                                int(
+                                    (self._native_fast_handoff_takeup_deadline - now)
+                                    * 1000
+                                ),
+                            ),
+                            "response_started": (
+                                self._native_fast_handoff_response_started_at > 0.0
+                            ),
                             "speed_norm": round(self._native_fast_handoff_speed_norm, 3),
-                            "projected_travel_norm": round(self._native_fast_handoff_projected_travel, 3),
-                            "future_error": round(self._native_fast_handoff_future_error, 3),
-                            "duration_s": round(self._native_fast_handoff_seconds, 3),
+                            "projected_travel_norm": round(
+                                self._native_fast_handoff_projected_travel, 3
+                            ),
+                            "future_error": round(
+                                self._native_fast_handoff_future_error, 3
+                            ),
+                            "legacy_duration_s": round(
+                                self._native_fast_handoff_seconds, 3
+                            ),
+                            "takeup_timeout_s": round(
+                                self._native_fast_handoff_takeup_timeout_s, 3
+                            ),
+                            "response_window_s": round(
+                                self._native_fast_handoff_response_seconds, 3
+                            ),
+                            "hard_max_s": round(
+                                self._native_fast_handoff_hard_max_s, 3
+                            ),
+                            "response_tail_window_s": round(
+                                self._native_response_tail_window_s, 3
+                            ),
+                            "attribution_guard_s": round(
+                                self._native_response_attribution_guard_s, 3
+                            ),
+                            "pending_response_tail": {
+                                axis: (
+                                    None
+                                    if tail is None
+                                    else {
+                                        "correction_sign": int(
+                                            tail.get("correction_sign", 0) or 0
+                                        ),
+                                        "remaining_ms": max(
+                                            0,
+                                            int(
+                                                (
+                                                    float(
+                                                        tail.get(
+                                                            "expires_at", now
+                                                        )
+                                                    )
+                                                    - now
+                                                )
+                                                * 1000
+                                            ),
+                                        ),
+                                        "reason": tail.get("reason"),
+                                    }
+                                )
+                                for axis, tail in self._native_response_tail.items()
+                            },
                             "min_speed": self._native_fast_handoff_min_speed,
                             "max_speed": self._native_fast_handoff_max_speed,
-                            "last_entry_speed_norm": round(self._hybrid_entry_speed_norm, 4),
-                            "last_projected_travel_norm": round(self._hybrid_projected_travel_norm, 4),
+                            "last_entry_speed_norm": round(
+                                self._hybrid_entry_speed_norm, 4
+                            ),
+                            "last_projected_travel_norm": round(
+                                self._hybrid_projected_travel_norm, 4
+                            ),
                             "fast_target": self._hybrid_fast_target,
                         },
                         "native_edge_rescue": {
