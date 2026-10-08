@@ -4652,6 +4652,8 @@ class DogTracker:
             )
             return False
 
+        if actuator == "native_discrete":
+            self._archive_native_response_tail(t1, reason)
         self.ptz_commands += 1
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
@@ -4714,6 +4716,8 @@ class DogTracker:
                 return False
             return True
 
+        if actuator == "native_discrete":
+            self._archive_native_response_tail(t1, reason)
         self._hybrid_chase_active = False
         self._hybrid_pan_speed = 0
         self._hybrid_tilt_speed = 0
@@ -4753,8 +4757,6 @@ class DogTracker:
         self._native_fast_handoff_response_started_at = 0.0
         self._native_fast_handoff_until = 0.0
         self._native_fast_handoff_axes = set()
-        self._native_response_tail = {"pan": None, "tilt": None}
-        self._servo_response_attribution_block_until = {"pan": 0.0, "tilt": 0.0}
         self._active_acquire_gap_started_at = None
         self._servo_hold_since = None
         self._servo_hold_frames = 0
@@ -4849,6 +4851,11 @@ class DogTracker:
             return False
         if bool(state.get("armed")):
             return True
+        if now < float(self._servo_response_attribution_block_until.get(axis, 0.0)):
+            return False
+        tail = self._native_response_tail.get(axis)
+        if tail is not None and now < float(tail.get("expires_at", 0.0)):
+            return False
         if camera_shift is None:
             return False
         shift = float(camera_shift)
@@ -4893,6 +4900,28 @@ class DogTracker:
             state["armed"] = False
             state["confirmed_at"] = 0.0
 
+    def _archive_native_response_tail(self, stopped_at: float, reason: str) -> None:
+        for axis in ("pan", "tilt"):
+            state = self._native_axis_response[axis]
+            correction_sign = int(state.get("correction_sign", 0) or 0)
+            changed_at = float(state.get("changed_at", 0.0) or 0.0)
+            if correction_sign == 0 or changed_at <= 0.0 or bool(state.get("armed")):
+                continue
+            self._native_response_tail[axis] = {
+                "correction_sign": correction_sign,
+                "changed_at": changed_at,
+                "stopped_at": float(stopped_at),
+                "expires_at": float(stopped_at) + self._native_response_tail_window_s,
+                "reason": reason,
+            }
+            self._record_event(
+                "native_axis_response_tail",
+                axis=axis,
+                correction_sign=correction_sign,
+                reason=reason,
+                remaining_ms=int(self._native_response_tail_window_s * 1000),
+            )
+
     def _note_native_applied_command(
         self,
         axis: str,
@@ -4904,6 +4933,7 @@ class DogTracker:
         command_sign = self._servo_command_sign(camera_command)
         correction_sign = command_sign * mapping_sign
         state = self._native_axis_response[axis]
+        self._native_response_tail[axis] = None
         previous_sign = int(state.get("correction_sign", 0) or 0)
         if correction_sign != previous_sign:
             state["correction_sign"] = correction_sign
@@ -4921,34 +4951,80 @@ class DogTracker:
         return correction_sign
 
     def _update_native_response_monitor(self, now: float) -> None:
-        if self._hybrid_actuator != "native_discrete" or self._camera_motion is None:
+        if self._camera_motion is None:
             return
         shifts = {
             "pan": float(self._camera_motion.dx),
             "tilt": float(self._camera_motion.dy),
         }
+        if self._hybrid_actuator == "native_discrete":
+            for axis in ("pan", "tilt"):
+                state = self._native_axis_response[axis]
+                correction_sign = int(state.get("correction_sign", 0) or 0)
+                if correction_sign == 0 or bool(state.get("armed")):
+                    continue
+                shift = shifts[axis]
+                if (
+                    not math.isfinite(shift)
+                    or abs(shift) < self._servo_divergence_min_camera_shift_px
+                    or shift * correction_sign >= 0.0
+                ):
+                    continue
+                state["armed"] = True
+                state["confirmed_at"] = float(now)
+                self._record_event(
+                    "native_axis_response_armed",
+                    axis=axis,
+                    correction_sign=correction_sign,
+                    camera_shift_px=round(shift, 3),
+                    takeup_ms=int(
+                        max(0.0, float(now) - float(state.get("changed_at", now))) * 1000
+                    ),
+                    fast_handoff=bool(self._native_fast_handoff_axes),
+                )
+
         for axis in ("pan", "tilt"):
-            state = self._native_axis_response[axis]
-            correction_sign = int(state.get("correction_sign", 0) or 0)
-            if correction_sign == 0 or bool(state.get("armed")):
+            tail = self._native_response_tail.get(axis)
+            if tail is None:
+                continue
+            expires_at = float(tail.get("expires_at", 0.0))
+            if now >= expires_at:
+                self._record_event(
+                    "native_axis_response_tail_expired",
+                    axis=axis,
+                    correction_sign=int(tail.get("correction_sign", 0) or 0),
+                    waited_ms=int(
+                        max(0.0, now - float(tail.get("stopped_at", now))) * 1000
+                    ),
+                )
+                self._native_response_tail[axis] = None
                 continue
             shift = shifts[axis]
+            correction_sign = int(tail.get("correction_sign", 0) or 0)
             if (
-                not math.isfinite(shift)
+                correction_sign == 0
+                or not math.isfinite(shift)
                 or abs(shift) < self._servo_divergence_min_camera_shift_px
                 or shift * correction_sign >= 0.0
             ):
                 continue
-            state["armed"] = True
-            state["confirmed_at"] = float(now)
             self._record_event(
-                "native_axis_response_armed",
+                "native_axis_response_delayed",
                 axis=axis,
                 correction_sign=correction_sign,
                 camera_shift_px=round(shift, 3),
-                takeup_ms=int(max(0.0, float(now) - float(state.get("changed_at", now))) * 1000),
-                fast_handoff=bool(self._native_fast_handoff_axes),
+                takeup_ms=int(
+                    max(0.0, now - float(tail.get("changed_at", now))) * 1000
+                ),
+                after_stop_ms=int(
+                    max(0.0, now - float(tail.get("stopped_at", now))) * 1000
+                ),
+                stop_reason=tail.get("reason"),
             )
+            self._servo_response_attribution_block_until[axis] = (
+                now + self._native_response_attribution_guard_s
+            )
+            self._native_response_tail[axis] = None
 
     def _apply_axis_reversal_holdoff(
         self,
@@ -6319,6 +6395,7 @@ class DogTracker:
         self._camera_motion = self._smart_motion.update(
             frame, motion_boxes, active=motion_active, use_homography=self._ptz_operation == "zoom"
         )
+        self._update_native_response_monitor(now)
         self._update_frame_quality(frame, now)
         released_by_timeout = False
         if self._ptz_operation is None and not self._scene_stable_ready:
