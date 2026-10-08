@@ -13,9 +13,9 @@ def block(start, end):
 
 class Rev672FastContinuityTests(unittest.TestCase):
     def test_status_identifies_rev672(self):
-        self.assertIn('"controller_patch": "6.7.3"', TRACKER)
+        self.assertIn('"controller_patch": "6.7.4"', TRACKER)
         self.assertIn(
-            '"latency_aware_fast_handoff_continuity_frozen_loss_clock"',
+            '"response_aware_native_handoff_decoupled_fast_continuity"',
             TRACKER,
         )
         for token in (
