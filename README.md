@@ -11,6 +11,8 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 - **TensorRT / CUDA acceleration** with automatic `.pt` -> `.engine` compilation when needed.
 - **Built-in face recognition** using `facenet-pytorch` (`MTCNN` + `InceptionResnetV1`).
 - **GPU watchdog / tainted-pipeline protection** so a timed-out CUDA worker cannot immediately be followed by another GPU job.
+- **Fatal CUDA-context recovery** that terminates the process on sticky launch-timeout/illegal-address/device-assert failures so Docker can recreate a clean CUDA context.
+- **Runtime `/healthz` probe** that reports gateway poison plus stuck/crashed tracker states.
 - **Atomic face database persistence** under `/app/models/faces_db.pt`.
 - **Optional PTZ autotracking** using the same YOLO model already loaded by the gateway.
 - **Latest-frame-only RTSP capture** for tracking, avoiding a backlog of stale frames.
@@ -380,3 +382,12 @@ Rev 6.7.2 addresses two behaviors measured in the 20:44 and 20:47 dog runs: acqu
 For genuinely time-critical fast targets, `auto` actuator mode may issue a short, axis-safe Dahua native impulse when target speed, projected travel, and per-axis future error all exceed their thresholds. This path is independent of `TRACKER_NATIVE_EDGE_RESCUE_ENABLED`, remains bounded by `TRACKER_NATIVE_FAST_HANDOFF_SECONDS`, exits early inside the continuous-control inner region, and retains the existing fail-closed stop behavior.
 
 Both ONVIF and native continuous paths now expose response-take-up telemetry. Native command-direction and response-armed events make it possible to compare physical take-up latency between the two actuators from tracker history rather than inferring it from video alone. Detector misses during servo hold preserve chase identity without converting the paused zero velocity into a false safe-inner-region stop.
+
+
+### Rev 6.7.3 GPU fatal-error hardening
+
+Rev 6.7.3 closes the direct-worker exception gap in the GPU watchdog. Runtime CUDA exceptions that indicate a poisoned context (including launch timeout/error 702, illegal-address, device-side assert, and unspecified launch failure families) are treated as unrecoverable for the current process. The gateway marks itself unhealthy and exits; with `restart: unless-stopped`, Docker starts a fresh container and CUDA context instead of leaving inference stuck in a repeated-error loop.
+
+A dedicated `/healthz` endpoint now returns HTTP 503 when the gateway is unhealthy/tainted, when an active tracker has stopped its task, when the tracker task has crashed, or while an active tracker remains in `INFERENCE_ERROR` with an error/timeout/unavailable outcome. Manual tracker `OFF` state remains healthy.
+
+The example Compose healthcheck probes `/healthz` every 10 seconds with three retries. Docker Compose does not restart a container merely because it is marked unhealthy; the automatic restart for fatal CUDA failures is provided by the application deliberately exiting, after which the existing Docker restart policy takes over.
