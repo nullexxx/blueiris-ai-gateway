@@ -1730,6 +1730,32 @@ class DogTracker:
         self._native_fast_handoff_seconds = max(
             0.20, min(0.90, _env_float("TRACKER_NATIVE_FAST_HANDOFF_SECONDS", 0.55))
         )
+        self._native_fast_handoff_takeup_timeout_s = max(
+            0.40,
+            min(2.00, _env_float("TRACKER_NATIVE_FAST_HANDOFF_TAKEUP_TIMEOUT", 1.20)),
+        )
+        self._native_fast_handoff_response_seconds = max(
+            0.10,
+            min(
+                0.75,
+                _env_float(
+                    "TRACKER_NATIVE_FAST_HANDOFF_RESPONSE_SECONDS",
+                    min(self._native_fast_handoff_seconds, 0.35),
+                ),
+            ),
+        )
+        self._native_fast_handoff_hard_max_s = max(
+            self._native_fast_handoff_takeup_timeout_s + 0.10,
+            min(2.50, _env_float("TRACKER_NATIVE_FAST_HANDOFF_HARD_MAX", 1.55)),
+        )
+        self._native_response_tail_window_s = max(
+            0.20,
+            min(1.50, _env_float("TRACKER_NATIVE_RESPONSE_TAIL_WINDOW", 0.90)),
+        )
+        self._native_response_attribution_guard_s = max(
+            0.05,
+            min(0.50, _env_float("TRACKER_NATIVE_RESPONSE_ATTRIBUTION_GUARD", 0.20)),
+        )
         self._native_fast_handoff_min_speed = max(
             1,
             min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_FAST_HANDOFF_MIN_SPEED", 3)),
@@ -1997,8 +2023,12 @@ class DogTracker:
         self._hybrid_entry_speed_norm = 0.0
         self._hybrid_projected_travel_norm = 0.0
         self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_takeup_deadline = 0.0
+        self._native_fast_handoff_response_started_at = 0.0
         self._native_fast_handoff_until = 0.0
         self._native_fast_handoff_axes = set()
+        self._native_response_tail = {"pan": None, "tilt": None}
+        self._servo_response_attribution_block_until = {"pan": 0.0, "tilt": 0.0}
         self._active_acquire_gap_started_at: Optional[float] = None
         self._servo_hold_since: Optional[float] = None
         self._servo_hold_frames = 0
@@ -2322,8 +2352,12 @@ class DogTracker:
         self._hybrid_entry_speed_norm = 0.0
         self._hybrid_projected_travel_norm = 0.0
         self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_takeup_deadline = 0.0
+        self._native_fast_handoff_response_started_at = 0.0
         self._native_fast_handoff_until = 0.0
         self._native_fast_handoff_axes = set()
+        self._native_response_tail = {"pan": None, "tilt": None}
+        self._servo_response_attribution_block_until = {"pan": 0.0, "tilt": 0.0}
         self._active_acquire_gap_started_at = None
         self._servo_hold_since = None
         self._servo_hold_frames = 0
@@ -3454,7 +3488,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.7.3 fast-target continuity + GPU-fatal hardening)")
+        self.logger.info("PTZ tracker STARTED (Rev6.7.4 response-aware native handoff + decoupled fast continuity)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3686,8 +3720,8 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.7.3",
-                    "strategy": "latency_aware_fast_handoff_continuity_frozen_loss_clock",
+                    "controller_patch": "6.7.4",
+                    "strategy": "response_aware_native_handoff_decoupled_fast_continuity",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -4715,8 +4749,12 @@ class DogTracker:
         self._hybrid_entry_speed_norm = 0.0
         self._hybrid_projected_travel_norm = 0.0
         self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_takeup_deadline = 0.0
+        self._native_fast_handoff_response_started_at = 0.0
         self._native_fast_handoff_until = 0.0
         self._native_fast_handoff_axes = set()
+        self._native_response_tail = {"pan": None, "tilt": None}
+        self._servo_response_attribution_block_until = {"pan": 0.0, "tilt": 0.0}
         self._active_acquire_gap_started_at = None
         self._servo_hold_since = None
         self._servo_hold_frames = 0
@@ -7150,14 +7188,11 @@ class DogTracker:
             hybrid_entry = bool(control_decision["use_continuous"])
             if hybrid_entry:
                 self._precision_slow_since = None
-                self._hybrid_fast_target = bool(
-                    fast_predictive_follow
-                    and (
-                        target_speed_norm >= self._native_fast_handoff_speed_norm
-                        or projected_travel_norm
-                            >= self._native_fast_handoff_projected_travel
-                    )
-                )
+                # Fast-target detector continuity is a perception policy, not an
+                # actuator-selection policy. Any fast_predictive_follow receives
+                # the longer miss grace even when native handoff thresholds are
+                # intentionally not met.
+                self._hybrid_fast_target = bool(fast_predictive_follow)
                 self._hybrid_entry_speed_norm = target_speed_norm
                 self._hybrid_projected_travel_norm = projected_travel_norm
                 # Native speed 1 is physically too coarse on this camera for the
@@ -7268,7 +7303,13 @@ class DogTracker:
                     return
                 if fast_native_axes:
                     self._native_fast_handoff_started_at = now
-                    self._native_fast_handoff_until = now + self._native_fast_handoff_seconds
+                    self._native_fast_handoff_takeup_deadline = (
+                        now + self._native_fast_handoff_takeup_timeout_s
+                    )
+                    self._native_fast_handoff_response_started_at = 0.0
+                    self._native_fast_handoff_until = (
+                        now + self._native_fast_handoff_hard_max_s
+                    )
                     self._native_fast_handoff_axes = set(fast_native_axes)
                     ok = await self._set_hybrid_chase_speed(
                         int(pan_command),
@@ -7291,10 +7332,21 @@ class DogTracker:
                                 round(future_error_y, 3),
                             ],
                             command=[int(pan_command), int(tilt_command)],
-                            duration_ms=int(self._native_fast_handoff_seconds * 1000),
+                            legacy_duration_ms=int(self._native_fast_handoff_seconds * 1000),
+                            takeup_timeout_ms=int(
+                                self._native_fast_handoff_takeup_timeout_s * 1000
+                            ),
+                            response_window_ms=int(
+                                self._native_fast_handoff_response_seconds * 1000
+                            ),
+                            hard_max_ms=int(
+                                self._native_fast_handoff_hard_max_s * 1000
+                            ),
                         )
                     else:
                         self._native_fast_handoff_started_at = 0.0
+                        self._native_fast_handoff_takeup_deadline = 0.0
+                        self._native_fast_handoff_response_started_at = 0.0
                         self._native_fast_handoff_until = 0.0
                         self._native_fast_handoff_axes.clear()
                     return
