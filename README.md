@@ -190,7 +190,12 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_NATIVE_FAST_HANDOFF_SPEED_NORM` | `0.18` | Minimum normalized target speed for the fast-native handoff. |
 | `TRACKER_NATIVE_FAST_HANDOFF_PROJECTED_TRAVEL` | `0.75` | Minimum projected normalized target travel required for the fast-native handoff. |
 | `TRACKER_NATIVE_FAST_HANDOFF_FUTURE_ERROR` | `0.60` | Per-axis predicted future error required before that axis participates in the native impulse. |
-| `TRACKER_NATIVE_FAST_HANDOFF_SECONDS` | `0.55` | Maximum duration of the native fast-target impulse before returning to fractional control. |
+| `TRACKER_NATIVE_FAST_HANDOFF_SECONDS` | `0.55` | Legacy compatibility value; when `TRACKER_NATIVE_FAST_HANDOFF_RESPONSE_SECONDS` is unset it contributes the post-response movement default. |
+| `TRACKER_NATIVE_FAST_HANDOFF_TAKEUP_TIMEOUT` | `1.20` | Maximum time to wait for measured optical motion proving the native command physically took effect. |
+| `TRACKER_NATIVE_FAST_HANDOFF_RESPONSE_SECONDS` | `0.35` | Productive native movement window after the first requested axis has a confirmed physical response. |
+| `TRACKER_NATIVE_FAST_HANDOFF_HARD_MAX` | `1.55` | Absolute safety ceiling for one fast-native handoff, including take-up and confirmed response time. |
+| `TRACKER_NATIVE_RESPONSE_TAIL_WINDOW` | `0.90` | After native Stop/switch, keep attribution open this long for delayed residual motion. |
+| `TRACKER_NATIVE_RESPONSE_ATTRIBUTION_GUARD` | `0.20` | After delayed native motion is observed, prevent the following ONVIF command from claiming that same motion as its response. |
 | `TRACKER_NATIVE_FAST_HANDOFF_MIN_SPEED` | `3` | Native Dahua speed for a qualifying fast handoff below the extreme future-error threshold. |
 | `TRACKER_NATIVE_FAST_HANDOFF_MAX_SPEED` | `4` | Maximum native Dahua speed used by the fast handoff. |
 | `TRACKER_NATIVE_EDGE_RESCUE_ENABLED` | `true` | Permit a brief native PTZ burst when fractional ONVIF is near saturation and the target is still escaping near an edge. |
@@ -391,3 +396,12 @@ Rev 6.7.3 closes the direct-worker exception gap in the GPU watchdog. Runtime CU
 A dedicated `/healthz` endpoint now returns HTTP 503 when the gateway is unhealthy/tainted, when an active tracker has stopped its task, when the tracker task has crashed, or while an active tracker remains in `INFERENCE_ERROR` with an error/timeout/unavailable outcome. Manual tracker `OFF` state remains healthy.
 
 The example Compose healthcheck probes `/healthz` every 10 seconds with three retries. Docker Compose does not restart a container merely because it is marked unhealthy; the automatic restart for fatal CUDA failures is provided by the application deliberately exiting, after which the existing Docker restart policy takes over.
+
+
+### Rev 6.7.4 response-aware native handoff
+
+Rev 6.7.4 separates **fast-target perception continuity** from **native-actuator eligibility**. Any chase entered through `fast_predictive_follow` receives the fast detector-miss policy, even when its speed/projected-travel values do not qualify for the Dahua native handoff. This fixes the 6.7.2/6.7.3 case where a target was explicitly classified as fast-predictive but still fell back to the ordinary 500 ms fractional-taper policy.
+
+The fast-native handoff is now response-aware. A qualifying native command first enters a bounded **take-up phase** and waits for background camera motion to prove that at least one requested axis physically responded. Once response is confirmed, a short productive-response window begins. The handoff still exits early inside the continuous-control inner region and has an absolute hard timeout, preserving the fail-closed stop path.
+
+Rev 6.7.4 also preserves native-response attribution after native Stop or native→ONVIF switching. If camera motion begins late, history records `native_axis_response_delayed` with total take-up and after-stop latency. While that native response tail is unresolved, the ONVIF response monitor is prevented from claiming the same optical motion. This makes native-vs-ONVIF response timing materially more trustworthy in live tests.
