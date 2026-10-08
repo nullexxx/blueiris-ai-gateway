@@ -3454,7 +3454,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.7.2 fast-target continuity + latency-aware handoff)")
+        self.logger.info("PTZ tracker STARTED (Rev6.7.3 fast-target continuity + GPU-fatal hardening)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3686,7 +3686,7 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.7.2",
+                    "controller_patch": "6.7.3",
                     "strategy": "latency_aware_fast_handoff_continuity_frozen_loss_clock",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
