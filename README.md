@@ -180,6 +180,17 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_STATIC_HOTSPOT_EXTRA_FRAMES` | `3` | Extra acquisition hits required at a suspicious hotspot. |
 | `TRACKER_STATIC_HOTSPOT_OVERRIDE_CONF` | `0.70` | Strong confidence that overrides the hotspot motion requirement. |
 | `TRACKER_EVENT_TIMEZONE` | `America/New_York` | Primary history/status timezone; every event also retains `time_utc`. |
+| `TRACKER_ACQUIRE_GAP_GRACE` | `0.30` | Preserve a not-yet-confirmed acquisition candidate across a short detector blink instead of resetting to one hit. |
+| `TRACKER_FAST_TARGET_MISSING_GRACE` | `0.80` | Detector-miss grace used for a chase that entered through the fast-predictive path. |
+| `TRACKER_FAST_TARGET_COAST_HOLD` | `0.20` | Initial fast-target miss interval that holds the last verified fractional chase velocity at full strength. |
+| `TRACKER_FAST_TARGET_COAST_END_SCALE` | `0.55` | Fraction of the last verified fractional velocity retained at the end of fast-target miss grace. |
+| `TRACKER_NATIVE_FAST_HANDOFF_ENABLED` | `true` | Permit a short axis-safe Dahua native impulse when a mature fast target has large projected travel and a near-edge future error. Independent of general native edge rescue. |
+| `TRACKER_NATIVE_FAST_HANDOFF_SPEED_NORM` | `0.18` | Minimum normalized target speed for the fast-native handoff. |
+| `TRACKER_NATIVE_FAST_HANDOFF_PROJECTED_TRAVEL` | `0.75` | Minimum projected normalized target travel required for the fast-native handoff. |
+| `TRACKER_NATIVE_FAST_HANDOFF_FUTURE_ERROR` | `0.60` | Per-axis predicted future error required before that axis participates in the native impulse. |
+| `TRACKER_NATIVE_FAST_HANDOFF_SECONDS` | `0.55` | Maximum duration of the native fast-target impulse before returning to fractional control. |
+| `TRACKER_NATIVE_FAST_HANDOFF_MIN_SPEED` | `3` | Native Dahua speed for a qualifying fast handoff below the extreme future-error threshold. |
+| `TRACKER_NATIVE_FAST_HANDOFF_MAX_SPEED` | `4` | Maximum native Dahua speed used by the fast handoff. |
 | `TRACKER_NATIVE_EDGE_RESCUE_ENABLED` | `true` | Permit a brief native PTZ burst when fractional ONVIF is near saturation and the target is still escaping near an edge. |
 | `TRACKER_NATIVE_EDGE_RESCUE_ERROR` | `0.75` | Per-axis error required before native rescue can trigger. |
 | `TRACKER_NATIVE_EDGE_RESCUE_EXIT_ERROR` | `0.65` | Exit native rescue once the target is pulled back inside this dominant-error region. |
@@ -191,7 +202,7 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_NATIVE_EDGE_RESCUE_MAX_SPEED` | `6` | Native speed used at the full-error threshold. |
 | `TRACKER_CONFIDENCE_COAST_START_SCALE` | `0.70` | Initial fraction of last verified fractional velocity during confidence/miss grace. |
 | `TRACKER_CONFIDENCE_COAST_END_SCALE` | `0.20` | Final fraction of snapshot velocity at grace expiry. |
-| `TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES` | `0.04,0.08,0.16` | Fractional ONVIF ContinuousMove velocities sampled by manual/active continuous calibration. |
+| `TRACKER_ONVIF_SERVO_CALIBRATION_VELOCITIES` | `0.04,0.08,0.12,0.16,0.24,0.32` | Fractional ONVIF ContinuousMove velocities sampled by manual/active continuous calibration. |
 | `TRACKER_ONVIF_SERVO_CALIBRATION_DURATION` | `0.22` | Seconds each fractional ONVIF calibration pulse runs. |
 | `TRACKER_CAMERA_IP` | blank | PTZ camera IP or hostname. |
 | `TRACKER_CAMERA_USER` | `admin` | Camera username. |
@@ -360,3 +371,12 @@ Rev 6.6 is based on correlated Rev 6.5 history/BVR evidence.
 Rev 6.7.1 treats camera inertia during command reversals as a first-class controller state. Each fractional ONVIF axis records the direction of the command that was actually accepted by the camera. After that direction changes, divergence monitoring remains disarmed until background motion is observed in the expected physical direction. This prevents residual motion from the previous command from being misclassified as a new wrong-direction response.
 
 Divergence strikes are now recoverable control events. A proven strike stops the current chase and applies the normal cooldown; repeated strikes inside the rolling window apply the escalated cooldown but do not permanently disable continuous tracking. Successful convergence clears accumulated strikes.
+
+
+### Rev 6.7.2 fast-target continuity and latency-aware handoff
+
+Rev 6.7.2 addresses two behaviors measured in the 20:44 and 20:47 dog runs: acquisition candidates were reset by a one-frame detector gap, and fractional ONVIF velocity was decayed aggressively just as a fast target left the frame. Acquisition confirmation now survives a bounded gap, and fast-predictive chases get a separate miss policy that holds the last verified fractional command briefly before tapering to a stronger floor.
+
+For genuinely time-critical fast targets, `auto` actuator mode may issue a short, axis-safe Dahua native impulse when target speed, projected travel, and per-axis future error all exceed their thresholds. This path is independent of `TRACKER_NATIVE_EDGE_RESCUE_ENABLED`, remains bounded by `TRACKER_NATIVE_FAST_HANDOFF_SECONDS`, exits early inside the continuous-control inner region, and retains the existing fail-closed stop behavior.
+
+Both ONVIF and native continuous paths now expose response-take-up telemetry. Native command-direction and response-armed events make it possible to compare physical take-up latency between the two actuators from tracker history rather than inferring it from video alone. Detector misses during servo hold preserve chase identity without converting the paused zero velocity into a false safe-inner-region stop.

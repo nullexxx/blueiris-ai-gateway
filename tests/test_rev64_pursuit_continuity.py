@@ -56,7 +56,7 @@ class Rev64PursuitContinuityTests(unittest.TestCase):
         self.assertNotIn('_stop_hybrid_chase("servo_brake"',chase)
 
     def test_status_identifies_rev64(self):
-        self.assertIn('"controller_patch": "6.7.1"',TRACKER)
+        self.assertIn('"controller_patch": "6.7.2"',TRACKER)
         for token in ['"outward_catchup_gain"','"hold_seconds"','"hold_active"','"confidence_coast_start_scale"']:
             self.assertIn(token,TRACKER)
 
