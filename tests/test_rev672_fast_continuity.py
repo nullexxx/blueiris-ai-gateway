@@ -74,7 +74,7 @@ class Rev672FastContinuityTests(unittest.TestCase):
             "    def _begin_ptz_operation",
         )
         self.assertIn('"native_fast_handoff_exit"', chase)
-        self.assertIn('reason="inner_region"', chase)
+        self.assertIn('exit_reason = "inner_region"', chase)
         self.assertIn('"native_fast_handoff_inner_region"', chase)
         self.assertIn("now < self._native_fast_handoff_until", chase)
 
