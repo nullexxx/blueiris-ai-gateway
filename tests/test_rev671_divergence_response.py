@@ -63,7 +63,7 @@ class Rev671DivergenceResponseTests(unittest.TestCase):
     def test_status_identifies_rev671_and_response_monitor(self):
         self.assertIn('"controller_patch": "6.7.2"', TRACKER)
         self.assertIn(
-            '"fractional_servo_response_armed_divergence_frozen_loss_clock"',
+            '"latency_aware_fast_handoff_continuity_frozen_loss_clock"',
             TRACKER,
         )
         self.assertIn('"axis_response": {', TRACKER)
