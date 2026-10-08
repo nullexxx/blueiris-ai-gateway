@@ -58,7 +58,7 @@ class Rev672FastContinuityTests(unittest.TestCase):
     def test_fast_native_handoff_is_separate_from_general_edge_rescue(self):
         drive = block(
             "    async def _drive_to_target(",
-            "    async def _maybe_autozoom(",
+            "    def _render_debug_frame(",
         )
         self.assertIn("self._native_fast_handoff_enabled", drive)
         self.assertIn("self._native_fast_handoff_speed_norm", drive)
