@@ -110,7 +110,7 @@ class MotionControlPolicyTests(unittest.TestCase):
 
     def test_rev6_precision_contracts_are_present(self):
         self.assertIn('"controller_revision": 6', TRACKER)
-        self.assertIn('"latency_aware_fast_handoff_continuity_frozen_loss_clock"', TRACKER)
+        self.assertIn('"response_aware_native_handoff_decoupled_fast_continuity"', TRACKER)
         self.assertIn('"rev6_stationary_precision"', TRACKER)
         self.assertIn("self._precision_hold_until", TRACKER)
         self.assertIn("hybrid_chase_confidence_grace", TRACKER)
