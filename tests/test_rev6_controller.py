@@ -117,7 +117,7 @@ class Rev6ControllerTests(unittest.TestCase):
     def test_rev6_status_contract(self):
         self.assertIn('"controller_revision": 6', TRACKER)
         self.assertIn(
-            '"latency_aware_fast_handoff_continuity_frozen_loss_clock"',
+            '"response_aware_native_handoff_decoupled_fast_continuity"',
             TRACKER,
         )
         self.assertIn('"fractional_onvif_available"', TRACKER)
