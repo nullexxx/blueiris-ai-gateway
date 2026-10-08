@@ -1616,6 +1616,19 @@ class DogTracker:
             self.cfg.hybrid_chase_miss_grace,
             max(0.20, min(0.80, _env_float("TRACKER_HYBRID_MISSING_GRACE", 0.50))),
         )
+        self._acquire_gap_grace_s = max(
+            0.05, min(0.75, _env_float("TRACKER_ACQUIRE_GAP_GRACE", 0.30))
+        )
+        self._fast_target_missing_grace_s = max(
+            self._hybrid_missing_grace,
+            min(1.50, _env_float("TRACKER_FAST_TARGET_MISSING_GRACE", 0.80)),
+        )
+        self._fast_target_coast_hold_s = max(
+            0.0, min(0.50, _env_float("TRACKER_FAST_TARGET_COAST_HOLD", 0.20))
+        )
+        self._fast_target_coast_end_scale = max(
+            0.20, min(1.0, _env_float("TRACKER_FAST_TARGET_COAST_END_SCALE", 0.55))
+        )
         self._target_release_timeout = max(
             self.cfg.home_timeout,
             max(3.0, min(15.0, _env_float("TRACKER_TARGET_RELEASE_TIMEOUT", 5.0))),
@@ -1698,6 +1711,32 @@ class DogTracker:
         self._native_edge_rescue_max_speed = max(
             self._native_edge_rescue_min_speed,
             min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_EDGE_RESCUE_MAX_SPEED", 6)),
+        )
+        self._native_fast_handoff_enabled = _env_bool(
+            "TRACKER_NATIVE_FAST_HANDOFF_ENABLED", True
+        )
+        self._native_fast_handoff_speed_norm = max(
+            self._fast_follow_speed_norm,
+            min(0.80, _env_float("TRACKER_NATIVE_FAST_HANDOFF_SPEED_NORM", 0.18)),
+        )
+        self._native_fast_handoff_projected_travel = max(
+            0.30,
+            min(3.0, _env_float("TRACKER_NATIVE_FAST_HANDOFF_PROJECTED_TRAVEL", 0.75)),
+        )
+        self._native_fast_handoff_future_error = max(
+            self._fast_follow_error,
+            min(0.90, _env_float("TRACKER_NATIVE_FAST_HANDOFF_FUTURE_ERROR", 0.60)),
+        )
+        self._native_fast_handoff_seconds = max(
+            0.20, min(0.90, _env_float("TRACKER_NATIVE_FAST_HANDOFF_SECONDS", 0.55))
+        )
+        self._native_fast_handoff_min_speed = max(
+            1,
+            min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_FAST_HANDOFF_MIN_SPEED", 3)),
+        )
+        self._native_fast_handoff_max_speed = max(
+            self._native_fast_handoff_min_speed,
+            min(self.cfg.hybrid_chase_max_speed, _env_int("TRACKER_NATIVE_FAST_HANDOFF_MAX_SPEED", 4)),
         )
         self._servo_kd = max(0.0, min(1.50, _env_float("TRACKER_SERVO_KD", 0.24)))
         self._servo_feedforward_gain = max(
@@ -1933,7 +1972,7 @@ class DogTracker:
                 "confirmed_at": 0.0,
             },
         }
-        self._servo_axis_response = {
+        self._native_axis_response = {
             "pan": {
                 "correction_sign": 0,
                 "changed_at": 0.0,
@@ -1954,6 +1993,13 @@ class DogTracker:
         self._hybrid_confidence_coast_velocity = (0.0, 0.0)
         self._hybrid_missing_coast_since: Optional[float] = None
         self._hybrid_missing_coast_velocity = (0.0, 0.0)
+        self._hybrid_fast_target = False
+        self._hybrid_entry_speed_norm = 0.0
+        self._hybrid_projected_travel_norm = 0.0
+        self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_until = 0.0
+        self._native_fast_handoff_axes = set()
+        self._active_acquire_gap_started_at: Optional[float] = None
         self._servo_hold_since: Optional[float] = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
@@ -2020,6 +2066,7 @@ class DogTracker:
 
     def _clear_active_acquisition_guard(self) -> None:
         self._active_acquire_required_hits = self.cfg.acquire_frames
+        self._active_acquire_gap_started_at = None
         self._active_acquire_hotspot_key = None
         self._active_acquire_hotspot_suspicious = False
         self._active_acquire_start_center = None
@@ -2271,6 +2318,13 @@ class DogTracker:
         self._hybrid_confidence_coast_velocity = (0.0, 0.0)
         self._hybrid_missing_coast_since = None
         self._hybrid_missing_coast_velocity = (0.0, 0.0)
+        self._hybrid_fast_target = False
+        self._hybrid_entry_speed_norm = 0.0
+        self._hybrid_projected_travel_norm = 0.0
+        self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_until = 0.0
+        self._native_fast_handoff_axes = set()
+        self._active_acquire_gap_started_at = None
         self._servo_hold_since = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
@@ -2295,6 +2349,8 @@ class DogTracker:
         self._servo_feedforward_started_at = 0.0
         self._servo_last_telemetry_at = 0.0
         self._servo_last_decision = {}
+        self._reset_servo_response_monitor()
+        self._reset_native_response_monitor()
         self._class_evidence.clear()
         self._clear_active_acquisition_guard()
         self._move_failure_count = 0
@@ -3398,7 +3454,7 @@ class DogTracker:
             move_directly=self.cfg.move_directly_enabled,
             autozoom=self.cfg.autozoom,
         )
-        self.logger.info("PTZ tracker STARTED (Rev6.7.1 response-armed divergence + frozen loss clock)")
+        self.logger.info("PTZ tracker STARTED (Rev6.7.2 fast-target continuity + latency-aware handoff)")
         return self.status()
 
     async def stop(self) -> dict:
@@ -3630,8 +3686,8 @@ class DogTracker:
                 "mean_error_improvement": (None if not self._quality_improvements else round(sum(self._quality_improvements) / len(self._quality_improvements), 3)),
                 "motion_control": {
                     "controller_revision": 6,
-                    "controller_patch": "6.7.1",
-                    "strategy": "fractional_servo_response_armed_divergence_frozen_loss_clock",
+                    "controller_patch": "6.7.2",
+                    "strategy": "latency_aware_fast_handoff_continuity_frozen_loss_clock",
                     "min_velocity_sample_ms": self._motion_control_min_sample_ms,
                     "deadline_travel_norm": round(self._motion_control_deadline_travel, 3),
                     "stationary_speed_norm": round(self._motion_control_stationary_speed_norm, 4),
@@ -3648,6 +3704,10 @@ class DogTracker:
                     "native_max_chase_seconds": round(self.cfg.hybrid_chase_max_seconds, 3),
                     "fractional_max_chase_seconds": None,
                     "missing_grace_s": round(self._hybrid_missing_grace, 3),
+                    "acquire_gap_grace_s": round(self._acquire_gap_grace_s, 3),
+                    "fast_target_missing_grace_s": round(self._fast_target_missing_grace_s, 3),
+                    "fast_target_coast_hold_s": round(self._fast_target_coast_hold_s, 3),
+                    "fast_target_coast_end_scale": round(self._fast_target_coast_end_scale, 3),
                     "target_release_timeout_s": round(self._target_release_timeout, 3),
                     "loss_clock_paused": self._loss_clock_pause_started_at is not None,
                     "loss_clock_paused_ms": int(
@@ -3683,6 +3743,21 @@ class DogTracker:
                         "axis_divergence_counts": {
                             "pan": int(self._hybrid_axis_divergence["pan"]["count"]),
                             "tilt": int(self._hybrid_axis_divergence["tilt"]["count"]),
+                        },
+                        "native_fast_handoff": {
+                            "enabled": self._native_fast_handoff_enabled,
+                            "active": now < self._native_fast_handoff_until,
+                            "active_axes": sorted(self._native_fast_handoff_axes),
+                            "remaining_ms": max(0, int((self._native_fast_handoff_until - now) * 1000)),
+                            "speed_norm": round(self._native_fast_handoff_speed_norm, 3),
+                            "projected_travel_norm": round(self._native_fast_handoff_projected_travel, 3),
+                            "future_error": round(self._native_fast_handoff_future_error, 3),
+                            "duration_s": round(self._native_fast_handoff_seconds, 3),
+                            "min_speed": self._native_fast_handoff_min_speed,
+                            "max_speed": self._native_fast_handoff_max_speed,
+                            "last_entry_speed_norm": round(self._hybrid_entry_speed_norm, 4),
+                            "last_projected_travel_norm": round(self._hybrid_projected_travel_norm, 4),
+                            "fast_target": self._hybrid_fast_target,
                         },
                         "native_edge_rescue": {
                             "enabled": self._native_edge_rescue_enabled,
@@ -3722,6 +3797,23 @@ class DogTracker:
                         "divergence_escalated_cooldown_s": round(
                             self._servo_divergence_escalated_cooldown_s, 3
                         ),
+                        "native_axis_response": {
+                            axis: {
+                                "correction_sign": int(state.get("correction_sign", 0) or 0),
+                                "armed": bool(state.get("armed")),
+                                "command_age_ms": (
+                                    0
+                                    if float(state.get("changed_at", 0.0)) <= 0.0
+                                    else int(max(0.0, now - float(state.get("changed_at", now))) * 1000)
+                                ),
+                                "confirmed_age_ms": (
+                                    None
+                                    if float(state.get("confirmed_at", 0.0)) <= 0.0
+                                    else int(max(0.0, now - float(state.get("confirmed_at", now))) * 1000)
+                                ),
+                            }
+                            for axis, state in self._native_axis_response.items()
+                        },
                         "axis_response": {
                             axis: {
                                 "correction_sign": int(
@@ -4533,6 +4625,7 @@ class DogTracker:
         self._hybrid_tilt_velocity = 0.0
         self._hybrid_last_command_at = t1
         self._reset_servo_response_monitor()
+        self._reset_native_response_monitor()
         self._reset_servo_feedback()
         return True
 
@@ -4618,6 +4711,13 @@ class DogTracker:
         self._hybrid_confidence_coast_velocity = (0.0, 0.0)
         self._hybrid_missing_coast_since = None
         self._hybrid_missing_coast_velocity = (0.0, 0.0)
+        self._hybrid_fast_target = False
+        self._hybrid_entry_speed_norm = 0.0
+        self._hybrid_projected_travel_norm = 0.0
+        self._native_fast_handoff_started_at = 0.0
+        self._native_fast_handoff_until = 0.0
+        self._native_fast_handoff_axes = set()
+        self._active_acquire_gap_started_at = None
         self._servo_hold_since = None
         self._servo_hold_frames = 0
         self._servo_hold_error = (0.0, 0.0)
@@ -4626,6 +4726,7 @@ class DogTracker:
         self._hybrid_tilt_reverse_until = 0.0
         self._precision_slow_since = None
         self._reset_servo_response_monitor()
+        self._reset_native_response_monitor()
         self._reset_servo_feedback()
 
         if was_active:
@@ -4745,6 +4846,71 @@ class DogTracker:
         )
         # The confirmation sample itself is not divergence evidence.
         return False
+
+    def _reset_native_response_monitor(self) -> None:
+        for axis in ("pan", "tilt"):
+            state = self._native_axis_response[axis]
+            state["correction_sign"] = 0
+            state["changed_at"] = 0.0
+            state["armed"] = False
+            state["confirmed_at"] = 0.0
+
+    def _note_native_applied_command(
+        self,
+        axis: str,
+        camera_command: float,
+        now: float,
+    ) -> int:
+        fallback = self.cfg.hybrid_chase_pan_sign if axis == "pan" else -1
+        mapping_sign = self._active_calibration.continuous_sign(axis, fallback)
+        command_sign = self._servo_command_sign(camera_command)
+        correction_sign = command_sign * mapping_sign
+        state = self._native_axis_response[axis]
+        previous_sign = int(state.get("correction_sign", 0) or 0)
+        if correction_sign != previous_sign:
+            state["correction_sign"] = correction_sign
+            state["changed_at"] = float(now)
+            state["armed"] = False
+            state["confirmed_at"] = 0.0
+            self._record_event(
+                "native_axis_command_direction",
+                axis=axis,
+                previous_correction_sign=previous_sign,
+                correction_sign=correction_sign,
+                camera_command=int(camera_command),
+                response_armed=False,
+            )
+        return correction_sign
+
+    def _update_native_response_monitor(self, now: float) -> None:
+        if self._hybrid_actuator != "native_discrete" or self._camera_motion is None:
+            return
+        shifts = {
+            "pan": float(self._camera_motion.dx),
+            "tilt": float(self._camera_motion.dy),
+        }
+        for axis in ("pan", "tilt"):
+            state = self._native_axis_response[axis]
+            correction_sign = int(state.get("correction_sign", 0) or 0)
+            if correction_sign == 0 or bool(state.get("armed")):
+                continue
+            shift = shifts[axis]
+            if (
+                not math.isfinite(shift)
+                or abs(shift) < self._servo_divergence_min_camera_shift_px
+                or shift * correction_sign >= 0.0
+            ):
+                continue
+            state["armed"] = True
+            state["confirmed_at"] = float(now)
+            self._record_event(
+                "native_axis_response_armed",
+                axis=axis,
+                correction_sign=correction_sign,
+                camera_shift_px=round(shift, 3),
+                takeup_ms=int(max(0.0, float(now) - float(state.get("changed_at", now))) * 1000),
+                fast_handoff=bool(self._native_fast_handoff_axes),
+            )
 
     def _apply_axis_reversal_holdoff(
         self,
@@ -4895,6 +5061,8 @@ class DogTracker:
         self._hybrid_tilt_speed = command_tilt
         self._hybrid_pan_velocity = 0.0
         self._hybrid_tilt_velocity = 0.0
+        self._note_native_applied_command("pan", command_pan, t1)
+        self._note_native_applied_command("tilt", command_tilt, t1)
         self._hybrid_last_command_at = t1
         self.ptz_commands += 1
         self.hybrid_chase_commands += 1
@@ -4909,7 +5077,9 @@ class DogTracker:
         self._record_event(
             "ptz_command_applied",
             source=(
-                "native_edge_rescue"
+                "native_fast_handoff"
+                if self._native_fast_handoff_axes
+                else "native_edge_rescue"
                 if self._native_edge_rescue_axes
                 else "hybrid_chase"
             ),
