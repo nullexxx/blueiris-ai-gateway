@@ -76,7 +76,7 @@ class GpuFatalHardeningTests(unittest.TestCase):
             'tracker_state == "INFERENCE_ERROR"',
             '"timeout", "unavailable"',
             'response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE',
-            'GATEWAY_REVISION = "6.7.3"',
+            'GATEWAY_REVISION = "6.7.4"',
         ):
             self.assertIn(token, APP_TEXT)
 

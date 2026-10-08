@@ -61,9 +61,9 @@ class Rev671DivergenceResponseTests(unittest.TestCase):
         self.assertIn('"repeated_divergence_cooldown"', chase)
 
     def test_status_identifies_rev671_and_response_monitor(self):
-        self.assertIn('"controller_patch": "6.7.3"', TRACKER)
+        self.assertIn('"controller_patch": "6.7.4"', TRACKER)
         self.assertIn(
-            '"latency_aware_fast_handoff_continuity_frozen_loss_clock"',
+            '"response_aware_native_handoff_decoupled_fast_continuity"',
             TRACKER,
         )
         self.assertIn('"axis_response": {', TRACKER)

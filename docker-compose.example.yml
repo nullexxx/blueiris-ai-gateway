@@ -92,6 +92,29 @@ services:
       TRACKER_FAST_FOLLOW_SPEED_NORM: "0.10"
       TRACKER_FAST_FOLLOW_HORIZON: "0.45"
       TRACKER_FAST_FOLLOW_ERROR: "0.22"
+
+      # Rev 6.7.2+: detector continuity for fast predictive pursuits.
+      TRACKER_ACQUIRE_GAP_GRACE: "0.30"
+      TRACKER_FAST_TARGET_MISSING_GRACE: "0.80"
+      TRACKER_FAST_TARGET_COAST_HOLD: "0.20"
+      TRACKER_FAST_TARGET_COAST_END_SCALE: "0.55"
+
+      # Rev 6.7.4: native handoff waits for measured camera response, then
+      # runs a short productive window. Delayed native motion remains
+      # attributable after native Stop/native->ONVIF switching.
+      TRACKER_NATIVE_FAST_HANDOFF_ENABLED: "true"
+      TRACKER_NATIVE_FAST_HANDOFF_SPEED_NORM: "0.18"
+      TRACKER_NATIVE_FAST_HANDOFF_PROJECTED_TRAVEL: "0.75"
+      TRACKER_NATIVE_FAST_HANDOFF_FUTURE_ERROR: "0.60"
+      TRACKER_NATIVE_FAST_HANDOFF_SECONDS: "0.55"
+      TRACKER_NATIVE_FAST_HANDOFF_TAKEUP_TIMEOUT: "1.20"
+      TRACKER_NATIVE_FAST_HANDOFF_RESPONSE_SECONDS: "0.35"
+      TRACKER_NATIVE_FAST_HANDOFF_HARD_MAX: "1.55"
+      TRACKER_NATIVE_RESPONSE_TAIL_WINDOW: "0.90"
+      TRACKER_NATIVE_RESPONSE_ATTRIBUTION_GUARD: "0.20"
+      TRACKER_NATIVE_FAST_HANDOFF_MIN_SPEED: "3"
+      TRACKER_NATIVE_FAST_HANDOFF_MAX_SPEED: "4"
+
       TRACKER_CLASS_CONTINUITY_LABELS: "dog,cat,bird,bear"
       # Learn recurring home-view false-positive fingerprints per session.
       TRACKER_STATIC_HOTSPOT_GUARD_ENABLED: "true"

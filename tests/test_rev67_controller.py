@@ -46,7 +46,7 @@ class Rev67ControllerTests(unittest.TestCase):
         self.assertIn("[0.04, 0.08, 0.12, 0.16, 0.24, 0.32]", TRACKER)
 
     def test_status_identifies_rev67(self):
-        self.assertIn('"controller_patch": "6.7.3"', TRACKER)
+        self.assertIn('"controller_patch": "6.7.4"', TRACKER)
         self.assertIn('"active_axes": sorted(self._native_edge_rescue_axes)', TRACKER)
         self.assertIn('"loss_clock_paused"', TRACKER)
 
