@@ -32,6 +32,9 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("async def run_gpu_job(", app)
         self.assertEqual(app.count("run_in_executor("), 1)
         self.assertIn("request was cancelled while its CUDA worker was still running", app)
+        self.assertIn("_is_fatal_cuda_exception(exc)", app)
+        self.assertIn("trigger_self_termination(reason)", app)
+        self.assertIn('@app.get("/healthz")', app)
 
     def test_tensorrt_cache_tracks_source_and_gpu(self):
         app = (ROOT / "app.py").read_text()

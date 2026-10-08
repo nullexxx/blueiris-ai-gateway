@@ -89,8 +89,40 @@ recovery_timer_handle: Optional[asyncio.TimerHandle] = None
 queue_depth: int = 0
 active_inferences: int = 0
 
+GATEWAY_REVISION = "6.7.3"
+
 is_healthy: bool = True
 health_failure_reason: Optional[str] = None
+
+_FATAL_CUDA_ERROR_MARKERS = (
+    "cuda_error_launch_timeout",
+    "cudaerrorlaunchtimeout",
+    "launch timed out and was terminated",
+    "sticky error detected",
+    "cuda_error_illegal_address",
+    "illegal memory access",
+    "device-side assert triggered",
+    "unspecified launch failure",
+)
+
+
+def _is_fatal_cuda_exception(exc: BaseException) -> bool:
+    """Return True when an exception indicates a poisoned CUDA context.
+
+    CUDA launch timeout/illegal-address/device-assert failures are sticky at the
+    process/context level. Retrying inference in the same process only repeats
+    the failure, so the safe recovery is a fresh container/CUDA context.
+    """
+    seen = set()
+    current: Optional[BaseException] = exc
+    messages = []
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(f"{type(current).__name__}: {current}".lower())
+        current = current.__cause__ or current.__context__
+    combined = " | ".join(messages)
+    return any(marker in combined for marker in _FATAL_CUDA_ERROR_MARKERS)
+
 
 # Optional multi-class PTZ tracker service (configured by TRACKER_* environment variables)
 tracker_service: Optional[DogTracker] = None
@@ -555,6 +587,12 @@ async def run_gpu_job(
                     f"{label} request was cancelled while its CUDA worker was still running.",
                 )
             raise
+        except Exception as exc:
+            if _is_fatal_cuda_exception(exc):
+                reason = f"{label} hit unrecoverable CUDA error: {exc}"
+                logger.critical("%s", reason, exc_info=True)
+                trigger_self_termination(reason)
+            raise
     finally:
         if active:
             active_inferences -= 1
@@ -579,6 +617,8 @@ async def lifespan(app: FastAPI):
         logger.info("FaceNet pipeline initialized and warmed on GPU.")
     except Exception as e:
         logger.error(f"Failed to initialize FaceNet: {e}")
+        if _is_fatal_cuda_exception(e):
+            trigger_self_termination(f"FaceNet initialization hit unrecoverable CUDA error: {e}")
 
     # Determine target stems to preload/compile
     target_stems = set()
@@ -934,6 +974,62 @@ async def face_recognize(
 # DIAGNOSTIC & DETECTION ENDPOINTS
 # ============================================================================
 
+def _runtime_health_snapshot() -> dict:
+    tracker = tracker_service.status() if tracker_service is not None else {"enabled": False}
+    reasons = []
+
+    if not is_healthy:
+        reasons.append(health_failure_reason or "gateway marked unhealthy")
+    if gpu_tainted:
+        reasons.append("GPU execution pipeline is tainted")
+
+    tracker_state = str(tracker.get("state") or "")
+    tracker_outcome = str(tracker.get("last_inference_outcome") or "")
+    tracker_active = bool(tracker.get("active"))
+    tracker_task_running = bool(tracker.get("tracker_task_running"))
+
+    if tracker_state == "TRACKER_ERROR":
+        reasons.append(
+            str(tracker.get("tracker_task_error") or tracker.get("stop_reason") or "tracker task crashed")
+        )
+    elif tracker_active and not tracker_task_running:
+        reasons.append("tracker is active but its task is not running")
+    elif (
+        tracker_active
+        and tracker_state == "INFERENCE_ERROR"
+        and tracker_outcome in {"error", "timeout", "unavailable"}
+    ):
+        reasons.append(f"tracker inference is unhealthy ({tracker_outcome})")
+
+    return {
+        "healthy": not reasons,
+        "reasons": reasons,
+        "gateway_revision": GATEWAY_REVISION,
+        "gpu_tainted": gpu_tainted,
+        "tracker": tracker,
+    }
+
+
+@app.get("/healthz")
+async def healthz(response: Response):
+    snapshot = _runtime_health_snapshot()
+    if not snapshot["healthy"]:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "status": "ok" if snapshot["healthy"] else "degraded",
+        "gateway_revision": snapshot["gateway_revision"],
+        "gpu_tainted": snapshot["gpu_tainted"],
+        "reasons": snapshot["reasons"],
+        "tracker": {
+            "enabled": snapshot["tracker"].get("enabled"),
+            "active": snapshot["tracker"].get("active"),
+            "state": snapshot["tracker"].get("state"),
+            "tracker_task_running": snapshot["tracker"].get("tracker_task_running"),
+            "last_inference_outcome": snapshot["tracker"].get("last_inference_outcome"),
+        },
+    }
+
+
 @app.get("/")
 async def root_health(response: Response):
     if not is_healthy or gpu_tainted:
@@ -941,6 +1037,7 @@ async def root_health(response: Response):
         return {"status": "degraded", "gpu_tainted": gpu_tainted, "reason": health_failure_reason}
     return {
         "status": "ok",
+        "gateway_revision": GATEWAY_REVISION,
         "loaded_models": list(loaded_models.keys()),
         "registered_faces": sorted(list(registered_faces.keys())),
         "tracker": tracker_service.status() if tracker_service is not None else {"enabled": False},
@@ -955,6 +1052,9 @@ async def detailed_status(response: Response):
     return {
         "success": is_healthy and not gpu_tainted,
         "status": "ok" if (is_healthy and not gpu_tainted) else "degraded",
+        "gateway_revision": GATEWAY_REVISION,
+        "health_failure_reason": health_failure_reason,
+        "gpu_tainted": gpu_tainted,
         "canUseGPU": True,
         "executionProvider": "CUDA",
         "queue_depth": queue_depth,
