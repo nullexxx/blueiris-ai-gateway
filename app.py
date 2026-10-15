@@ -151,11 +151,23 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tensorrt_manifest(pt_path: Path) -> dict:
+def _source_model_path(stem: str) -> Optional[Path]:
+    """Return the preferred source weights (.pt or .onnx) for building a TensorRT engine."""
+    pt_path = MODELS_DIR / f"{stem}.pt"
+    if pt_path.exists():
+        return pt_path
+    onnx_path = MODELS_DIR / f"{stem}.onnx"
+    if onnx_path.exists():
+        return onnx_path
+    return None
+
+
+def _tensorrt_manifest(source_path: Path) -> dict:
     props = torch.cuda.get_device_properties(0)
     return {
-        "source_sha256": _sha256_file(pt_path),
-        "source_size": pt_path.stat().st_size,
+        "source_file": source_path.name,
+        "source_sha256": _sha256_file(source_path),
+        "source_size": source_path.stat().st_size,
         "tensorrt": str(tensorrt.__version__),
         "cuda": str(torch.version.cuda),
         "gpu_name": torch.cuda.get_device_name(0),
@@ -166,7 +178,11 @@ def _tensorrt_manifest(pt_path: Path) -> dict:
 
 
 def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
-    """Build a TensorRT engine when its source/runtime manifest is stale."""
+    """Build a TensorRT engine from .pt when its source/runtime manifest is stale.
+
+    Note: Custom standalone .onnx models (like Frigate+) run natively via ONNX Runtime
+    CUDAExecutionProvider, whereas .pt models auto-export to TensorRT .engine.
+    """
     engine_path = MODELS_DIR / f"{stem}.engine"
     pt_path = MODELS_DIR / f"{stem}.pt"
     manifest_path = MODELS_DIR / f"{stem}.trt_manifest.json"
@@ -203,7 +219,7 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
         expected["precision"],
     )
     try:
-        model = YOLO(str(pt_path))
+        model = YOLO(str(pt_path), task="detect")
         model.export(
             format="engine",
             device=0,
@@ -271,19 +287,19 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
 
 
 def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
-    """Loads weights and forces CUDA/TensorRT buffer allocation."""
-    model = YOLO(str(path))
+    """Loads weights and forces CUDA/TensorRT/ONNX Runtime buffer allocation."""
+    ext = path.suffix.lower()
+    is_pt = (ext == ".pt")
+    model = YOLO(str(path)) if is_pt else YOLO(str(path), task="detect")
     dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
     model.predict(dummy_frame, device=0, verbose=False)
 
-    ext = path.suffix.lower()
-    is_pt = (ext == ".pt")
     format_name = "TensorRT" if ext == ".engine" else ("ONNX" if ext == ".onnx" else "PyTorch")
     return model, is_pt, format_name
 
 
 def load_and_warmup_with_recovery_sync(path: Path) -> Tuple[YOLO, bool, str]:
-    """Load a model, rebuilding a broken preferred TensorRT engine once."""
+    """Load a model, rebuilding a broken preferred TensorRT engine once or falling back to .onnx/.pt."""
     try:
         return load_and_warmup_sync(path)
     except Exception as first_exc:
@@ -292,7 +308,17 @@ def load_and_warmup_with_recovery_sync(path: Path) -> Tuple[YOLO, bool, str]:
 
         stem = path.stem
         pt_path = MODELS_DIR / f"{stem}.pt"
+        onnx_path = MODELS_DIR / f"{stem}.onnx"
         if not pt_path.exists():
+            if onnx_path.exists():
+                logger.warning(
+                    "TensorRT engine '%s' failed to load (%s); falling back to %s.",
+                    path.name,
+                    first_exc,
+                    onnx_path.name,
+                )
+                path.unlink(missing_ok=True)
+                return load_and_warmup_sync(onnx_path)
             raise
 
         logger.warning(
@@ -626,9 +652,14 @@ async def lifespan(app: FastAPI):
         discovered = discover_models()
         target_stems = set(discovered.keys())
     elif PRELOAD_MODELS_ENV:
-        target_stems = {s.strip() for s in PRELOAD_MODELS_ENV.split(",") if s.strip()}
+        target_stems = {Path(s.strip()).stem for s in PRELOAD_MODELS_ENV.split(",") if s.strip()}
     else:
         target_stems = {Path(DEFAULT_MODEL_NAME).stem}
+
+    # Ensure tracker model is also in target_stems if tracker is enabled
+    tracker_model_env = os.getenv("TRACKER_MODEL", "").strip()
+    if tracker_model_env:
+        target_stems.add(Path(tracker_model_env).stem)
 
     logger.info("Checking TensorRT engine compilation status...")
     for stem in target_stems:
@@ -640,7 +671,12 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting model preloading sequence...")
     for stem in target_stems:
-        model_path = discovered[stem] if stem in discovered else MODELS_DIR / f"{stem}.pt"
+        if stem in discovered:
+            model_path = discovered[stem]
+        elif (MODELS_DIR / f"{stem}.onnx").exists():
+            model_path = MODELS_DIR / f"{stem}.onnx"
+        else:
+            model_path = MODELS_DIR / f"{stem}.pt"
         try:
             model, is_pt, fmt = await asyncio.to_thread(load_and_warmup_with_recovery_sync, model_path)
             loaded_models[stem] = ModelEntry(model=model, is_pt=is_pt, format_name=fmt)
@@ -656,10 +692,10 @@ async def lifespan(app: FastAPI):
     logger.info("==================================================")
     for name, m in loaded_models.items():
         fp_mode = str(HALF_PRECISION).lower() if m.is_pt else "Native"
-        logger.info(f"  [+] {name:<16} Format: {m.format_name:<8} FP16: {fp_mode}")
+        logger.info(f"  [+] {name:<24} Format: {m.format_name:<8} FP16: {fp_mode}")
     logger.info(f"  [+] Face Recognition Enrolled: {len(registered_faces)} person(s)")
     for name, err in failed_models.items():
-        logger.warning(f"  [!] {name:<16} Error: {err}")
+        logger.warning(f"  [!] {name:<24} Error: {err}")
     logger.info("==================================================")
 
     tracker_cfg = TrackerConfig.from_env()
