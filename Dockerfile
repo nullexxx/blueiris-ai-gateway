@@ -2,7 +2,7 @@ FROM ultralytics/ultralytics:latest
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt onvif-zeep-async
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt onvif-zeep-async onnx>=1.23.2 onnxruntime-gpu>=1.31.0
 RUN pip install --no-cache-dir --no-deps facenet-pytorch
 
 # Pre-cache the VGGFace2 model weights into the container image
