@@ -9,7 +9,7 @@ import math
 import os
 import threading
 import time
-from typing import Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Deque, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
 import cv2
@@ -51,19 +51,14 @@ COCO_TRACKER_CLASSES: Dict[str, int] = {
 def _parse_class_list(value: str, default: List[str]) -> List[str]:
     raw = [item.strip().lower() for item in value.split(",") if item.strip()]
     result: List[str] = []
+    # Class names are resolved against the LOADED model's own label map at
+    # startup (see TrackerConfig.resolve_class_ids), so any label the model
+    # knows is valid (e.g. Frigate+ "raccoon", "fox"). A bare number is kept as
+    # a raw class id for that model; it carries no label, so it cannot take
+    # part in label-based priority. Prefer names.
     for token in (raw or default):
-        if token.isdigit():
-            cid = int(token)
-            name = next((n for n, i in COCO_TRACKER_CLASSES.items() if i == cid), str(cid))
-        else:
-            if token not in COCO_TRACKER_CLASSES:
-                raise ValueError(
-                    f"Unsupported TRACKER target class '{token}'. "
-                    f"Supported names: {', '.join(COCO_TRACKER_CLASSES)}"
-                )
-            name = token
-        if name not in result:
-            result.append(name)
+        if token not in result:
+            result.append(token)
     return result
 
 
@@ -451,13 +446,43 @@ class TrackerConfig:
         cfg.history_size = max(50, min(2000, cfg.history_size))
         return cfg
 
+    def resolve_class_ids(self, model_names: Mapping[int, str]) -> Tuple[List[int], List[str]]:
+        """Map configured class names to the class ids of the loaded model.
+
+        Returns (ids, unresolved_tokens). Different models number classes
+        differently (COCO dog=16, Frigate+ dog=3, Frigate+ 16=license_plate),
+        so ids must come from the model, never from a hardcoded table.
+        """
+        by_label: Dict[str, int] = {}
+        valid_ids = set()
+        for cid, label in model_names.items():
+            valid_ids.add(int(cid))
+            by_label.setdefault(str(label).strip().lower(), int(cid))
+        ids: List[int] = []
+        unresolved: List[str] = []
+        for token in self.target_classes:
+            if token.isdigit():
+                cid = int(token)
+                if cid not in valid_ids:
+                    unresolved.append(token)
+                    continue
+            elif token in by_label:
+                cid = by_label[token]
+            else:
+                unresolved.append(token)
+                continue
+            if cid not in ids:
+                ids.append(cid)
+        return ids, unresolved
+
     @property
     def target_class_ids(self) -> List[int]:
+        """LEGACY COCO-only fallback. Used only when no model label map is available."""
         ids: List[int] = []
         for name in self.target_classes:
             if name.isdigit():
                 ids.append(int(name))
-            else:
+            elif name in COCO_TRACKER_CLASSES:
                 ids.append(COCO_TRACKER_CLASSES[name])
         return ids
 
@@ -1460,10 +1485,19 @@ def _motion_control_decision(
 class DogTracker:
     """Multi-class YOLO tracker using Dahua 3D moveDirectly + bounded autozoom."""
 
-    def __init__(self, cfg: TrackerConfig, inference_cb: InferenceCallback, logger):
+    def __init__(
+        self,
+        cfg: TrackerConfig,
+        inference_cb: InferenceCallback,
+        logger,
+        model_names_cb: Optional[Callable[[str], Optional[Mapping[int, str]]]] = None,
+    ):
         self.cfg = cfg
         self.inference_cb = inference_cb
         self.logger = logger
+        # Returns {class_id: label} for the named model, or None if not loaded.
+        self._model_names_cb = model_names_cb
+        self._resolved_class_ids: Optional[List[int]] = None
         self.capture = LatestFrameCapture(
             cfg.resolved_rtsp_url(),
             open_timeout_s=cfg.rtsp_open_timeout,
@@ -2207,9 +2241,46 @@ class DogTracker:
             )
         return self._servo_onvif_available
 
+    def _active_class_ids(self) -> List[int]:
+        """Class ids to request from the detector, resolved from the model's labels."""
+        if self._resolved_class_ids is not None:
+            return self._resolved_class_ids
+        if self._model_names_cb is None:
+            self.logger.warning(
+                "PTZ tracker: no model label map provider; falling back to COCO class ids "
+                "(only correct for COCO-trained models such as yolo11l)."
+            )
+            return self.cfg.target_class_ids
+        names = self._model_names_cb(self.cfg.model_name)
+        if not names:
+            raise RuntimeError(
+                f"Tracker model '{self.cfg.model_name}' is not loaded, so TRACKER_TARGET_CLASSES "
+                "cannot be resolved. Add it to PRELOAD_MODELS."
+            )
+        ids, unresolved = self.cfg.resolve_class_ids(names)
+        if unresolved:
+            self.logger.error(
+                "PTZ tracker: classes %s do not exist in model '%s' and will be ignored. "
+                "Available labels: %s",
+                unresolved, self.cfg.model_name, sorted(str(v) for v in names.values()),
+            )
+        if not ids:
+            raise RuntimeError(
+                f"None of TRACKER_TARGET_CLASSES {self.cfg.target_classes} exist in model "
+                f"'{self.cfg.model_name}'."
+            )
+        self._resolved_class_ids = ids
+        self.logger.info(
+            "PTZ tracker class map for model '%s': %s",
+            self.cfg.model_name,
+            ", ".join(f"{names[i]}={i}" for i in ids),
+        )
+        return ids
+
     async def initialize(self) -> None:
         if not self.cfg.camera_ip:
             raise RuntimeError("TRACKER_CAMERA_IP is required when TRACKER_ENABLED=true")
+        self._active_class_ids()  # fail loudly at startup on a bad class config
         if not self.cfg.camera_password:
             self.logger.warning("PTZ tracker camera password is empty.")
         self.capture.start()
@@ -3692,7 +3763,14 @@ class DogTracker:
             "frame_shape": list(self._last_frame_shape) if self._last_frame_shape else None,
             "model": self.cfg.model_name,
             "target_classes": list(self.cfg.target_classes),
-            "target_class_ids": list(self.cfg.target_class_ids),
+            "target_class_ids": list(
+                self._resolved_class_ids
+                if self._resolved_class_ids is not None
+                else self.cfg.target_class_ids
+            ),
+            "target_class_ids_source": (
+                "model_labels" if self._resolved_class_ids is not None else "coco_fallback"
+            ),
             "target_priority": list(self.cfg.target_priority),
             "target": target_info,
             "last_seen_ms": last_seen_ms,
@@ -6430,7 +6508,7 @@ class DogTracker:
                     frame,
                     inference_conf,
                     self.cfg.model_name,
-                    self.cfg.target_class_ids,
+                    self._active_class_ids(),
                 )
                 if not self._session_valid(generation):
                     continue
