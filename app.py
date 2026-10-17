@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 import urllib.request
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
@@ -701,7 +701,9 @@ async def lifespan(app: FastAPI):
     tracker_cfg = TrackerConfig.from_env()
     if tracker_cfg.enabled:
         try:
-            tracker_service = DogTracker(tracker_cfg, run_tracker_inference, logger)
+            tracker_service = DogTracker(
+                tracker_cfg, run_tracker_inference, logger, model_names_cb=tracker_model_names
+            )
             await tracker_service.initialize()
         except Exception as e:
             tracker_service = None
@@ -764,6 +766,15 @@ async def get_model_entry(requested_name: str, allow_lazy: bool = True) -> Optio
             logger.error("Failed to lazy load %s: %s", target_path.name, exc)
             failed_models[stem] = str(exc)
             return None
+
+
+def tracker_model_names(model_name: str) -> Optional[Mapping[int, str]]:
+    """Label map ({class_id: label}) of a loaded model, for tracker class resolution."""
+    entry = loaded_models.get(Path(model_name).stem)
+    if entry is None:
+        return None
+    names = getattr(entry.model, "names", None)
+    return dict(names) if names else None
 
 
 async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: str, target_class_ids: List[int]):
