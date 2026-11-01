@@ -2,7 +2,16 @@ FROM ultralytics/ultralytics:latest
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt onvif-zeep-async "onnx>=1.23.2" "onnxruntime-gpu>=1.31.0"
+# onnxruntime-gpu[cuda] pulls the pip CUDA libraries ONNX Runtime needs that the PyTorch base image does not
+# ship (notably cuRAND). Without them the CUDA execution provider fails to load and ONNX models silently run on CPU.
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart tqdm tensorrt onvif-zeep-async "onnx>=1.23.2" "onnxruntime-gpu[cuda]>=1.31.0"
+
+# Fail the build if any CUDA library ONNX Runtime requires is missing (no GPU is needed for this check).
+RUN python3 -c "import os, sys, nvidia, onnxruntime as ort; \
+required = [p for p in ort._get_nvidia_dll_paths(False, True, False) if not any(k in p[-1] for k in ('cufft', 'nvrtc'))]; \
+missing = [p[-1] for p in required if not any(os.path.isfile(os.path.join(base, *p[1:])) for base in nvidia.__path__)]; \
+print('onnxruntime', ort.__version__, 'CUDA libs:', 'MISSING ' + ', '.join(missing) if missing else 'ok'); \
+sys.exit(1 if missing else 0)"
 RUN pip install --no-cache-dir --no-deps facenet-pytorch
 
 # Pre-cache the VGGFace2 model weights into the container image

@@ -181,6 +181,33 @@ class DecodeImageTests(unittest.TestCase):
         )
 
 
+class OnnxProviderDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.provider, = load_functions("_onnx_execution_provider", YOLO=object)
+
+    @staticmethod
+    def model_with(backend):
+        predictor = type("Predictor", (), {"model": backend})()
+        return type("Model", (), {"predictor": predictor})()
+
+    @staticmethod
+    def session(*providers):
+        return type("Session", (), {"get_providers": lambda self: list(providers)})()
+
+    def test_reads_provider_forwarded_by_autobackend(self):
+        backend = type("AutoBackend", (), {"session": self.session("CPUExecutionProvider")})()
+        self.assertEqual(self.provider(self.model_with(backend)), "CPUExecutionProvider")
+
+    def test_reads_provider_from_nested_backend(self):
+        inner = type("ONNXBackend", (), {"session": self.session("CUDAExecutionProvider", "CPUExecutionProvider")})()
+        backend = type("AutoBackend", (), {"backend": inner})()
+        self.assertEqual(self.provider(self.model_with(backend)), "CUDAExecutionProvider")
+
+    def test_unknown_layout_returns_none(self):
+        self.assertIsNone(self.provider(object()))
+        self.assertIsNone(self.provider(self.model_with(object())))
+
+
 class GpuBoundaryContracts(unittest.TestCase):
     def test_request_handlers_do_not_touch_result_tensors(self):
         # Tensor reads on the event loop block it on the GPU with no timeout.

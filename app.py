@@ -364,7 +364,29 @@ def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
     model.predict(dummy_frame, device=0, verbose=False)
 
     format_name = "TensorRT" if ext == ".engine" else ("ONNX" if ext == ".onnx" else "PyTorch")
+    if ext == ".onnx":
+        provider = _onnx_execution_provider(model)
+        if provider is not None and provider != "CUDAExecutionProvider":
+            logger.error(
+                "ONNX model '%s' is running on %s, not the GPU. ONNX Runtime could not load its CUDA "
+                "provider; check the image's CUDA libraries.",
+                path.name,
+                provider,
+            )
+            format_name = "ONNX (CPU)"
     return model, is_pt, format_name
+
+
+def _onnx_execution_provider(model: YOLO) -> Optional[str]:
+    """Execution provider ONNX Runtime actually selected for a loaded ONNX model, if discoverable."""
+    try:
+        backend = model.predictor.model  # Ultralytics AutoBackend (forwards attributes to its backend)
+        session = getattr(backend, "session", None)
+        if session is None:
+            session = getattr(getattr(backend, "backend", None), "session", None)
+        return session.get_providers()[0] if session is not None else None
+    except Exception:
+        return None
 
 
 def load_and_warmup_with_recovery_sync(path: Path) -> Tuple[YOLO, bool, str]:
