@@ -2,22 +2,39 @@ import ast
 from pathlib import Path
 import re
 import unittest
+from _sources import TRACKER_MODULES, tracker_source
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class StaticContracts(unittest.TestCase):
     def test_python_sources_compile_to_ast(self):
-        for name in ("app.py", "tracker.py"):
+        for name in ("app.py", "ptz_enhancements.py", "ptz_phase2.py", "ptz_active_calibration.py", *TRACKER_MODULES):
             ast.parse((ROOT / name).read_text(), filename=name)
 
     def test_every_compose_tracker_variable_is_consumed(self):
         compose = (ROOT / "docker-compose.example.yml").read_text()
-        tracker = (ROOT / "tracker.py").read_text()
+        tracker = tracker_source()
         names = set(re.findall(r"^\s+(TRACKER_[A-Z0-9_]+):", compose, flags=re.MULTILINE))
         self.assertTrue(names)
         missing = sorted(name for name in names if f'"{name}"' not in tracker)
-        self.assertEqual(missing, [], f"Compose tracker settings not consumed by tracker.py: {missing}")
+        self.assertEqual(missing, [], f"Compose tracker settings not consumed by the tracker modules: {missing}")
+
+    def test_every_runtime_module_is_shipped_and_triggers_image_build(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        build = (ROOT / ".github/workflows/build.yml").read_text()
+        modules = sorted(path.name for path in ROOT.glob("*.py"))
+        self.assertIn("app.py", modules)
+        for name in modules:
+            self.assertIn(f"COPY {name} /app/{name}", dockerfile, f"{name} is not copied into the image")
+            self.assertIn(f'      - "{name}"', build, f"changes to {name} do not trigger an image build")
+
+    def test_dockerfile_pip_specifiers_are_quoted(self):
+        # An unquoted `pkg>=1.0` in a RUN line is a shell redirect, silently dropping the constraint.
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        for line in dockerfile.splitlines():
+            if line.startswith("RUN pip install"):
+                self.assertIsNone(re.search(r"\s[A-Za-z0-9_.\-\[\]]+[<>]=?", line), line)
 
     def test_obsolete_tracker_variables_are_gone_from_docs_and_compose(self):
         text = "\n".join(
@@ -43,7 +60,7 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('"compute_capability"', app)
 
     def test_ptz_timeout_stops_when_state_is_unsafe(self):
-        tracker = (ROOT / "tracker.py").read_text()
+        tracker = tracker_source()
         self.assertIn("async def _halt_tracking_for_ptz_failure", tracker)
         self.assertIn("PTZ status remained unavailable", tracker)
         self.assertIn('self.state = "PTZ_ERROR"', tracker)
@@ -54,7 +71,7 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("FROM ultralytics/ultralytics:latest", dockerfile)
 
     def test_second_pass_tracker_safety_contracts(self):
-        tracker = (ROOT / "tracker.py").read_text()
+        tracker = tracker_source()
         compose = (ROOT / "docker-compose.example.yml").read_text()
         self.assertIn("if dist_norm > max_dist and overlap < 0.30", tracker)
         self.assertNotIn("best_score >= 0.20 or best_dist_norm <= max_dist", tracker)
@@ -68,7 +85,7 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('TRACKER_PTZ_STATUS_POLL_INTERVAL: "0.12"', compose)
 
     def test_conservative_zoom_policy(self):
-        tracker = (ROOT / "tracker.py").read_text()
+        tracker = tracker_source()
         compose = (ROOT / "docker-compose.example.yml").read_text()
         self.assertIn('zoom_max_factor: float = 3.0', tracker)
         self.assertIn('zoom_target_min: float = 0.12', tracker)
@@ -84,7 +101,7 @@ class StaticContracts(unittest.TestCase):
 
     def test_face_and_debug_optimizations(self):
         app = (ROOT / "app.py").read_text()
-        tracker = (ROOT / "tracker.py").read_text()
+        tracker = tracker_source()
         self.assertIn("face_detector.extract(img, boxes, None)", app)
         self.assertNotIn("faces = face_detector(img)", app)
         self.assertIn('kwargs["quantize"] = 16', app)

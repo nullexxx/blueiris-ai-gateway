@@ -2,10 +2,11 @@ import ast
 import math
 from pathlib import Path
 import unittest
+from _sources import tracker_block, tracker_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 
 
 def load_large_error_gain():
@@ -22,9 +23,7 @@ def load_large_error_gain():
 
 
 def block(start: str, end: str) -> str:
-    a = TRACKER.index(start)
-    b = TRACKER.index(end, a + len(start))
-    return TRACKER[a:b]
+    return tracker_block(start, end)
 
 
 class Rev62TrackingPerformanceTests(unittest.TestCase):

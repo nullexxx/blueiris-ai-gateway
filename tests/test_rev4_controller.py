@@ -3,10 +3,11 @@ from pathlib import Path
 import unittest
 
 from ptz_phase2 import BBoxMotionValidator
+from _sources import tracker_block, tracker_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 
 
 class Rev4ControllerTests(unittest.TestCase):
@@ -46,9 +47,7 @@ class Rev4ControllerTests(unittest.TestCase):
         self.assertIn("d.confidence >= self.cfg.acquire_conf", TRACKER)
 
     def test_axis_reversal_no_longer_ends_whole_chase(self):
-        start = TRACKER.index("    async def _set_hybrid_chase_speed")
-        end = TRACKER.index("    async def _drive_hybrid_chase", start)
-        block = TRACKER[start:end]
+        block = tracker_block("    async def _set_hybrid_chase_speed", "    async def _drive_hybrid_chase")
         self.assertIn("hybrid_axis_reversal_suppressed", block)
         self.assertIn("hybrid_actuator_pause", TRACKER)
         self.assertIn("command_pan, command_tilt = desired", block)
