@@ -243,8 +243,29 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
         return False
 
 
-def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
-    """Synchronous inference worker executed inside threadpool."""
+def _result_boxes(results) -> List[Tuple[float, float, float, float, float, int]]:
+    """Flatten Ultralytics results into (x1, y1, x2, y2, conf, class_id) rows.
+
+    Copies each result's box tensor to the host in a single transfer instead of
+    one device sync per coordinate. Must run inside the GPU worker so the copy
+    is covered by run_gpu_job's timeout and taint handling.
+    """
+    rows: List[Tuple[float, float, float, float, float, int]] = []
+    for r in results:
+        boxes = getattr(r, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            continue
+        data = boxes.data.cpu().numpy()  # columns: x1, y1, x2, y2, [track_id,] conf, cls
+        for row in data:
+            rows.append((
+                float(row[0]), float(row[1]), float(row[2]), float(row[3]),
+                float(row[-2]), int(row[-1]),
+            ))
+    return rows
+
+
+def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool) -> List[dict]:
+    """Run detection and return plain-Python predictions (executed inside the GPU worker)."""
     kwargs = {
         "conf": min_conf,
         "device": 0,
@@ -253,7 +274,16 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
     if is_pt and HALF_PRECISION:
         kwargs["quantize"] = 16
 
-    return model.predict(img, **kwargs)
+    results = model.predict(img, **kwargs)
+    return [
+        {
+            "confidence": round(conf, 2),
+            "label": model.names[class_id],
+            "x_min": int(x1), "y_min": int(y1),
+            "x_max": int(x2), "y_max": int(y2),
+        }
+        for x1, y1, x2, y2, conf, class_id in _result_boxes(results)
+    ]
 
 
 def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, target_class_ids: List[int]) -> List[dict]:
@@ -269,21 +299,16 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
         kwargs["quantize"] = 16
 
     results = entry.model.predict(frame, **kwargs)
-    predictions: List[dict] = []
-    for r in results:
-        for box in r.boxes:
-            coords = box.xyxy[0].tolist()
-            class_id = int(box.cls[0])
-            predictions.append({
-                "class_id": class_id,
-                "label": str(entry.model.names[class_id]),
-                "confidence": float(box.conf[0]),
-                "x_min": int(coords[0]),
-                "y_min": int(coords[1]),
-                "x_max": int(coords[2]),
-                "y_max": int(coords[3]),
-            })
-    return predictions
+    return [
+        {
+            "class_id": class_id,
+            "label": str(entry.model.names[class_id]),
+            "confidence": conf,
+            "x_min": int(x1), "y_min": int(y1),
+            "x_max": int(x2), "y_max": int(y2),
+        }
+        for x1, y1, x2, y2, conf, class_id in _result_boxes(results)
+    ]
 
 
 def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
@@ -370,30 +395,32 @@ def load_faces_db():
 
 
 def _rebuild_face_matrix():
-    """Stacks every enrolled embedding into one (M, D) matrix + parallel label list.
+    """Stacks every enrolled embedding into one (M, D) CPU matrix + parallel label list.
 
     Rebuilt lazily (only when dirty) so recognize() can do a single batched
     matmul against all enrolled faces instead of looping + torch.cat-ing
-    per user, per detected face, on every request.
+    per user, per detected face, on every request. The matrix deliberately
+    stays on the CPU: it is tiny, and moving it to the GPU happens inside the
+    recognition job so all CUDA work stays behind run_gpu_job.
     """
     global _face_matrix_cache, _face_labels_cache, _face_cache_dirty
     labels: List[str] = []
     mats: List[torch.Tensor] = []
     for user, embs in registered_faces.items():
         for e in embs:
-            mats.append(e)
+            mats.append(e.detach().cpu())
             labels.append(user)
 
-    _face_matrix_cache = torch.cat(mats, dim=0).to("cuda:0") if mats else None
+    _face_matrix_cache = torch.cat(mats, dim=0) if mats else None
     _face_labels_cache = labels
     _face_cache_dirty = False
 
 
 async def _get_face_enrollment_snapshot() -> Tuple[Optional[torch.Tensor], List[str]]:
-    """Return an immutable snapshot of the enrolled face matrix and labels under face_state_lock."""
+    """Return an immutable CPU snapshot of the enrolled face matrix and labels."""
     async with face_state_lock:
         if _face_cache_dirty:
-            await asyncio.to_thread(_rebuild_face_matrix)
+            _rebuild_face_matrix()  # CPU-only and small; no CUDA work here.
         return _face_matrix_cache, list(_face_labels_cache)
 
 
@@ -418,42 +445,40 @@ def sync_face_register_embedding(img: Image.Image) -> Tuple[Optional[torch.Tenso
 def sync_face_recognize(
     img: Image.Image,
     min_conf: float,
-    face_matrix: Optional[torch.Tensor] = None,
-    face_labels: Optional[List[str]] = None,
+    face_matrix: Optional[torch.Tensor],
+    face_labels: List[str],
 ) -> List[dict]:
-    """Detect faces once, extract crops, and compare embeddings against enrollment data."""
+    """Detect faces once, extract crops, and compare embeddings against enrollment data.
+
+    ``face_matrix`` is the CPU snapshot from _get_face_enrollment_snapshot(); it is
+    moved to the GPU here, inside the GPU worker. With nobody enrolled, the
+    embedding model is skipped and every detected face is reported as unknown.
+    """
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
     if boxes is None or len(boxes) == 0:
         return []
 
-    faces = face_detector.extract(img, boxes, None)
-    if faces is None or len(faces) == 0:
-        return []
-
-    faces = faces.to("cuda:0")
-    with torch.no_grad():
-        embeddings = face_recognizer(faces)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-
-    if face_matrix is None and face_labels is None:
-        if _face_cache_dirty:
-            _rebuild_face_matrix()
-        face_matrix = _face_matrix_cache
-        face_labels = _face_labels_cache
-
+    best_sims = best_idx = None
     if face_matrix is not None and face_labels:
-        sims = embeddings @ face_matrix.T
-        best_sims, best_idx = sims.max(dim=1)
-    else:
-        best_sims = best_idx = None
+        faces = face_detector.extract(img, boxes, None)
+        if faces is None or len(faces) == 0:
+            return []
+
+        with torch.no_grad():
+            embeddings = face_recognizer(faces.to("cuda:0"))
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+            sims = embeddings @ face_matrix.to(embeddings.device, embeddings.dtype).T
+            best_sims, best_idx = sims.max(dim=1)
+        best_sims = best_sims.cpu().tolist()
+        best_idx = best_idx.cpu().tolist()
 
     predictions = []
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box.tolist()
-        if best_sims is not None and face_labels is not None:
-            sim = float(best_sims[i].item())
-            matched_id = face_labels[int(best_idx[i].item())] if sim >= min_conf else "unknown"
+        if best_sims is not None:
+            sim = float(best_sims[i])
+            matched_id = face_labels[int(best_idx[i])] if sim >= min_conf else "unknown"
         else:
             sim = 0.0
             matched_id = "unknown"
@@ -837,25 +862,36 @@ async def run_tracker_inference(frame: np.ndarray, min_conf: float, model_name: 
         return "error", [], int((time.perf_counter() - t_infer_start) * 1000)
 
 
+def _failure(error: str, t_start: float, t_infer_start: Optional[float] = None) -> dict:
+    """CodeProject.AI-style failure payload with timing fields."""
+    now = time.perf_counter()
+    return {
+        "success": False,
+        "error": error,
+        "inferenceMs": int((now - t_infer_start) * 1000) if t_infer_start is not None else 0,
+        "processMs": int((now - t_start) * 1000),
+    }
+
+
 async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_start: float):
     if not is_healthy:
-        return {"success": False, "error": f"Gateway shutting down: {health_failure_reason}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(f"Gateway shutting down: {health_failure_reason}", t_start)
     if gpu_tainted:
-        return {"success": False, "error": "GPU execution frozen during recovery grace window.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure("GPU execution frozen during recovery grace window.", t_start)
 
     try:
         entry = await get_model_entry(model_name)
         if entry is None:
-            return {"success": False, "error": f"Model '{model_name}' is not loaded or available on server.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+            return _failure(f"Model '{model_name}' is not loaded or available on server.", t_start)
         img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(image_bytes)).convert("RGB"))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        return {"success": False, "error": f"Bad request/corrupt image: {exc}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(f"Bad request/corrupt image: {exc}", t_start)
 
     t_infer_start = time.perf_counter()
     try:
-        results = await run_gpu_job(
+        predictions = await run_gpu_job(
             sync_predict,
             entry.model,
             img,
@@ -866,27 +902,16 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
             enqueue=True,
         )
     except GpuJobTimeoutError as exc:
-        return {"success": False, "error": str(exc), "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(str(exc), t_start, t_infer_start)
     except GpuUnavailableError as exc:
-        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(str(exc), t_start)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         logger.error("Inference error on '%s': %s", model_name, exc, exc_info=True)
-        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(str(exc), t_start)
 
     t_infer_end = time.perf_counter()
-    predictions = []
-    for result in results:
-        for box in result.boxes:
-            coords = box.xyxy[0].tolist()
-            predictions.append({
-                "confidence": round(float(box.conf[0]), 2),
-                "label": entry.model.names[int(box.cls[0])],
-                "x_min": int(coords[0]), "y_min": int(coords[1]),
-                "x_max": int(coords[2]), "y_max": int(coords[3]),
-            })
-
     return {
         "success": True,
         "message": f"{len(predictions)} object(s) detected",
@@ -994,13 +1019,13 @@ async def face_recognize(
 ):
     t_start = time.perf_counter()
     if face_detector is None or face_recognizer is None:
-        return {"success": False, "error": "Face recognition is unavailable.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure("Face recognition is unavailable.", t_start)
 
     contents = await image.read()
     try:
         img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
     except Exception as exc:
-        return {"success": False, "error": f"Invalid image: {exc}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(f"Invalid image: {exc}", t_start)
 
     t_infer_start = time.perf_counter()
     try:
@@ -1016,12 +1041,12 @@ async def face_recognize(
             enqueue=True,
         )
     except (GpuJobTimeoutError, GpuUnavailableError) as exc:
-        return {"success": False, "error": str(exc), "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(str(exc), t_start, t_infer_start)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         logger.error("Face recognition failed: %s", exc, exc_info=True)
-        return {"success": False, "error": str(exc), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+        return _failure(str(exc), t_start)
 
     t_infer_end = time.perf_counter()
     return {
