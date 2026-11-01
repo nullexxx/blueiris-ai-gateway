@@ -137,6 +137,8 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `RECOVERY_GRACE_PERIOD` | `4.0` | Grace period for an orphaned CUDA worker before the container self-terminates. |
 | `MAX_FACE_EMBEDDINGS_PER_USER` | `20` | Maximum saved FaceNet embeddings per enrolled identity; oldest samples are discarded first. |
 | `ALERT_WEBHOOK_URL` | blank | Optional crash-alert webhook. |
+| `DETECTION_DECODE_MAX_SIDE` | `0` (off) | Decode large JPEGs for YOLO detection at 1/2, 1/4 or 1/8 size (libjpeg DCT scaling) while keeping the long side at or above this many pixels. Boxes are scaled back to original-image coordinates. `1280` is a safe value for 640-input models and roughly halves decode time for 4K frames. |
+| `FACE_DECODE_MAX_SIDE` | `0` (off) | Same as above for `/v1/vision/face/recognize`. Leave off unless faces are large in frame: shrinking the image can make small faces undetectable. Face registration always decodes at full resolution. |
 
 ## Tracker Environment Variables
 

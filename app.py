@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sys
@@ -51,6 +52,21 @@ MODEL_LOAD_TIMEOUT = float(os.getenv("MODEL_LOAD_TIMEOUT", "180.0"))
 RECOVERY_GRACE_PERIOD = float(os.getenv("RECOVERY_GRACE_PERIOD", "4.0"))
 MAX_FACE_EMBEDDINGS_PER_USER = max(1, min(100, int(os.getenv("MAX_FACE_EMBEDDINGS_PER_USER", "20"))))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+
+
+def _env_decode_side(name: str) -> int:
+    try:
+        return max(0, int(os.getenv(name, "0")))
+    except ValueError:
+        return 0
+
+
+# Optional reduced-size JPEG decoding (0 = off). Large JPEGs are decoded via
+# libjpeg DCT scaling to the smallest 1/2, 1/4 or 1/8 size whose long side is
+# still >= this many pixels; returned boxes are scaled back to the original
+# image, so callers see full-resolution coordinates either way.
+DETECTION_DECODE_MAX_SIDE = _env_decode_side("DETECTION_DECODE_MAX_SIDE")
+FACE_DECODE_MAX_SIDE = _env_decode_side("FACE_DECODE_MAX_SIDE")
 
 MODEL_EXT_PRIORITY = [".engine", ".onnx", ".pt"]
 
@@ -243,6 +259,23 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
         return False
 
 
+def decode_image(image_bytes: bytes, max_side: int = 0) -> Tuple[Image.Image, float, float]:
+    """Decode upload bytes to RGB, optionally using JPEG DCT scaling.
+
+    Returns ``(image, scale_x, scale_y)`` where the scales map decoded-image
+    pixel coordinates back to the original image.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    orig_w, orig_h = img.size
+    long_side = max(orig_w, orig_h)
+    if max_side > 0 and img.format == "JPEG" and long_side >= 2 * max_side:
+        ratio = max_side / long_side
+        img.draft("RGB", (max(1, math.ceil(orig_w * ratio)), max(1, math.ceil(orig_h * ratio))))
+    img = img.convert("RGB")
+    width, height = img.size
+    return img, orig_w / width, orig_h / height
+
+
 def _result_boxes(results) -> List[Tuple[float, float, float, float, float, int]]:
     """Flatten Ultralytics results into (x1, y1, x2, y2, conf, class_id) rows.
 
@@ -264,8 +297,19 @@ def _result_boxes(results) -> List[Tuple[float, float, float, float, float, int]
     return rows
 
 
-def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool) -> List[dict]:
-    """Run detection and return plain-Python predictions (executed inside the GPU worker)."""
+def sync_predict(
+    model: YOLO,
+    img: Image.Image,
+    min_conf: float,
+    is_pt: bool,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> List[dict]:
+    """Run detection and return plain-Python predictions (executed inside the GPU worker).
+
+    ``scale_x``/``scale_y`` map coordinates on a reduced-size decode back to the
+    original image (see decode_image).
+    """
     kwargs = {
         "conf": min_conf,
         "device": 0,
@@ -279,8 +323,8 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool) ->
         {
             "confidence": round(conf, 2),
             "label": model.names[class_id],
-            "x_min": int(x1), "y_min": int(y1),
-            "x_max": int(x2), "y_max": int(y2),
+            "x_min": int(x1 * scale_x), "y_min": int(y1 * scale_y),
+            "x_max": int(x2 * scale_x), "y_max": int(y2 * scale_y),
         }
         for x1, y1, x2, y2, conf, class_id in _result_boxes(results)
     ]
@@ -447,6 +491,8 @@ def sync_face_recognize(
     min_conf: float,
     face_matrix: Optional[torch.Tensor],
     face_labels: List[str],
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
 ) -> List[dict]:
     """Detect faces once, extract crops, and compare embeddings against enrollment data.
 
@@ -487,10 +533,10 @@ def sync_face_recognize(
             "confidence": round(sim, 2),
             "userid": matched_id,
             "label": matched_id,
-            "x_min": int(max(0, x1)),
-            "y_min": int(max(0, y1)),
-            "x_max": int(x2),
-            "y_max": int(y2),
+            "x_min": int(max(0, x1) * scale_x),
+            "y_min": int(max(0, y1) * scale_y),
+            "x_max": int(x2 * scale_x),
+            "y_max": int(y2 * scale_y),
         })
 
     return predictions
@@ -883,7 +929,7 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
         entry = await get_model_entry(model_name)
         if entry is None:
             return _failure(f"Model '{model_name}' is not loaded or available on server.", t_start)
-        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+        img, scale_x, scale_y = await asyncio.to_thread(decode_image, image_bytes, DETECTION_DECODE_MAX_SIDE)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -897,6 +943,8 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
             img,
             min_conf,
             entry.is_pt,
+            scale_x,
+            scale_y,
             label=f"Inference on '{model_name}'",
             timeout=INFERENCE_TIMEOUT,
             enqueue=True,
@@ -959,7 +1007,7 @@ async def face_register(
 
     contents = await image.read()
     try:
-        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
+        img, _, _ = await asyncio.to_thread(decode_image, contents)
     except Exception as exc:
         return {"success": False, "error": f"Invalid image: {exc}"}
 
@@ -1023,7 +1071,7 @@ async def face_recognize(
 
     contents = await image.read()
     try:
-        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
+        img, scale_x, scale_y = await asyncio.to_thread(decode_image, contents, FACE_DECODE_MAX_SIDE)
     except Exception as exc:
         return _failure(f"Invalid image: {exc}", t_start)
 
@@ -1036,6 +1084,8 @@ async def face_recognize(
             min_confidence,
             face_matrix,
             face_labels,
+            scale_x,
+            scale_y,
             label="Face recognition",
             timeout=INFERENCE_TIMEOUT,
             enqueue=True,
