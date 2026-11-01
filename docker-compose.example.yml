@@ -17,6 +17,7 @@ services:
       PRELOAD_MODELS: "${PRELOAD_MODELS:-yolo11m}"
       ALLOW_LAZY_LOAD: "false"
       HALF_PRECISION: "true"
+      TENSORRT_FROM_ONNX: "true"
       INFERENCE_TIMEOUT: "8.0"
       MODEL_LOAD_TIMEOUT: "180.0"
       RECOVERY_GRACE_PERIOD: "4.0"

@@ -8,7 +8,7 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 ## Features
 
 - **Blue Iris-oriented object detection** using Ultralytics YOLO.
-- **TensorRT / CUDA acceleration** with automatic `.pt` -> `.engine` compilation when needed.
+- **TensorRT / CUDA acceleration** with automatic `.pt` or `.onnx` -> `.engine` compilation when needed.
 - **Built-in face recognition** using `facenet-pytorch` (`MTCNN` + `InceptionResnetV1`).
 - **GPU watchdog / tainted-pipeline protection** so a timed-out CUDA worker cannot immediately be followed by another GPU job.
 - **Fatal CUDA-context recovery** that terminates the process on sticky launch-timeout/illegal-address/device-assert failures so Docker can recreate a clean CUDA context.
@@ -65,7 +65,7 @@ in that directory. On startup, the gateway prefers models in this order:
 .engine -> .onnx -> .pt
 ```
 
-If a `.pt` model exists without a matching TensorRT engine, the gateway can build the `.engine` automatically. A per-model manifest records the source-weight SHA-256, TensorRT/CUDA versions, GPU identity/compute capability, image size, and precision. A source/runtime change invalidates the cached engine, and an engine load failure triggers one rebuild attempt before falling back to the `.pt` model.
+If a `.pt` or `.onnx` model (for example a Frigate+ model) exists without a matching TensorRT engine, the gateway builds the `.engine` automatically at startup (FP16 when `HALF_PRECISION=true`; this takes a few minutes the first time). `.pt` weights are preferred as the build source when both exist. A per-model manifest records the source-file SHA-256, TensorRT/CUDA versions, GPU identity/compute capability, image size, and precision. A source/runtime change invalidates the cached engine. An engine load failure triggers one rebuild attempt for `.pt` models; an engine built from `.onnx` falls back to ONNX Runtime. A failed build is recorded in `<model>.trt_failed.json` and is not retried on every restart until the model, GPU, TensorRT or CUDA version changes (delete that file to retry sooner). Set `TENSORRT_FROM_ONNX=false` to keep `.onnx` models on ONNX Runtime (also delete any `<model>.engine` already built from it).
 
 ## API Endpoints
 
@@ -136,6 +136,7 @@ ONNX models exported outside Ultralytics (for example Frigate+ models) usually c
 | `PRELOAD_MODELS` | blank | Comma-separated model stems to preload, or `all`. If blank, the default model is loaded. |
 | `ALLOW_LAZY_LOAD` | `false` | Allow requested models to load on demand. |
 | `HALF_PRECISION` | `true` | Use FP16 where supported. |
+| `TENSORRT_FROM_ONNX` | `true` | Build cached TensorRT engines for `.onnx`-only models (e.g. Frigate+), falling back to ONNX Runtime on failure. |
 | `INFERENCE_TIMEOUT` | `8.0` | Runtime CUDA job timeout in seconds. Applies to YOLO and FaceNet. |
 | `MODEL_LOAD_TIMEOUT` | `180.0` | Timeout for an optional lazy model load/warmup. |
 | `RECOVERY_GRACE_PERIOD` | `4.0` | Grace period for an orphaned CUDA worker before the container self-terminates. |

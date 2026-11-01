@@ -259,8 +259,10 @@ class LabelMapTests(unittest.TestCase):
         self.write(FRIGATE_PLUS_JSON)
         for ext in (".onnx", ".engine", ".pt"):
             names = self.load(self.dir / f"frigate_yolov9c_640{ext}")
-            self.assertEqual(names, {0: "person", 1: "dhl", 16: "license_plate", 29: "car"})
-            self.assertEqual(list(names), [0, 1, 16, 29])
+            self.assertEqual((names[0], names[1], names[16], names[29]), ("person", "dhl", "license_plate", "car"))
+            # Gaps are filled so ids are contiguous 0..N-1, as Ultralytics requires.
+            self.assertEqual(list(names), list(range(30)))
+            self.assertEqual(names[2], "class2")
 
     def test_accepts_names_object_list_and_plain_map(self):
         self.write({"names": {"0": "a", "1": "b"}}, "m1.json")

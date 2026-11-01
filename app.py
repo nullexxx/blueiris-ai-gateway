@@ -1,3 +1,4 @@
+import ast
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -67,6 +68,10 @@ def _env_decode_side(name: str) -> int:
 # image, so callers see full-resolution coordinates either way.
 DETECTION_DECODE_MAX_SIDE = _env_decode_side("DETECTION_DECODE_MAX_SIDE")
 FACE_DECODE_MAX_SIDE = _env_decode_side("FACE_DECODE_MAX_SIDE")
+
+# Build cached TensorRT engines for ONNX-only models (e.g. Frigate+) as is done for .pt weights.
+# Falls back to ONNX Runtime if the build or load fails.
+TENSORRT_FROM_ONNX = os.getenv("TENSORRT_FROM_ONNX", "true").lower() in ("true", "1")
 
 MODEL_EXT_PRIORITY = [".engine", ".onnx", ".pt"]
 
@@ -148,6 +153,8 @@ def discover_models() -> Dict[str, Path]:
     """Map model stem -> best available file on disk (Engine > ONNX > PyTorch)."""
     all_files = list(MODELS_DIR.glob("*.*"))
     stems = {f.stem for f in all_files if f.suffix.lower() in MODEL_EXT_PRIORITY}
+    # TensorRT 11 FP16 builds leave a "<stem>.fp16.onnx" intermediate; it is not a separate model.
+    stems = {s for s in stems if not (s.endswith(".fp16") and s[: -len(".fp16")] in stems)}
 
     found: Dict[str, Path] = {}
     for stem in stems:
@@ -193,21 +200,98 @@ def _tensorrt_manifest(source_path: Path) -> dict:
     }
 
 
-def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
-    """Build a TensorRT engine from .pt when its source/runtime manifest is stale.
+def _trt_paths(stem: str) -> Tuple[Path, Path, Path]:
+    return (
+        MODELS_DIR / f"{stem}.engine",
+        MODELS_DIR / f"{stem}.trt_manifest.json",
+        MODELS_DIR / f"{stem}.trt_failed.json",
+    )
 
-    Note: Custom standalone .onnx models (like Frigate+) run natively via ONNX Runtime
-    CUDAExecutionProvider, whereas .pt models auto-export to TensorRT .engine.
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+    os.replace(temp, path)
+
+
+def _mark_tensorrt_failed(stem: str, expected: dict) -> None:
+    """Remember a failed build so every restart doesn't retry a multi-minute build that will fail again.
+
+    The marker is ignored as soon as the source model, GPU, TensorRT or CUDA version changes.
     """
-    engine_path = MODELS_DIR / f"{stem}.engine"
-    pt_path = MODELS_DIR / f"{stem}.pt"
-    manifest_path = MODELS_DIR / f"{stem}.trt_manifest.json"
+    try:
+        _write_json_atomic(_trt_paths(stem)[2], expected)
+    except OSError as exc:
+        logger.warning("Could not record TensorRT build failure for '%s': %s", stem, exc)
+
+
+def _onnx_engine_metadata(onnx_path: Path) -> Tuple[dict, Tuple[int, int, int, int], bool]:
+    """Ultralytics metadata, input shape and dynamic flag for building an engine from an ONNX file."""
+    import onnx  # noqa: PLC0415 - only needed when building engines
+    from ultralytics.nn.backends.base import BaseBackend  # noqa: PLC0415
+
+    metadata = dict(BaseBackend.read_metadata(onnx_path) or {})
+    graph_input = onnx.load(str(onnx_path), load_external_data=False).graph.input[0]
+    dims = [d.dim_value if d.dim_value > 0 else -1 for d in graph_input.type.tensor_type.shape.dim]
+    dynamic = len(dims) != 4 or any(d <= 0 for d in dims)
+
+    imgsz = metadata.get("imgsz")
+    if isinstance(imgsz, str):
+        imgsz = ast.literal_eval(imgsz)
+    if isinstance(imgsz, int):
+        imgsz = [imgsz, imgsz]
+    if not imgsz:
+        imgsz = dims[2:4] if not dynamic else [640, 640]
+    height, width = int(imgsz[0]), int(imgsz[1])
+
+    args = metadata.get("args") or {}
+    if isinstance(args, str):
+        args = ast.literal_eval(args)
+    args = {**args, "dynamic": dynamic, "batch": 1}
+    metadata.update(
+        task=metadata.get("task", "detect"),
+        batch=1,
+        imgsz=[height, width],
+        stride=int(metadata.get("stride", 32)),
+        args=args,
+    )
+    label_map = load_label_map(onnx_path)
+    if label_map:
+        metadata["names"] = label_map
+    return metadata, (1, 3, height, width), dynamic
+
+
+def _build_engine_from_onnx(onnx_path: Path, engine_path: Path) -> None:
+    """Build an Ultralytics-compatible TensorRT engine (metadata header + plan) from an ONNX model."""
+    from ultralytics.utils.export.engine import onnx2engine  # noqa: PLC0415
+
+    metadata, shape, dynamic = _onnx_engine_metadata(onnx_path)
+    onnx2engine(
+        str(onnx_path),
+        output_file=engine_path,
+        quantize=16 if HALF_PRECISION else None,
+        dynamic=dynamic,
+        shape=shape,
+        metadata=metadata,
+        prefix="TensorRT:",
+    )
+
+
+def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
+    """Build a cached TensorRT engine from .pt (preferred) or .onnx when its manifest is stale.
+
+    The manifest records the source file hash, GPU, TensorRT/CUDA versions and precision,
+    so engines rebuild automatically when any of them change. Returns True when a usable
+    engine is in place.
+    """
+    engine_path, manifest_path, failed_path = _trt_paths(stem)
     legacy_stamp_path = MODELS_DIR / f"{stem}.trt_version"
 
-    if not pt_path.exists():
+    source_path = _source_model_path(stem)
+    if source_path is None or (source_path.suffix == ".onnx" and not TENSORRT_FROM_ONNX):
         return engine_path.exists()
 
-    expected = _tensorrt_manifest(pt_path)
+    expected = _tensorrt_manifest(source_path)
     current = None
     if manifest_path.exists():
         try:
@@ -219,6 +303,18 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
     if not needs_rebuild:
         return True
 
+    if not force and failed_path.exists():
+        try:
+            if json.loads(failed_path.read_text()) == expected:
+                logger.warning(
+                    "Skipping TensorRT build for '%s': it already failed for this model/GPU/TensorRT; "
+                    "using %s. Delete %s to retry.",
+                    stem, source_path.name, failed_path.name,
+                )
+                return False
+        except Exception:
+            pass
+
     if engine_path.exists():
         logger.warning("Rebuilding stale TensorRT engine for '%s'.", stem)
         try:
@@ -229,34 +325,41 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
     manifest_path.unlink(missing_ok=True)
 
     logger.info(
-        "Compiling TensorRT engine for '%s' on %s (%s)...",
+        "Compiling TensorRT engine for '%s' from %s on %s (%s); this can take a few minutes...",
         stem,
+        source_path.name,
         expected["gpu_name"],
         expected["precision"],
     )
     try:
-        model = YOLO(str(pt_path), task="detect")
-        model.export(
-            format="engine",
-            device=0,
-            quantize=(16 if HALF_PRECISION else 32),
-            imgsz=640,
-            dynamic=False,
-        )
+        if source_path.suffix == ".pt":
+            model = YOLO(str(source_path), task="detect")
+            model.export(
+                format="engine",
+                device=0,
+                quantize=(16 if HALF_PRECISION else 32),
+                imgsz=640,
+                dynamic=False,
+            )
+        else:
+            _build_engine_from_onnx(source_path, engine_path)
         if not engine_path.exists():
-            raise RuntimeError(f"Ultralytics export did not create {engine_path}")
+            raise RuntimeError(f"TensorRT build did not create {engine_path}")
 
-        temp_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
-        temp_manifest.write_text(json.dumps(expected, sort_keys=True, indent=2) + "\n")
-        os.replace(temp_manifest, manifest_path)
+        _write_json_atomic(manifest_path, expected)
         legacy_stamp_path.unlink(missing_ok=True)
+        failed_path.unlink(missing_ok=True)
         logger.info("Successfully compiled and cached: %s", engine_path.name)
         return True
     except Exception as exc:
         logger.error("Failed to auto-compile engine for '%s': %s", stem, exc, exc_info=True)
         engine_path.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
+        _mark_tensorrt_failed(stem, expected)
         return False
+    finally:
+        # TensorRT 11 FP16 builds write a ModelOpt "<stem>.fp16.onnx" intermediate next to the source.
+        (MODELS_DIR / f"{stem}.fp16.onnx").unlink(missing_ok=True)
 
 
 def decode_image(image_bytes: bytes, max_side: int = 0) -> Tuple[Image.Image, float, float]:
@@ -409,10 +512,13 @@ def load_label_map(model_path: Path) -> Optional[Dict[int, str]]:
         if not isinstance(mapping, dict) or not mapping:
             raise ValueError("no labelMap/names mapping found")
         names = {int(k): str(v) for k, v in mapping.items()}
+        if min(names) < 0:
+            raise ValueError("class ids must be >= 0")
     except Exception as exc:
         logger.warning("Ignoring label file %s: %s", sidecar.name, exc)
         return None
-    return dict(sorted(names.items()))
+    # Ultralytics requires contiguous ids 0..N-1; fill any gaps with generic names.
+    return {i: names.get(i, f"class{i}") for i in range(max(names) + 1)}
 
 
 def _apply_label_map(model: YOLO, names: Dict[int, str], source: str) -> None:
@@ -462,6 +568,11 @@ def load_and_warmup_with_recovery_sync(path: Path) -> Tuple[YOLO, bool, str]:
                     onnx_path.name,
                 )
                 path.unlink(missing_ok=True)
+                (MODELS_DIR / f"{stem}.trt_manifest.json").unlink(missing_ok=True)
+                try:
+                    _mark_tensorrt_failed(stem, _tensorrt_manifest(onnx_path))
+                except Exception:
+                    pass
                 return load_and_warmup_sync(onnx_path)
             raise
 
