@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install PTZ calibration test dependencies
-        run: pip install numpy opencv-python-headless
+        run: pip install numpy opencv-python-headless pillow
       - name: Compile Python sources
         run: python -m py_compile *.py
       - name: Run static contract tests
