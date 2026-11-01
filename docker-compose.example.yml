@@ -21,6 +21,9 @@ services:
       MODEL_LOAD_TIMEOUT: "180.0"
       RECOVERY_GRACE_PERIOD: "4.0"
       MAX_FACE_EMBEDDINGS_PER_USER: "20"
+      # Optional faster JPEG decode for large frames (0 = off). See README.
+      DETECTION_DECODE_MAX_SIDE: "0"
+      FACE_DECODE_MAX_SIDE: "0"
       OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp"
       ALERT_WEBHOOK_URL: "${ALERT_WEBHOOK_URL:-}"
       NVIDIA_VISIBLE_DEVICES: "all"

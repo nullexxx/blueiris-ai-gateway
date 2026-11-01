@@ -5,11 +5,18 @@ functions under test are isolated from the source with ``ast`` and exercised
 against small stand-ins for Ultralytics result objects.
 """
 import ast
+import io
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 import unittest
 
 import numpy as np
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - Pillow is installed in CI
+    Image = None
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_TEXT = (ROOT / "app.py").read_text()
@@ -120,6 +127,58 @@ class DetectionPostprocessTests(unittest.TestCase):
         model = FakeModel([])
         self.assertEqual(sync_predict(model, object(), 0.4, False), [])
         self.assertNotIn("quantize", model.calls[0])
+
+
+def encode(width: int, height: int, fmt: str = "JPEG") -> bytes:
+    rng = np.random.default_rng(0)
+    pixels = rng.integers(0, 255, size=(height, width, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(pixels).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+@unittest.skipIf(Image is None, "Pillow is not installed")
+class DecodeImageTests(unittest.TestCase):
+    def setUp(self):
+        self.decode, = load_functions("decode_image", Image=Image, io=io, math=math)
+
+    def test_disabled_decodes_full_resolution(self):
+        img, sx, sy = self.decode(encode(3840, 2160), 0)
+        self.assertEqual(img.size, (3840, 2160))
+        self.assertEqual((sx, sy), (1.0, 1.0))
+        self.assertEqual(img.mode, "RGB")
+
+    def test_large_jpeg_keeps_long_side_at_or_above_target(self):
+        img, sx, sy = self.decode(encode(3840, 2160), 1280)
+        self.assertEqual(img.size, (1920, 1080))
+        self.assertEqual((sx, sy), (2.0, 2.0))
+        img, sx, sy = self.decode(encode(3840, 2160), 640)
+        self.assertEqual(img.size, (960, 540))
+        self.assertEqual((sx, sy), (4.0, 4.0))
+
+    def test_portrait_and_odd_sizes_map_back_to_original(self):
+        img, sx, sy = self.decode(encode(1521, 2689), 640)
+        self.assertGreaterEqual(max(img.size), 640)
+        self.assertAlmostEqual(img.size[0] * sx, 1521, places=6)
+        self.assertAlmostEqual(img.size[1] * sy, 2689, places=6)
+
+    def test_small_jpeg_and_non_jpeg_are_untouched(self):
+        img, sx, _ = self.decode(encode(1000, 600), 640)  # cannot halve without going below 640
+        self.assertEqual((img.size, sx), ((1000, 600), 1.0))
+        img, sx, _ = self.decode(encode(2560, 1440, "PNG"), 640)
+        self.assertEqual((img.size, sx), ((2560, 1440), 1.0))
+
+    def test_predictions_are_scaled_back_to_original_pixels(self):
+        _, sync_predict = load_functions(
+            "_result_boxes", "sync_predict",
+            YOLO=object, Image=Placeholder, HALF_PRECISION=False,
+        )
+        model = FakeModel([FakeResult([[100, 50, 200, 150, 0.9, 0]])])
+        predictions = sync_predict(model, object(), 0.4, False, 4.0, 4.0)
+        self.assertEqual(
+            (predictions[0]["x_min"], predictions[0]["y_min"], predictions[0]["x_max"], predictions[0]["y_max"]),
+            (400, 200, 800, 600),
+        )
 
 
 class GpuBoundaryContracts(unittest.TestCase):
