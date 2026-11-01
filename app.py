@@ -319,10 +319,11 @@ def sync_predict(
         kwargs["quantize"] = 16
 
     results = model.predict(img, **kwargs)
+    names = model.names
     return [
         {
             "confidence": round(conf, 2),
-            "label": model.names[class_id],
+            "label": names.get(class_id, f"class{class_id}"),
             "x_min": int(x1 * scale_x), "y_min": int(y1 * scale_y),
             "x_max": int(x2 * scale_x), "y_max": int(y2 * scale_y),
         }
@@ -343,10 +344,11 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
         kwargs["quantize"] = 16
 
     results = entry.model.predict(frame, **kwargs)
+    names = entry.model.names
     return [
         {
             "class_id": class_id,
-            "label": str(entry.model.names[class_id]),
+            "label": str(names.get(class_id, f"class{class_id}")),
             "confidence": conf,
             "x_min": int(x1), "y_min": int(y1),
             "x_max": int(x2), "y_max": int(y2),
@@ -361,7 +363,17 @@ def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
     is_pt = (ext == ".pt")
     model = YOLO(str(path)) if is_pt else YOLO(str(path), task="detect")
     dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-    model.predict(dummy_frame, device=0, verbose=False)
+    # Warm up with the same predictor-setup arguments real requests use (device, quantize):
+    # Ultralytics rebuilds its predictor when those change, which would discard the warm-up
+    # and any class-name override applied below.
+    warmup_kwargs = {"device": 0, "verbose": False}
+    if is_pt and HALF_PRECISION:
+        warmup_kwargs["quantize"] = 16
+    model.predict(dummy_frame, **warmup_kwargs)
+
+    label_map = load_label_map(path)
+    if label_map:
+        _apply_label_map(model, label_map, path.with_suffix(".json").name)
 
     format_name = "TensorRT" if ext == ".engine" else ("ONNX" if ext == ".onnx" else "PyTorch")
     if ext == ".onnx":
@@ -375,6 +387,47 @@ def load_and_warmup_sync(path: Path) -> Tuple[YOLO, bool, str]:
             )
             format_name = "ONNX (CPU)"
     return model, is_pt, format_name
+
+
+def load_label_map(model_path: Path) -> Optional[Dict[int, str]]:
+    """Class names from a ``<stem>.json`` file beside the model, if present.
+
+    Accepts the model JSON Frigate+ ships with each model (its ``labelMap``), a
+    ``{"names": {...}}`` object, or a plain ``{"0": "person", ...}`` map. Third-party
+    exports (e.g. Frigate+ ONNX) usually carry no class names, in which case
+    Ultralytics would report generic ``class0``/``class1`` labels.
+    """
+    sidecar = model_path.with_suffix(".json")
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text())
+        if isinstance(data, dict):
+            mapping = data.get("labelMap", data.get("names", data))
+        else:
+            mapping = dict(enumerate(data)) if isinstance(data, list) else None
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("no labelMap/names mapping found")
+        names = {int(k): str(v) for k, v in mapping.items()}
+    except Exception as exc:
+        logger.warning("Ignoring label file %s: %s", sidecar.name, exc)
+        return None
+    return dict(sorted(names.items()))
+
+
+def _apply_label_map(model: YOLO, names: Dict[int, str], source: str) -> None:
+    """Override a loaded model's class names (after warm-up, when the predictor exists)."""
+    auto_backend = model.predictor.model
+    target = getattr(auto_backend, "backend", None) or auto_backend
+    current = dict(getattr(target, "names", None) or {})
+    generic = all(str(v) == f"class{k}" for k, v in current.items())
+    if current and not generic and current != names:
+        logger.warning(
+            "Model's embedded class names differ from %s; using %s (%d labels).",
+            source, source, len(names),
+        )
+    target.names = dict(names)
+    logger.info("Using %d class labels from %s.", len(names), source)
 
 
 def _onnx_execution_provider(model: YOLO) -> Optional[str]:

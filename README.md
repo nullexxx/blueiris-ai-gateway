@@ -124,6 +124,10 @@ Target-loss timing is paused while the camera is moving so global image motion i
 
 The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, including an Amcrest IP2M-863EW-AI. Other cameras may require changes to the PTZ transport or coordinate behavior.
 
+## Custom Model Labels (Frigate+ and other third-party exports)
+
+ONNX models exported outside Ultralytics (for example Frigate+ models) usually carry no class names, so detections would come back as `class0`, `class1`, and so on. Put a JSON file with the same name as the model next to it in `/app/models`, for example `frigate_yolov9c_640.onnx` + `frigate_yolov9c_640.json`. The model JSON Frigate+ provides with each download works as-is (its `labelMap` is used). A plain `{"0": "person", "1": "car"}` map or `{"names": {...}}` also works. The startup log prints `Using N class labels from <file>.json` when it is applied.
+
 ## Main Environment Variables
 
 | Variable | Default | Description |

@@ -6,9 +6,11 @@ against small stand-ins for Ultralytics result objects.
 """
 import ast
 import io
+import json
 import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+import tempfile
+from typing import Dict, List, Optional, Tuple
 import unittest
 
 import numpy as np
@@ -35,7 +37,7 @@ def load_functions(*names, **namespace):
         node for node in APP_TREE.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    ns = {"List": List, "Optional": Optional, "Tuple": Tuple, "np": np, **namespace}
+    ns = {"List": List, "Optional": Optional, "Tuple": Tuple, "Dict": Dict, "np": np, **namespace}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), ns)
     return [ns[name] for name in names]
 
@@ -118,6 +120,14 @@ class DetectionPostprocessTests(unittest.TestCase):
         )
         self.assertEqual(model.calls[0]["quantize"], 16)
         self.assertEqual(model.calls[0]["conf"], 0.4)
+
+    def test_classes_missing_from_names_fall_back_to_generic_label(self):
+        _, sync_predict = load_functions(
+            "_result_boxes", "sync_predict",
+            YOLO=object, Image=Placeholder, HALF_PRECISION=False,
+        )
+        model = FakeModel([FakeResult([[1, 2, 3, 4, 0.9, 45]])])
+        self.assertEqual(sync_predict(model, object(), 0.4, False)[0]["label"], "class45")
 
     def test_sync_predict_only_quantizes_pytorch_weights(self):
         _, sync_predict = load_functions(
@@ -206,6 +216,95 @@ class OnnxProviderDetectionTests(unittest.TestCase):
     def test_unknown_layout_returns_none(self):
         self.assertIsNone(self.provider(object()))
         self.assertIsNone(self.provider(self.model_with(object())))
+
+
+class SilentLogger:
+    def __init__(self):
+        self.messages = []
+
+    def _log(self, level, msg, *args):
+        self.messages.append((level, msg % args if args else msg))
+
+    def info(self, msg, *args):
+        self._log("info", msg, *args)
+
+    def warning(self, msg, *args):
+        self._log("warning", msg, *args)
+
+
+FRIGATE_PLUS_JSON = {
+    "name": "yolov9c",
+    "type": "yolo-generic",
+    "width": 640,
+    "labelMap": {"0": "person", "1": "dhl", "16": "license_plate", "29": "car"},
+}
+
+
+class LabelMapTests(unittest.TestCase):
+    def setUp(self):
+        self.logger = SilentLogger()
+        self.load, self.apply = load_functions(
+            "load_label_map", "_apply_label_map", json=json, logger=self.logger, Path=Path, YOLO=object,
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, payload, name="frigate_yolov9c_640.json"):
+        (self.dir / name).write_text(payload if isinstance(payload, str) else json.dumps(payload))
+
+    def test_reads_frigate_plus_label_map_for_any_model_format(self):
+        self.write(FRIGATE_PLUS_JSON)
+        for ext in (".onnx", ".engine", ".pt"):
+            names = self.load(self.dir / f"frigate_yolov9c_640{ext}")
+            self.assertEqual(names, {0: "person", 1: "dhl", 16: "license_plate", 29: "car"})
+            self.assertEqual(list(names), [0, 1, 16, 29])
+
+    def test_accepts_names_object_list_and_plain_map(self):
+        self.write({"names": {"0": "a", "1": "b"}}, "m1.json")
+        self.write(["a", "b"], "m2.json")
+        self.write({"0": "a", "1": "b"}, "m3.json")
+        for stem in ("m1", "m2", "m3"):
+            self.assertEqual(self.load(self.dir / f"{stem}.onnx"), {0: "a", 1: "b"}, stem)
+
+    def test_missing_or_bad_files_are_ignored_with_a_warning(self):
+        self.assertIsNone(self.load(self.dir / "absent.onnx"))
+        self.write("{not json", "broken.json")
+        self.write({"labelMap": {"zero": "person"}}, "badkeys.json")
+        self.write({"width": 640}, "nolabels.json")
+        for stem in ("broken", "badkeys", "nolabels"):
+            self.assertIsNone(self.load(self.dir / f"{stem}.onnx"), stem)
+        self.assertEqual(sum(1 for level, _ in self.logger.messages if level == "warning"), 3)
+
+    def test_trt_manifest_is_not_mistaken_for_a_label_file(self):
+        self.write({"source_sha256": "x"}, "yolo11l.trt_manifest.json")
+        self.assertIsNone(self.load(self.dir / "yolo11l.engine"))
+
+    @staticmethod
+    def model_with_backend(names):
+        inner = type("ONNXBackend", (), {})()
+        inner.names = names
+        auto = type("AutoBackend", (), {})()
+        auto.backend = inner
+        predictor = type("Predictor", (), {})()
+        predictor.model = auto
+        model = type("Model", (), {})()
+        model.predictor = predictor
+        return model, inner
+
+    def test_apply_replaces_generic_names_on_the_inner_backend(self):
+        model, inner = self.model_with_backend({i: f"class{i}" for i in range(999)})
+        self.apply(model, {0: "person", 29: "car"}, "frigate.json")
+        self.assertEqual(inner.names, {0: "person", 29: "car"})
+        self.assertFalse(any(level == "warning" for level, _ in self.logger.messages))
+
+    def test_apply_warns_when_overriding_real_embedded_names(self):
+        model, inner = self.model_with_backend({0: "person", 1: "bicycle"})
+        self.apply(model, {0: "person", 1: "dhl"}, "frigate.json")
+        self.assertEqual(inner.names[1], "dhl")
+        self.assertTrue(any(level == "warning" for level, _ in self.logger.messages))
 
 
 class GpuBoundaryContracts(unittest.TestCase):
