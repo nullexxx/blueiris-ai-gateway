@@ -17,8 +17,6 @@ The gateway is designed for NVIDIA/CUDA homelab deployments and keeps all GPU in
 - **Optional PTZ autotracking** using the same YOLO model already loaded by the gateway.
 - **Latest-frame-only RTSP capture** for tracking, avoiding a backlog of stale frames.
 - **Native Dahua/Amcrest 3D positioning** using `moveDirectly`, with status-driven PTZ settling rather than fixed movement sleeps.
-- **Bounded predictive lead** based only on stationary-camera target motion.
-- **Adaptive `moveDirectly` lead** learned from completed camera moves, with bounded one-shot edge rescue.
 - **Hybrid escape chase** that uses continuous PTZ only when a fast target is in genuine danger of leaving the frame.
 - **Evidence-gated conservative auto-zoom** that requires a small, confident, centered target across multiple observations before zooming in.
 - **GitHub Actions -> GHCR** builds on pushes to `main`.
@@ -116,9 +114,7 @@ curl -s 'http://HOST:32169/v1/tracker/history?limit=300' | python3 -m json.tool
 
 The tracker continuously drains the camera RTSP substream and retains only the newest decoded frame. Tracker inference is opportunistic: regular Blue Iris and FaceNet work has priority, so the tracker drops a frame instead of waiting behind queued gateway inference.
 
-Normal pan/tilt tracking uses Dahua/Amcrest `moveDirectly` 3D positioning. The tracker polls camera status and position until the camera reports idle and stable rather than sleeping for a guessed movement duration. Completed moves feed a small timing model that estimates future `moveDirectly` duration for bounded predictive lead.
-
-Predictive target velocity is learned only while the camera is stationary. It is suppressed for immature/noisy velocity samples, low-confidence or tiny detections, and edge-clipped detections. A one-shot **edge rescue** can use a stronger positional gain when the target is already near escape.
+Normal pan/tilt tracking uses Dahua/Amcrest `moveDirectly` 3D positioning. The tracker polls camera status and position until the camera reports idle and stable rather than sleeping for a guessed movement duration. Completed moves feed a small timing model that estimates future `moveDirectly` duration for continuous-vs-positional handoff decisions. A one-shot **edge rescue** can use a stronger positional gain when the target is already near escape.
 
 For moving targets, Rev 6 prefers a **fractional ONVIF feedback servo** when the camera proves during active calibration that its ONVIF ContinuousMove velocity is genuinely proportional below native speed 1. Rev 6.2 lets that closed-loop fractional servo run continuously instead of forcing a 2.5-second brake/restart cycle, uses the established-target hold-confidence threshold while actively chasing, and progressively adds proportional authority only when the target is far off-center. Rev 6.3 adds velocity-aware earlier braking for fast fractional moves, a 0.50-second chase miss grace, a 5-second target-release window before returning home, and association-miss diagnostics so rejected detections can be distinguished from true detector dropouts. Rev 6.4 adds an outward-only catch-up multiplier for large errors that are still growing, decays the last verified velocity during marginal-confidence or detector-miss grace, and introduces a short servo-hold state so transient predicted stops do not tear down the entire chase. Rev 6.5 makes divergence per-axis and sign-aware, prevents servo hold from settling while the target remains outside the continuous-exit region, records rejected association candidates, and adds a brief native edge-rescue burst only when the fractional servo is near saturation and the target is still escaping. The controller maps desired image-space correction rate into the measured fractional velocity, brakes on genuine confidence loss, and waits for both a minimum physical quiet interval and optical-flow stability before learning subject velocity again. If fractional ONVIF is unavailable or quantized, native Dahua continuous movement is reserved for clipped/hard-edge rescue rather than used for fine servo tracking. `moveDirectly` is a stationary-target precision tool and no longer uses predictive lead.
 
@@ -244,18 +240,12 @@ The tracker has been developed against a Dahua/Amcrest-style PTZ CGI camera, inc
 | `TRACKER_MOVE_GAIN` | `0.60` | Fraction of projected frame error applied to a normal positional move. |
 | `TRACKER_LEAD_TIME` | `0.75` | Fallback lead horizon before enough move timing samples exist. |
 | `TRACKER_VELOCITY_MIN_SAMPLE_MS` | `100` | Minimum stationary-camera sample window before velocity is trusted. |
-| `TRACKER_LEAD_MIN_CONF` | `0.50` | Suppress predictive lead below this confidence. |
-| `TRACKER_LEAD_MIN_SPAN` | `0.08` | Suppress predictive lead for very small targets. |
 | `TRACKER_LEAD_EDGE_MARGIN` | `0.02` | Suppress predictive lead when the bbox touches this frame margin. |
 | `TRACKER_ADAPTIVE_LEAD` | `true` | Learn move duration from completed `moveDirectly` operations. |
 | `TRACKER_MOVE_ETA_MIN_SAMPLES` | `3` | Completed moves required before the learned timing model is trusted. |
 | `TRACKER_MOVE_ETA_HISTORY` | `24` | Maximum completed move samples retained. |
 | `TRACKER_MOVE_ETA_MIN` | `0.50` | Minimum learned/fallback lead horizon. |
 | `TRACKER_MOVE_ETA_MAX` | `2.00` | Maximum learned lead horizon. |
-| `TRACKER_VELOCITY_CONSISTENCY_COSINE` | `0.25` | Reject abrupt direction changes from predictive lead. |
-| `TRACKER_VELOCITY_JUMP_RATIO` | `4.0` | Reject implausible velocity magnitude jumps. |
-
-Predictive lead is hard-clamped to 20% of frame width/height per axis in code.
 
 ### Edge Rescue / Hybrid Escape Chase
 

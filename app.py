@@ -223,7 +223,7 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
         model.export(
             format="engine",
             device=0,
-            quantize=(16 if HALF_PRECISION else 32),
+            half=HALF_PRECISION,
             imgsz=640,
             dynamic=False,
         )
@@ -251,7 +251,7 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
         "verbose": False,
     }
     if is_pt and HALF_PRECISION:
-        kwargs["quantize"] = 16
+        kwargs["half"] = True
 
     return model.predict(img, **kwargs)
 
@@ -266,7 +266,7 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
         "verbose": False,
     }
     if entry.is_pt and HALF_PRECISION:
-        kwargs["quantize"] = 16
+        kwargs["half"] = True
 
     results = entry.model.predict(frame, **kwargs)
     predictions: List[dict] = []
@@ -389,6 +389,14 @@ def _rebuild_face_matrix():
     _face_cache_dirty = False
 
 
+async def _get_face_enrollment_snapshot() -> Tuple[Optional[torch.Tensor], List[str]]:
+    """Return an immutable snapshot of the enrolled face matrix and labels under face_state_lock."""
+    async with face_state_lock:
+        if _face_cache_dirty:
+            await asyncio.to_thread(_rebuild_face_matrix)
+        return _face_matrix_cache, list(_face_labels_cache)
+
+
 def sync_face_register_embedding(img: Image.Image) -> Tuple[Optional[torch.Tensor], int]:
     """Extract exactly one normalized face embedding without repeating MTCNN detection."""
     assert face_detector is not None and face_recognizer is not None
@@ -407,7 +415,12 @@ def sync_face_register_embedding(img: Image.Image) -> Tuple[Optional[torch.Tenso
         return F.normalize(emb, p=2, dim=1).cpu(), face_count
 
 
-def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
+def sync_face_recognize(
+    img: Image.Image,
+    min_conf: float,
+    face_matrix: Optional[torch.Tensor] = None,
+    face_labels: Optional[List[str]] = None,
+) -> List[dict]:
     """Detect faces once, extract crops, and compare embeddings against enrollment data."""
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
@@ -423,11 +436,14 @@ def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
         embeddings = face_recognizer(faces)
         embeddings = F.normalize(embeddings, p=2, dim=1)
 
-    if _face_cache_dirty:
-        _rebuild_face_matrix()
+    if face_matrix is None and face_labels is None:
+        if _face_cache_dirty:
+            _rebuild_face_matrix()
+        face_matrix = _face_matrix_cache
+        face_labels = _face_labels_cache
 
-    if _face_matrix_cache is not None:
-        sims = embeddings @ _face_matrix_cache.T
+    if face_matrix is not None and face_labels:
+        sims = embeddings @ face_matrix.T
         best_sims, best_idx = sims.max(dim=1)
     else:
         best_sims = best_idx = None
@@ -435,9 +451,9 @@ def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
     predictions = []
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box.tolist()
-        if best_sims is not None:
+        if best_sims is not None and face_labels is not None:
             sim = float(best_sims[i].item())
-            matched_id = _face_labels_cache[int(best_idx[i].item())] if sim >= min_conf else "unknown"
+            matched_id = face_labels[int(best_idx[i].item())] if sim >= min_conf else "unknown"
         else:
             sim = 0.0
             matched_id = "unknown"
@@ -633,13 +649,17 @@ async def lifespan(app: FastAPI):
     global is_healthy, health_failure_reason, face_detector, face_recognizer, tracker_service
     load_faces_db()
 
-    # Initialize and warm up Face Recognition models
+    # Initialize and warm up Face Recognition models off the event loop
     logger.info("Initializing FaceNet (MTCNN + InceptionResnetV1) on CUDA...")
-    try:
-        face_detector = MTCNN(keep_all=True, device="cuda:0", post_process=True)
-        face_recognizer = InceptionResnetV1(pretrained="vggface2").eval().to("cuda:0")
+    def _init_facenet_sync():
+        detector = MTCNN(keep_all=True, device="cuda:0", post_process=True)
+        recognizer = InceptionResnetV1(pretrained="vggface2").eval().to("cuda:0")
         dummy = Image.fromarray(np.zeros((160, 160, 3), dtype=np.uint8))
-        face_detector.detect(dummy)
+        detector.detect(dummy)
+        return detector, recognizer
+
+    try:
+        face_detector, face_recognizer = await asyncio.to_thread(_init_facenet_sync)
         logger.info("FaceNet pipeline initialized and warmed on GPU.")
     except Exception as e:
         logger.error(f"Failed to initialize FaceNet: {e}")
@@ -984,16 +1004,17 @@ async def face_recognize(
 
     t_infer_start = time.perf_counter()
     try:
-        # Freeze face mutations while the worker may rebuild the flattened GPU matrix.
-        async with face_state_lock:
-            predictions = await run_gpu_job(
-                sync_face_recognize,
-                img,
-                min_confidence,
-                label="Face recognition",
-                timeout=INFERENCE_TIMEOUT,
-                enqueue=True,
-            )
+        face_matrix, face_labels = await _get_face_enrollment_snapshot()
+        predictions = await run_gpu_job(
+            sync_face_recognize,
+            img,
+            min_confidence,
+            face_matrix,
+            face_labels,
+            label="Face recognition",
+            timeout=INFERENCE_TIMEOUT,
+            enqueue=True,
+        )
     except (GpuJobTimeoutError, GpuUnavailableError) as exc:
         return {"success": False, "error": str(exc), "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
     except asyncio.CancelledError:

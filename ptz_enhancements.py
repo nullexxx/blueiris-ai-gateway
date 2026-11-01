@@ -223,11 +223,19 @@ class CameraMotionEstimator:
         *,
         active: bool,
         use_homography: bool = False,
+        gray: Optional[np.ndarray] = None,
     ) -> Optional[CameraMotionEstimate]:
-        gray = self._gray(frame)
         current_boxes = [tuple(float(v) for v in box) for box in boxes]
+        if not active:
+            self.prev_gray = gray if gray is not None else (self._gray(frame) if frame is not None and frame.size > 0 else None)
+            self.prev_boxes = current_boxes
+            self.last_estimate = None
+            return None
 
-        if self.prev_gray is None or self.prev_gray.shape != gray.shape or not active:
+        if gray is None:
+            gray = self._gray(frame)
+
+        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
             self.prev_gray = gray
             self.prev_boxes = current_boxes
             self.last_estimate = None
@@ -397,6 +405,15 @@ class CalibrationStore:
         samples = timing.get("samples", [])
         return {"path": str(self.path), "loaded": bool(camera), "move_timing": {"intercept": timing.get("intercept"), "slope": timing.get("slope"), "samples": len(samples) if isinstance(samples, list) else 0}, "spatial_response": camera.get("spatial_response", {})}
 
+    def _write_sync(self, payload: str) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_suffix(self.path.suffix + ".tmp")
+            temp.write_text(payload)
+            temp.replace(self.path)
+        except Exception:
+            return
+
     def flush(self, force: bool = False) -> None:
         if not self.enabled or not self._dirty:
             return
@@ -404,12 +421,18 @@ class CalibrationStore:
         if not force and (now - self._last_write) < 2.0:
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temp = self.path.with_suffix(self.path.suffix + ".tmp")
-            temp.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
-            temp.replace(self.path)
+            payload = json.dumps(self.data, indent=2, sort_keys=True) + "\n"
             self._dirty = False
             self._last_write = now
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and not force:
+                loop.run_in_executor(None, self._write_sync, payload)
+            else:
+                self._write_sync(payload)
         except Exception:
             # Persistence is an optimization; runtime tracking stays authoritative.
             return

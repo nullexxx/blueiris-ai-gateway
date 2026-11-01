@@ -440,12 +440,27 @@ class ZoomCalibrationMap:
             rows.append((actual_factor, normalized))
         self.replace_points(rows)
 
-    def _flush(self) -> None:
+    def _write_sync(self, payload: str) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_suffix(self.path.suffix + ".tmp")
-            temp.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+            temp.write_text(payload)
             temp.replace(self.path)
+        except Exception:
+            return
+
+    def _flush(self, force: bool = False) -> None:
+        try:
+            payload = json.dumps(self.data, indent=2, sort_keys=True) + "\n"
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and not force:
+                loop.run_in_executor(None, self._write_sync, payload)
+            else:
+                self._write_sync(payload)
         except Exception:
             return
 

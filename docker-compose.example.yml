@@ -48,25 +48,21 @@ services:
       TRACKER_ASSOCIATION_IDLE_DISTANCE: "0.22"
       TRACKER_ASSOCIATION_MOVING_DISTANCE: "0.40"
 
-      # Native 3D pan/tilt + bounded predictive lead
+      # Native 3D stationary pan/tilt precision positioning
       TRACKER_MOVE_DIRECTLY_ENABLED: "true"
       TRACKER_MOVE_DEADZONE_X: "0.14"
       TRACKER_MOVE_DEADZONE_Y: "0.18"
       TRACKER_MOVE_GAIN: "0.60"
       TRACKER_LEAD_TIME: "0.75"
       TRACKER_VELOCITY_MIN_SAMPLE_MS: "100"
-      TRACKER_LEAD_MIN_CONF: "0.50"
-      TRACKER_LEAD_MIN_SPAN: "0.08"
       TRACKER_LEAD_EDGE_MARGIN: "0.02"
 
-      # Adaptive positional lead and one-shot edge rescue.
+      # Adaptive move timing model and one-shot edge rescue.
       TRACKER_ADAPTIVE_LEAD: "true"
       TRACKER_MOVE_ETA_MIN_SAMPLES: "3"
       TRACKER_MOVE_ETA_HISTORY: "24"
       TRACKER_MOVE_ETA_MIN: "0.50"
       TRACKER_MOVE_ETA_MAX: "2.00"
-      TRACKER_VELOCITY_CONSISTENCY_COSINE: "0.25"
-      TRACKER_VELOCITY_JUMP_RATIO: "4.0"
       TRACKER_EDGE_RESCUE_ENABLED: "true"
       TRACKER_EDGE_RESCUE_ERROR: "0.75"
       TRACKER_EDGE_RESCUE_GAIN: "0.85"

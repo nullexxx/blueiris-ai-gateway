@@ -11,6 +11,11 @@ RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1
 # Runtime modules: core API/tracker plus the smart-PTZ calibration and filtering layers.
 COPY app.py /app/app.py
 COPY tracker.py /app/tracker.py
+COPY tracker_config.py /app/tracker_config.py
+COPY tracker_models.py /app/tracker_models.py
+COPY tracker_policy.py /app/tracker_policy.py
+COPY tracker_calibration.py /app/tracker_calibration.py
+COPY tracker_servo.py /app/tracker_servo.py
 COPY ptz_enhancements.py /app/ptz_enhancements.py
 COPY ptz_phase2.py /app/ptz_phase2.py
 COPY ptz_active_calibration.py /app/ptz_active_calibration.py
