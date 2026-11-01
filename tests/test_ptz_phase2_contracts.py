@@ -1,9 +1,10 @@
 import ast
 from pathlib import Path
 import unittest
+from _sources import tracker_source
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 HELPER = (ROOT / "ptz_enhancements.py").read_text()
 PHASE2 = (ROOT / "ptz_phase2.py").read_text()
 APP = (ROOT / "app.py").read_text()

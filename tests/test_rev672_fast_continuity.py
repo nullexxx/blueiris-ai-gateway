@@ -1,14 +1,13 @@
 from pathlib import Path
 import unittest
+from _sources import tracker_block, tracker_source
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 
 
 def block(start, end):
-    a = TRACKER.index(start)
-    b = TRACKER.index(end, a + len(start))
-    return TRACKER[a:b]
+    return tracker_block(start, end)
 
 
 class Rev672FastContinuityTests(unittest.TestCase):

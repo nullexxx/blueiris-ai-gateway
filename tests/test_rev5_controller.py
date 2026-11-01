@@ -3,10 +3,11 @@ import math
 from pathlib import Path
 from typing import Dict
 import unittest
+from _sources import tracker_block, tracker_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 ACTIVE_CAL = (ROOT / "ptz_active_calibration.py").read_text()
 
 
@@ -68,9 +69,7 @@ class Rev5ServoTests(unittest.TestCase):
         self.assertIn("self._seed_servo_feedback(frame_shape, now, err_x, err_y)", TRACKER)
 
     def test_semantic_continuity_is_spatially_gated(self):
-        start = TRACKER.index("    def _associate(")
-        end = TRACKER.index("    async def _drive_to_target", start)
-        block = TRACKER[start:end]
+        block = tracker_block("    def _associate(", "    async def _drive_to_target")
         self.assertNotIn("if det.class_id != self.target.class_id:\n                continue", block)
         self.assertIn("self._class_mismatch_compatible(", block)
         self.assertIn("class_penalty", block)

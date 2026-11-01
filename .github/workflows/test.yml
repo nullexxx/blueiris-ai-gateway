@@ -4,21 +4,27 @@ on:
   pull_request:
   push:
     branches: ["main"]
+  workflow_call: # Reused by build.yml so an image is only pushed after tests pass.
 
 permissions:
   contents: read
 
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   static-validation:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install PTZ calibration test dependencies
         run: pip install numpy opencv-python-headless
       - name: Compile Python sources
-        run: python -m py_compile app.py tracker.py ptz_enhancements.py ptz_phase2.py ptz_active_calibration.py
+        run: python -m py_compile *.py
       - name: Run static contract tests
         run: python -m unittest discover -s tests -v

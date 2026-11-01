@@ -1,11 +1,12 @@
 import ast
 from pathlib import Path
 import unittest
+from _sources import tracker_source
 
 
 class HybridChaseContractTests(unittest.TestCase):
     def test_axis_specific_speed_calls_are_explicit(self):
-        source = Path("tracker.py").read_text()
+        source = tracker_source()
         tree = ast.parse(source)
         legacy_bad = []
         servo_axes = []

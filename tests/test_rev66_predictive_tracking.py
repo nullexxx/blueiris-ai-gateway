@@ -3,9 +3,10 @@ import math
 from pathlib import Path
 from typing import Tuple
 import unittest
+from _sources import tracker_source
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 
 
 def load_functions(*names):

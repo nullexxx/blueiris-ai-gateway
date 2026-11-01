@@ -1,8 +1,9 @@
 from pathlib import Path
 import unittest
+from _sources import tracker_source
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 APP = (ROOT / "app.py").read_text()
 DOCKER = (ROOT / "Dockerfile").read_text()
 COMPOSE = (ROOT / "docker-compose.example.yml").read_text()

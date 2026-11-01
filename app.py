@@ -223,7 +223,7 @@ def ensure_tensorrt_engine(stem: str, force: bool = False) -> bool:
         model.export(
             format="engine",
             device=0,
-            half=HALF_PRECISION,
+            quantize=(16 if HALF_PRECISION else 32),
             imgsz=640,
             dynamic=False,
         )
@@ -251,7 +251,7 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
         "verbose": False,
     }
     if is_pt and HALF_PRECISION:
-        kwargs["half"] = True
+        kwargs["quantize"] = 16
 
     return model.predict(img, **kwargs)
 
@@ -266,7 +266,7 @@ def sync_tracker_predict(entry: ModelEntry, frame: np.ndarray, min_conf: float, 
         "verbose": False,
     }
     if entry.is_pt and HALF_PRECISION:
-        kwargs["half"] = True
+        kwargs["quantize"] = 16
 
     results = entry.model.predict(frame, **kwargs)
     predictions: List[dict] = []

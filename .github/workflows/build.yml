@@ -1,6 +1,5 @@
 name: Build and Push to GHCR
 
-# Runtime image includes Rev 6 fractional settled-velocity PTZ servo (final hardened tree).
 on:
   push:
     branches: [ "main" ]
@@ -8,10 +7,16 @@ on:
       - "Dockerfile"
       - "app.py"
       - "tracker.py"
+      - "tracker_config.py"
+      - "tracker_models.py"
+      - "tracker_policy.py"
+      - "tracker_calibration.py"
+      - "tracker_servo.py"
       - "ptz_enhancements.py"
       - "ptz_phase2.py"
       - "ptz_active_calibration.py"
       - ".github/workflows/build.yml"
+      - ".github/workflows/test.yml"
   workflow_dispatch: # Manual GHCR build from the GitHub web UI
   schedule:
     - cron: '0 4 * * 0' # Rebuild every Sunday at 4:00 AM UTC
@@ -25,15 +30,20 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Free up runner disk space
         run: |

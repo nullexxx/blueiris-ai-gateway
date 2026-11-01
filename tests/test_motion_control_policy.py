@@ -2,10 +2,11 @@ import ast
 import math
 from pathlib import Path
 import unittest
+from _sources import tracker_block, tracker_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 
 
 def load_motion_policy():
@@ -102,9 +103,7 @@ class MotionControlPolicyTests(unittest.TestCase):
         self.assertEqual(decision["precision_hold_reason"], "velocity_sample")
 
     def test_live_target_quality_no_longer_mutates_spatial_calibration(self):
-        start = TRACKER.index("    def _complete_move_quality")
-        end = TRACKER.index("    def _hybrid_axis_speed", start)
-        block = TRACKER[start:end]
+        block = tracker_block("    def _complete_move_quality", "    def _hybrid_axis_speed")
         self.assertNotIn("set_spatial_scales", block)
         self.assertIn("Live-target telemetry is observational only", block)
 
@@ -120,9 +119,7 @@ class MotionControlPolicyTests(unittest.TestCase):
     def test_continuous_exit_is_inside_old_escape_exit(self):
         self.assertIn("TRACKER_MOTION_CONTROL_CONTINUOUS_EXIT_ERROR", TRACKER)
         self.assertIn("self._motion_control_continuous_exit_error", TRACKER)
-        start = TRACKER.index("    async def _drive_hybrid_chase")
-        end = TRACKER.index("    def _begin_ptz_operation", start)
-        block = TRACKER[start:end]
+        block = tracker_block("    async def _drive_hybrid_chase", "    def _begin_ptz_operation")
         self.assertIn("<= self._motion_control_continuous_exit_error", block)
 
 

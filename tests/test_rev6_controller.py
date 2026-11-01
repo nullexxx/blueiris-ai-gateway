@@ -7,10 +7,11 @@ from typing import Dict
 import unittest
 
 from ptz_active_calibration import ActivePtzCalibrationStore
+from _sources import tracker_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACKER = (ROOT / "tracker.py").read_text()
+TRACKER = tracker_source()
 ACTIVE_CAL = (ROOT / "ptz_active_calibration.py").read_text()
 
 
